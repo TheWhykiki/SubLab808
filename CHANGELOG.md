@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.3.0
+
+- Smoothed automated DSP parameters to prevent zipper noise.
+- Added a protected final output stage and reliable MIDI All Sound Off handling.
+- Added held-note priority for monophonic playing and reset Pitch Bend on panic.
+- Made click timing independent of project sample rate.
+- Added Custom preset state, complete One Shot preset data, and editor-size persistence.
+- Fixed compact header layout and added accessible names, descriptions, and tooltips.
+- Corrected the release build target to macOS 11 and pinned JUCE to an exact commit.
+- Expanded behavioral audio tests and release verification.
+
 ## 1.2.0
 
 - Added One Shot and Gate playback modes.

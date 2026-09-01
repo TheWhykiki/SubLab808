@@ -2,16 +2,16 @@
 #include "PluginEditor.h"
 
 namespace {
-struct FactoryPreset { const char* name; std::array<float, 12> values; };
+struct FactoryPreset { const char* name; std::array<float, 12> values; bool oneShot; };
 constexpr std::array<FactoryPreset, 8> factoryPresets {{
-    { "Deep Foundation", { 1.40f, 0.18f, 12.0f, 0.070f, 0.030f, 0.0f, 10.0f, 5.0f, 2.0f, 1800.0f, 72.0f, -3.0f } },
-    { "Modern Knock",    { 0.72f, 0.09f, 24.0f, 0.035f, 0.015f, 0.0f, 25.0f, 22.0f, 7.0f, 5200.0f, 90.0f, -3.0f } },
-    { "Long Slide",      { 2.80f, 0.32f, 10.0f, 0.090f, 0.180f, 0.0f, 16.0f, 4.0f, 4.0f, 2600.0f, 65.0f, -4.0f } },
-    { "Dirty Trunk",     { 1.10f, 0.12f, 18.0f, 0.055f, 0.045f, 0.0f, 42.0f, 12.0f, 16.0f, 3200.0f, 85.0f, -5.0f } },
-    { "Short Punch",     { 0.28f, 0.05f, 32.0f, 0.022f, 0.000f, 0.0f, 30.0f, 38.0f, 9.0f, 7800.0f, 100.0f, -2.0f } },
-    { "Soft Pillow",     { 1.75f, 0.40f, 7.0f, 0.110f, 0.060f, 0.0f, 5.0f, 0.0f, 1.0f, 1250.0f, 55.0f, -2.5f } },
-    { "Upper Bass",      { 0.90f, 0.10f, 15.0f, 0.045f, 0.025f, 12.0f, 36.0f, 18.0f, 8.0f, 6400.0f, 82.0f, -4.0f } },
-    { "Sub Destroyer",   { 1.55f, 0.16f, 28.0f, 0.030f, 0.040f, -12.0f, 55.0f, 15.0f, 22.0f, 4100.0f, 95.0f, -7.0f } }
+    { "Deep Foundation", { 1.40f, 0.18f, 12.0f, 0.070f, 0.030f, 0.0f, 10.0f, 5.0f, 2.0f, 1800.0f, 72.0f, -3.0f }, true },
+    { "Modern Knock",    { 0.72f, 0.09f, 24.0f, 0.035f, 0.015f, 0.0f, 25.0f, 22.0f, 7.0f, 5200.0f, 90.0f, -3.0f }, true },
+    { "Long Slide",      { 2.80f, 0.32f, 10.0f, 0.090f, 0.180f, 0.0f, 16.0f, 4.0f, 4.0f, 2600.0f, 65.0f, -4.0f }, false },
+    { "Dirty Trunk",     { 1.10f, 0.12f, 18.0f, 0.055f, 0.045f, 0.0f, 42.0f, 12.0f, 16.0f, 3200.0f, 85.0f, -5.0f }, true },
+    { "Short Punch",     { 0.28f, 0.05f, 32.0f, 0.022f, 0.000f, 0.0f, 30.0f, 38.0f, 9.0f, 7800.0f, 100.0f, -2.0f }, true },
+    { "Soft Pillow",     { 1.75f, 0.40f, 7.0f, 0.110f, 0.060f, 0.0f, 5.0f, 0.0f, 1.0f, 1250.0f, 55.0f, -2.5f }, false },
+    { "Upper Bass",      { 0.90f, 0.10f, 15.0f, 0.045f, 0.025f, 12.0f, 36.0f, 18.0f, 8.0f, 6400.0f, 82.0f, -4.0f }, true },
+    { "Sub Destroyer",   { 1.55f, 0.16f, 28.0f, 0.030f, 0.040f, -12.0f, 55.0f, 15.0f, 22.0f, 4100.0f, 95.0f, -7.0f }, true }
 }};
 constexpr std::array<const char*, 12> presetParameterIds {
     "decay", "release", "punch", "pitchdecay", "glide", "tune", "body", "click", "drive", "tone", "velocity", "output"
@@ -23,23 +23,44 @@ SubLab808Processor::SubLab808Processor()
       parameters(*this, nullptr, "PARAMETERS", makeLayout())
 {
     setCurrentProgram(0);
+    for (const auto* id : presetParameterIds) parameters.addParameterListener(id, this);
+    parameters.addParameterListener("oneshot", this);
+}
+
+SubLab808Processor::~SubLab808Processor()
+{
+    for (const auto* id : presetParameterIds) parameters.removeParameterListener(id, this);
+    parameters.removeParameterListener("oneshot", this);
 }
 
 int SubLab808Processor::getNumPrograms() { return (int) factoryPresets.size(); }
 
 const juce::String SubLab808Processor::getProgramName(int index)
 {
-    return juce::isPositiveAndBelow(index, getNumPrograms()) ? factoryPresets[(size_t) index].name : juce::String();
+    if (! juce::isPositiveAndBelow(index, getNumPrograms())) return {};
+    auto name = juce::String(factoryPresets[(size_t) index].name);
+    if (index == currentProgram.load() && presetModified.load()) name += " (Modified)";
+    return name;
 }
 
 void SubLab808Processor::setCurrentProgram(int index)
 {
     if (! juce::isPositiveAndBelow(index, getNumPrograms())) return;
+    applyingPreset.store(true);
     const auto& preset = factoryPresets[(size_t) index];
     for (size_t i = 0; i < presetParameterIds.size(); ++i)
         if (auto* parameter = parameters.getParameter(presetParameterIds[i]))
             parameter->setValueNotifyingHost(parameter->convertTo0to1(preset.values[i]));
+    if (auto* parameter = parameters.getParameter("oneshot"))
+        parameter->setValueNotifyingHost(preset.oneShot ? 1.0f : 0.0f);
     currentProgram.store(index);
+    presetModified.store(false);
+    applyingPreset.store(false);
+}
+
+void SubLab808Processor::parameterChanged(const juce::String&, float)
+{
+    if (! applyingPreset.load()) presetModified.store(true);
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout SubLab808Processor::makeLayout()
@@ -64,11 +85,41 @@ juce::AudioProcessorValueTreeState::ParameterLayout SubLab808Processor::makeLayo
 
 void SubLab808Processor::prepareToPlay(double sr, int)
 {
-    sampleRate = sr; phase = 0.0; amp = pitchEnv = filterState = 0.0f; active = false;
+    sampleRate = sr;
+    resetSound();
+    clickCoef = std::exp(-1.0f / (0.0006f * (float) sampleRate));
+    ampCoef.reset(sampleRate, 0.02); pitchCoef.reset(sampleRate, 0.02);
+    glideCoef.reset(sampleRate, 0.02); releaseCoef.reset(sampleRate, 0.02);
+    drive.reset(sampleRate, 0.02); outputGain.reset(sampleRate, 0.02);
+    filterCoef.reset(sampleRate, 0.02); body.reset(sampleRate, 0.02);
+    const auto decay = parameters.getRawParameterValue("decay")->load();
+    const auto pitchDecay = parameters.getRawParameterValue("pitchdecay")->load();
+    const auto release = parameters.getRawParameterValue("release")->load();
+    const auto glide = parameters.getRawParameterValue("glide")->load();
+    ampCoef.setCurrentAndTargetValue(std::exp(-1.0f / (decay * (float) sampleRate)));
+    pitchCoef.setCurrentAndTargetValue(std::exp(-1.0f / (pitchDecay * (float) sampleRate)));
+    releaseCoef.setCurrentAndTargetValue(std::exp(-1.0f / (release * (float) sampleRate)));
+    glideCoef.setCurrentAndTargetValue(glide <= 0.0001f ? 0.0f : (float) std::exp(-1.0 / (glide * sampleRate)));
+    drive.setCurrentAndTargetValue(juce::Decibels::decibelsToGain(parameters.getRawParameterValue("drive")->load()));
+    outputGain.setCurrentAndTargetValue(juce::Decibels::decibelsToGain(parameters.getRawParameterValue("output")->load()));
+    filterCoef.setCurrentAndTargetValue((float) std::exp(-juce::MathConstants<double>::twoPi * parameters.getRawParameterValue("tone")->load() / sampleRate));
+    body.setCurrentAndTargetValue(parameters.getRawParameterValue("body")->load() * 0.01f);
+}
+
+void SubLab808Processor::resetSound()
+{
+    phase = 0.0; amp = 0.0f; pitchEnv = 0.0f; filterState = 0.0f; click = 0.0f;
+    bendSemitones = 0.0f; active = false; gateReleased = false; currentNote = -1; numHeldNotes = 0;
 }
 
 void SubLab808Processor::triggerNote(int note, float newVelocity)
 {
+    for (int i = numHeldNotes - 1; i >= 0; --i)
+        if (heldNotes[(size_t) i] == note) {
+            for (int j = i; j < numHeldNotes - 1; ++j) heldNotes[(size_t) j] = heldNotes[(size_t) (j + 1)];
+            --numHeldNotes;
+        }
+    if (numHeldNotes < (int) heldNotes.size()) heldNotes[(size_t) numHeldNotes++] = note;
     auto tune = parameters.getRawParameterValue("tune")->load();
     targetHz = juce::MidiMessage::getMidiNoteInHertz(note + (int) tune);
     if (! active || parameters.getRawParameterValue("glide")->load() < 0.001f) currentHz = targetHz;
@@ -83,9 +134,30 @@ void SubLab808Processor::triggerNote(int note, float newVelocity)
     active = true;
 }
 
+void SubLab808Processor::releaseNote(int note)
+{
+    for (int i = numHeldNotes - 1; i >= 0; --i)
+        if (heldNotes[(size_t) i] == note) {
+            for (int j = i; j < numHeldNotes - 1; ++j) heldNotes[(size_t) j] = heldNotes[(size_t) (j + 1)];
+            --numHeldNotes;
+            break;
+        }
+    if (note != currentNote) return;
+    if (numHeldNotes > 0) {
+        currentNote = heldNotes[(size_t) (numHeldNotes - 1)];
+        auto tune = parameters.getRawParameterValue("tune")->load();
+        targetHz = juce::MidiMessage::getMidiNoteInHertz(currentNote + (int) tune);
+        gateReleased = false;
+    } else {
+        currentNote = -1;
+        if (parameters.getRawParameterValue("oneshot")->load() < 0.5f) gateReleased = true;
+    }
+}
+
 float SubLab808Processor::renderSample()
 {
-    currentHz = targetHz + (currentHz - targetHz) * glideCoef;
+    const auto glideNow = glideCoef.getNextValue();
+    currentHz = targetHz + (currentHz - targetHz) * glideNow;
     auto hz = currentHz * std::pow(2.0, (pitchEnv + bendSemitones) / 12.0f);
     phase += hz / sampleRate;
     phase -= std::floor(phase);
@@ -94,14 +166,18 @@ float SubLab808Processor::renderSample()
     noiseState ^= noiseState << 13; noiseState ^= noiseState >> 17; noiseState ^= noiseState << 5;
     auto noise = (float) ((noiseState & 0xffffu) / 32767.5 - 1.0);
     auto transient = click * noise;
-    click *= 0.965f;
-    auto sample = (fundamental + body * 0.22f * harmonic + transient) * amp * velocity;
-    sample = std::tanh(sample * drive) / std::max(1.0f, std::tanh(drive));
-    filterState = (1.0f - filterCoef) * sample + filterCoef * filterState;
-    amp *= gateReleased ? releaseCoef : ampCoef;
-    pitchEnv *= pitchCoef;
+    click *= clickCoef;
+    const auto bodyNow = body.getNextValue();
+    const auto driveNow = drive.getNextValue();
+    const auto filterNow = filterCoef.getNextValue();
+    auto sample = (fundamental + bodyNow * 0.22f * harmonic + transient) * amp * velocity;
+    sample = std::tanh(sample * driveNow) / std::max(1.0f, std::tanh(driveNow));
+    filterState = (1.0f - filterNow) * sample + filterNow * filterState;
+    amp *= gateReleased ? releaseCoef.getNextValue() : ampCoef.getNextValue();
+    pitchEnv *= pitchCoef.getNextValue();
     if (amp < 0.00001f) active = false;
-    return filterState * outputGain;
+    const auto postGain = filterState * outputGain.getNextValue();
+    return std::tanh(postGain * 1.2f);
 }
 
 bool SubLab808Processor::isBusesLayoutSupported(const BusesLayout& l) const
@@ -120,14 +196,14 @@ void SubLab808Processor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
     auto glide = parameters.getRawParameterValue("glide")->load();
     auto driveDb = parameters.getRawParameterValue("drive")->load();
     auto cutoff = parameters.getRawParameterValue("tone")->load();
-    ampCoef = std::exp(-1.0f / (decay * (float) sampleRate));
-    pitchCoef = std::exp(-1.0f / (pitchDecay * (float) sampleRate));
-    releaseCoef = std::exp(-1.0f / (release * (float) sampleRate));
-    glideCoef = glide <= 0.0001f ? 0.0f : (float) std::exp(-1.0 / (glide * sampleRate));
-    filterCoef = (float) std::exp(-juce::MathConstants<double>::twoPi * cutoff / sampleRate);
-    drive = juce::Decibels::decibelsToGain(driveDb);
-    outputGain = juce::Decibels::decibelsToGain(parameters.getRawParameterValue("output")->load());
-    body = parameters.getRawParameterValue("body")->load() * 0.01f;
+    ampCoef.setTargetValue(std::exp(-1.0f / (decay * (float) sampleRate)));
+    pitchCoef.setTargetValue(std::exp(-1.0f / (pitchDecay * (float) sampleRate)));
+    releaseCoef.setTargetValue(std::exp(-1.0f / (release * (float) sampleRate)));
+    glideCoef.setTargetValue(glide <= 0.0001f ? 0.0f : (float) std::exp(-1.0 / (glide * sampleRate)));
+    filterCoef.setTargetValue((float) std::exp(-juce::MathConstants<double>::twoPi * cutoff / sampleRate));
+    drive.setTargetValue(juce::Decibels::decibelsToGain(driveDb));
+    outputGain.setTargetValue(juce::Decibels::decibelsToGain(parameters.getRawParameterValue("output")->load()));
+    body.setTargetValue(parameters.getRawParameterValue("body")->load() * 0.01f);
 
     auto midiIterator = midi.begin();
     const auto midiEnd = midi.end();
@@ -139,17 +215,17 @@ void SubLab808Processor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
             const auto message = (*midiIterator).getMessage();
             if (message.isNoteOn()) triggerNote(message.getNoteNumber(), message.getFloatVelocity());
             else if (message.isPitchWheel()) bendSemitones = 2.0f * (message.getPitchWheelValue() - 8192) / 8192.0f;
-            else if (message.isNoteOff() && message.getNoteNumber() == currentNote
-                     && parameters.getRawParameterValue("oneshot")->load() < 0.5f) gateReleased = true;
-            else if (message.isAllNotesOff()) gateReleased = true;
-            else if (message.isAllSoundOff()) { active = false; amp = 0.0f; }
+            else if (message.isNoteOff()) releaseNote(message.getNoteNumber());
+            else if (message.isAllNotesOff()) { numHeldNotes = 0; currentNote = -1; gateReleased = true; bendSemitones = 0.0f; }
+            else if (message.isAllSoundOff()) resetSound();
             ++midiIterator;
         }
         float sample = renderSample();
         for (int c = 0; c < buffer.getNumChannels(); ++c) buffer.setSample(c, i, sample);
         peak = std::max(peak, std::abs(sample));
     }
-    outputMeter.store(std::max(peak, outputMeter.load() * 0.86f));
+    auto previousPeak = outputMeter.load();
+    while (previousPeak < peak && ! outputMeter.compare_exchange_weak(previousPeak, peak)) {}
 }
 
 juce::AudioProcessorEditor* SubLab808Processor::createEditor()
@@ -161,6 +237,9 @@ void SubLab808Processor::getStateInformation(juce::MemoryBlock& dest)
 {
     auto state = parameters.copyState();
     state.setProperty("factoryProgram", currentProgram.load(), nullptr);
+    state.setProperty("presetModified", presetModified.load(), nullptr);
+    state.setProperty("editorWidth", editorWidth.load(), nullptr);
+    state.setProperty("editorHeight", editorHeight.load(), nullptr);
     if (auto xml = state.createXml()) copyXmlToBinary(*xml, dest);
 }
 
@@ -169,7 +248,13 @@ void SubLab808Processor::setStateInformation(const void* data, int size)
     if (auto xml = getXmlFromBinary(data, size)) {
         auto state = juce::ValueTree::fromXml(*xml);
         currentProgram.store(juce::jlimit(0, getNumPrograms() - 1, (int) state.getProperty("factoryProgram", 0)));
+        const auto wasModified = (bool) state.getProperty("presetModified", false);
+        editorWidth.store(juce::jlimit(820, 1100, (int) state.getProperty("editorWidth", 860)));
+        editorHeight.store(juce::jlimit(430, 680, (int) state.getProperty("editorHeight", 520)));
+        applyingPreset.store(true);
         parameters.replaceState(state);
+        applyingPreset.store(false);
+        presetModified.store(wasModified);
     }
 }
 

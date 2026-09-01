@@ -1,23 +1,25 @@
 cmake_minimum_required(VERSION 3.25)
-project(SubLab808 VERSION 1.2.0 LANGUAGES C CXX)
+set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version" FORCE)
+project(SubLab808 VERSION 1.3.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version")
 set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "Apple Silicon build" FORCE)
 
 include(FetchContent)
 set(SUBLAB808_JUCE_PATH "" CACHE PATH "Optional path to a local JUCE checkout")
+set(SUBLAB808_JUCE_COMMIT "91ad83ae34a81e0833b1a2b0866f54846370ae53")
 if (SUBLAB808_JUCE_PATH AND EXISTS "${SUBLAB808_JUCE_PATH}/CMakeLists.txt")
+    execute_process(COMMAND git -C "${SUBLAB808_JUCE_PATH}" rev-parse HEAD
+        OUTPUT_VARIABLE SUBLAB808_LOCAL_JUCE_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if (NOT SUBLAB808_LOCAL_JUCE_COMMIT STREQUAL SUBLAB808_JUCE_COMMIT)
+        message(FATAL_ERROR "SUBLAB808_JUCE_PATH must point to JUCE commit ${SUBLAB808_JUCE_COMMIT}")
+    endif()
     add_subdirectory("${SUBLAB808_JUCE_PATH}" JUCE)
-elseif (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/JUCE/CMakeLists.txt")
-    add_subdirectory(external/JUCE JUCE)
-elseif (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../ReverseLab/external/JUCE/CMakeLists.txt")
-    add_subdirectory(../ReverseLab/external/JUCE JUCE)
 else()
     FetchContent_Declare(JUCE
         GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
-        GIT_TAG 8.0.15
+        GIT_TAG ${SUBLAB808_JUCE_COMMIT}
         GIT_SHALLOW TRUE)
     FetchContent_MakeAvailable(JUCE)
 endif()

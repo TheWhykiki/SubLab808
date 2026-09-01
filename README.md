@@ -1,6 +1,6 @@
 # SubLab808
 
-Eigenständiger, nativer 808-Bass-Synth für Apple Silicon und Cubase (VST3), Version 1.2.
+Eigenständiger, nativer 808-Bass-Synth für Apple Silicon und Cubase (VST3), Version 1.3.
 Die Klangerzeugung ist neu implementiert und verwendet keine Binärdaten oder Samples von 808 Lab.
 
 ## Regler

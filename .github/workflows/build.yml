@@ -1,0 +1,21 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  macos-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -G Xcode
+      - name: Build and test
+        run: |
+          cmake --build build --config Release --target SubLab808Tests SubLab808_VST3
+          ctest --test-dir build -C Release --output-on-failure
+      - name: Verify deployment target
+        run: |
+          binary="build/SubLab808_artefacts/Release/VST3/SubLab808.vst3/Contents/MacOS/SubLab808"
+          otool -l "$binary" | grep -A3 LC_BUILD_VERSION | grep "minos 11.0"

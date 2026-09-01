@@ -6,7 +6,7 @@
 - Apple Silicon Mac
 - Xcode command-line tools
 - CMake 3.25 or newer
-- JUCE 8.0.15 (downloaded automatically when no local checkout is found)
+- JUCE 8.0.15 at commit `91ad83ae34a81e0833b1a2b0866f54846370ae53` (downloaded automatically when no local checkout is supplied)
 
 ## Configure and build
 
@@ -32,4 +32,12 @@ Copy the bundle to `~/Library/Audio/Plug-Ins/VST3/`, then restart Cubase or resc
 
 ## Tests
 
-`SubLab808Smoke` verifies audio generation, every factory preset, state restoration, Gate mode, Pitch Bend, editor construction, and UI rendering. The rendered preview is written to `build/SubLab808-preview.png`.
+`SubLab808Smoke` verifies audio generation, every factory preset, parameter/state restoration, Gate mode, Pitch Bend, MIDI panic, output bounds, editor construction, and UI rendering. The rendered preview is written to `build/SubLab808-preview.png`.
+
+Release builds must be created from a clean build directory. Verify the compatibility target with:
+
+```sh
+otool -l build/SubLab808_artefacts/Release/VST3/SubLab808.vst3/Contents/MacOS/SubLab808 | grep -A3 LC_BUILD_VERSION
+```
+
+Public distribution additionally requires an Apple Developer ID Application certificate and notarization. Local ad-hoc signing is suitable only for the current machine.

@@ -39,8 +39,8 @@ SubLab808Editor::SubLab808Editor(SubLab808Processor& p)
 {
     setLookAndFeel(&look);
     setResizable(true, true);
-    setResizeLimits(700, 430, 1100, 680);
-    setSize(860, 520);
+    setResizeLimits(820, 430, 1100, 680);
+    setSize(audioProcessor.editorWidth.load(), audioProcessor.editorHeight.load());
     addDial(decay, "decay", "DECAY", " s");
     addDial(release, "release", "RELEASE", " s");
     addDial(punch, "punch", "PITCH PUNCH", " st");
@@ -57,6 +57,11 @@ SubLab808Editor::SubLab808Editor(SubLab808Processor& p)
     presetLabel.setJustificationType(juce::Justification::centredRight);
     presetLabel.setColour(juce::Label::textColourId, juce::Colour(0xff7e8b96));
     presetLabel.setFont(juce::FontOptions(10.0f, juce::Font::bold));
+    presetBox.setName("Factory Preset");
+    presetBox.setTitle("Factory Preset");
+    presetBox.setDescription("Selects one of the factory bass sounds");
+    presetBox.setTooltip("Factory preset; manual edits are shown as Custom");
+    presetBox.setTextWhenNothingSelected("Custom");
     addAndMakeVisible(presetLabel);
     for (int i = 0; i < audioProcessor.getNumPrograms(); ++i)
         presetBox.addItem(audioProcessor.getProgramName(i), i + 1);
@@ -68,6 +73,9 @@ SubLab808Editor::SubLab808Editor(SubLab808Processor& p)
     addAndMakeVisible(presetBox);
     oneShotButton.setColour(juce::ToggleButton::textColourId, juce::Colour(0xffaab4bd));
     oneShotButton.setColour(juce::ToggleButton::tickColourId, juce::Colour(0xffff4f2e));
+    oneShotButton.setTitle("One Shot playback mode");
+    oneShotButton.setDescription("When enabled, notes play their full decay after note-off. When disabled, note-off uses Release.");
+    oneShotButton.setTooltip("Play the full decay after releasing a MIDI note");
     addAndMakeVisible(oneShotButton);
     oneShotAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(audioProcessor.parameters, "oneshot", oneShotButton);
     startTimerHz(30);
@@ -80,6 +88,10 @@ void SubLab808Editor::addDial(Dial& dial, const juce::String& id, const juce::St
     dial.slider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
     dial.slider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 74, 22);
     dial.slider.setTextValueSuffix(suffix);
+    dial.slider.setName(title);
+    dial.slider.setTitle(title);
+    dial.slider.setDescription("SubLab808 " + title.toLowerCase() + " parameter");
+    dial.slider.setTooltip(title + suffix);
     if (id == "decay" || id == "release" || id == "pitchdecay" || id == "glide") dial.slider.setNumDecimalPlacesToDisplay(3);
     else if (id == "drive" || id == "output") dial.slider.setNumDecimalPlacesToDisplay(1);
     else dial.slider.setNumDecimalPlacesToDisplay(0);
@@ -108,19 +120,20 @@ void SubLab808Editor::paint(juce::Graphics& g)
     g.setColour(juce::Colour(0xff11161b)); g.fillRoundedRectangle(panel, 12.0f);
     g.setColour(juce::Colour(0xff273039)); g.drawRoundedRectangle(panel, 12.0f, 1.0f);
     g.setColour(juce::Colour(0xff1f272e)); g.drawVerticalLine(getWidth() / 2, 118.0f, (float) getHeight() - 52.0f);
-    auto meterBounds = juce::Rectangle<float>((float) getWidth() - 190.0f, 40.0f, 150.0f, 8.0f);
+    auto meterBounds = juce::Rectangle<float>((float) getWidth() - 140.0f, 40.0f, 100.0f, 8.0f);
     g.setColour(juce::Colour(0xff252d35)); g.fillRoundedRectangle(meterBounds, 4.0f);
     g.setColour(meter > 0.88f ? juce::Colour(0xffffd166) : juce::Colour(0xffff4f2e));
     g.fillRoundedRectangle(meterBounds.withWidth(meterBounds.getWidth() * juce::jlimit(0.0f, 1.0f, meter)), 4.0f);
     g.setColour(juce::Colour(0xff606d77)); g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
-    g.drawText("OUTPUT", getWidth() - 190, 53, 150, 16, juce::Justification::centredRight);
+    g.drawText("OUTPUT LEVEL", getWidth() - 140, 53, 100, 16, juce::Justification::centredRight);
 }
 
 void SubLab808Editor::resized()
 {
-    presetLabel.setBounds(getWidth() / 2 - 40, 35, 112, 25);
-    presetBox.setBounds(getWidth() / 2 + 78, 34, 190, 28);
-    oneShotButton.setBounds(getWidth() / 2 + 278, 34, 100, 28);
+    const auto presetX = juce::jmax(280, getWidth() / 2 - 130);
+    presetLabel.setBounds(presetX, 35, 90, 25);
+    presetBox.setBounds(presetX + 96, 34, 180, 28);
+    oneShotButton.setBounds(presetX + 286, 34, 96, 28);
     auto area = getLocalBounds().reduced(36).withTrimmedTop(82).withTrimmedBottom(12);
     auto rowHeight = area.getHeight() / 2;
     for (int row = 0; row < 2; ++row) {
@@ -133,12 +146,14 @@ void SubLab808Editor::resized()
             dial->slider.setBounds(cell);
         }
     }
+    audioProcessor.editorWidth.store(getWidth());
+    audioProcessor.editorHeight.store(getHeight());
 }
 
 void SubLab808Editor::timerCallback()
 {
-    meter = audioProcessor.outputMeter.load();
-    audioProcessor.outputMeter.store(meter * 0.88f);
-    presetBox.setSelectedId(audioProcessor.getCurrentProgram() + 1, juce::dontSendNotification);
-    repaint(getWidth() - 200, 30, 175, 45);
+    meter = juce::jmax(audioProcessor.outputMeter.exchange(0.0f), meter * 0.88f);
+    presetBox.setSelectedId(audioProcessor.isPresetModified() ? 0 : audioProcessor.getCurrentProgram() + 1,
+                            juce::dontSendNotification);
+    repaint(getWidth() - 150, 30, 120, 45);
 }
