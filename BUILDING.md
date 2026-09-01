@@ -12,7 +12,7 @@
 
 ```sh
 cmake -S . -B build -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target SubLab808Tests SubLab808_VST3 -j 4
+cmake --build build --target SubLab808Tests SubLab808_VST3 SubLab808HostTests -j 4
 ctest --test-dir build --output-on-failure
 ```
 
@@ -32,7 +32,7 @@ Copy the bundle to `~/Library/Audio/Plug-Ins/VST3/`, then restart Cubase or resc
 
 ## Tests
 
-`SubLab808Smoke` verifies audio generation, every factory preset, parameter/state restoration, Gate mode, Pitch Bend, MIDI panic, output bounds, editor construction, and UI rendering. The rendered preview is written to `build/SubLab808-preview.png`.
+`SubLab808Smoke` verifies audio generation, every factory preset, parameter/state restoration, Gate mode, Pitch Bend, MIDI panic, output bounds, editor construction, and UI rendering. `SubLab808BundleLoad` scans and instantiates the built VST3 through JUCE's VST3 host implementation, then renders MIDI-driven audio through the bundle. The rendered preview is written to `build/SubLab808-preview.png`.
 
 Release builds must be created from a clean build directory. Verify the compatibility target with:
 

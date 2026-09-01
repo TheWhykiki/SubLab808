@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.1
+
+- Added an automated VST3 bundle scan and host-instantiation test.
+- Added MIDI-driven audio rendering through the built plugin bundle.
+- Revalidated the clean macOS 11 ARM64 release and Cubase metadata.
+
 ## 1.3.0
 
 - Smoothed automated DSP parameters to prevent zipper noise.

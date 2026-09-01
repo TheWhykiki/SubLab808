@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version" FORCE)
-project(SubLab808 VERSION 1.3.0 LANGUAGES C CXX)
+project(SubLab808 VERSION 1.3.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -58,3 +58,14 @@ target_link_libraries(SubLab808Tests PRIVATE juce::juce_audio_utils juce::juce_d
 
 enable_testing()
 add_test(NAME SubLab808Smoke COMMAND SubLab808Tests)
+
+juce_add_console_app(SubLab808HostTests PRODUCT_NAME "SubLab808 Host Tests")
+juce_generate_juce_header(SubLab808HostTests)
+target_sources(SubLab808HostTests PRIVATE Tests/HostTest.cpp)
+target_compile_definitions(SubLab808HostTests PUBLIC
+    JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_PLUGINHOST_VST3=1)
+target_link_libraries(SubLab808HostTests PRIVATE juce::juce_audio_utils
+    PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
+add_dependencies(SubLab808HostTests SubLab808_VST3)
+add_test(NAME SubLab808BundleLoad COMMAND SubLab808HostTests
+    "${CMAKE_BINARY_DIR}/SubLab808_artefacts/$<CONFIG>/VST3/SubLab808.vst3")

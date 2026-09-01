@@ -13,7 +13,7 @@ jobs:
         run: cmake -S . -B build -G Xcode
       - name: Build and test
         run: |
-          cmake --build build --config Release --target SubLab808Tests SubLab808_VST3
+          cmake --build build --config Release --target SubLab808Tests SubLab808_VST3 SubLab808HostTests
           ctest --test-dir build -C Release --output-on-failure
       - name: Verify deployment target
         run: |
