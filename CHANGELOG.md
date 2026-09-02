@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- CI now fails unless the built VST3 contains exactly the intended ARM64 architecture.
+- Host-test failures report invalid MIDI capability and plugin names explicitly; removed the unsafe SIGABRT handler.
+- UI snapshot validation encodes in memory instead of leaving generated files in the checkout.
 - Legato: a new note played while another is held with Glide active now slides without retriggering the envelope, phase and click (previously every slide clicked from a phase reset).
 - Idle voices stop rendering once envelope, click and filter have decayed.
 - Program changes from the editor are reported to the host; tail length reduced to 8 s.

@@ -1,20 +1,15 @@
 #include <JuceHeader.h>
-#include <csignal>
 #include <cstdio>
 
-// Every stage reports to stderr so a CI failure identifies where the host test died. An abort
-// handler makes SIGABRT (e.g. an uncaught exception or dyld/codesign refusal) visible as well.
+// Every stage reports to stderr so a CI failure identifies where the host test died.
 namespace {
-const char* currentStage = "startup";
-void stage(const char* name) { currentStage = name; std::fprintf(stderr, "[host-test] %s\n", name); std::fflush(stderr); }
-void onAbort(int) { std::fprintf(stderr, "[host-test] aborted during: %s\n", currentStage); std::fflush(stderr); std::_Exit(99); }
+void stage(const char* name) { std::fprintf(stderr, "[host-test] %s\n", name); std::fflush(stderr); }
 }
 
 int runHostTest(int argc, char** argv);
 
 int main(int argc, char** argv)
 {
-    std::signal(SIGABRT, onAbort);
     int result = 0;
     {
         juce::ScopedJuceInitialiser_GUI initialiseJuce;
@@ -47,7 +42,14 @@ int runHostTest(int argc, char** argv)
         std::fprintf(stderr, "[host-test] instantiation failed: %s\n", error.toRawUTF8());
         return 3;
     }
-    if (! instance->acceptsMidi() || instance->getName() != "SubLab808") return 4;
+    if (! instance->acceptsMidi()) {
+        std::fprintf(stderr, "[host-test] plugin does not accept MIDI\n");
+        return 4;
+    }
+    if (instance->getName() != "SubLab808") {
+        std::fprintf(stderr, "[host-test] unexpected plugin name: %s\n", instance->getName().toRawUTF8());
+        return 4;
+    }
 
     stage("rendering audio");
     // A VST3 host promises never to exceed the block size passed to prepareToPlay(); the JUCE

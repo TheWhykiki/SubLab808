@@ -140,11 +140,8 @@ int main()
     std::unique_ptr<juce::AudioProcessorEditor> editor(processor.createEditor());
     editor->setSize(820, 520);
     auto preview = editor->createComponentSnapshot(editor->getLocalBounds(), true, 1.0f);
-    auto previewFile = juce::File::getCurrentWorkingDirectory().getChildFile("SubLab808-preview.png");
-    previewFile.deleteFile();
-    if (auto stream = previewFile.createOutputStream()) {
-        juce::PNGImageFormat png;
-        if (! png.writeImageToStream(preview, *stream)) return 11;
-    } else return 12;
+    juce::MemoryOutputStream previewData;
+    juce::PNGImageFormat png;
+    if (! png.writeImageToStream(preview, previewData) || previewData.getDataSize() == 0) return 11;
     return 0;
 }
