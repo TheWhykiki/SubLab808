@@ -50,12 +50,22 @@ int runHostTest(int argc, char** argv)
     if (! instance->acceptsMidi() || instance->getName() != "SubLab808") return 4;
 
     stage("rendering audio");
-    instance->prepareToPlay(48000.0, 512);
-    juce::AudioBuffer<float> audio(2, 2048);
+    // A VST3 host promises never to exceed the block size passed to prepareToPlay(); the JUCE
+    // wrapper sizes its scratch buffers to exactly that. Render in blocks of that size, as a real
+    // host does - a single oversized block would overflow the wrapper's buffers (heap corruption
+    // that showed up as intermittent silence or an abort on teardown in CI).
+    constexpr int blockSize = 512;
+    instance->prepareToPlay(48000.0, blockSize);
+    juce::AudioBuffer<float> audio(2, blockSize);
     juce::MidiBuffer midi;
     midi.addEvent(juce::MidiMessage::noteOn(1, 36, (juce::uint8) 110), 0);
-    instance->processBlock(audio, midi);
-    const auto peak = audio.getMagnitude(0, audio.getNumSamples());
+    float peak = 0.0f;
+    for (int block = 0; block < 4; ++block)
+    {
+        instance->processBlock(audio, midi);
+        midi.clear();
+        peak = juce::jmax(peak, audio.getMagnitude(0, audio.getNumSamples()));
+    }
     if (! std::isfinite(peak) || peak <= 0.0001f || peak > 1.001f) { std::fprintf(stderr, "[host-test] bad peak %f\n", (double) peak); return 5; }
 
     // Tear down in explicit steps so an abort during shutdown names the responsible stage.

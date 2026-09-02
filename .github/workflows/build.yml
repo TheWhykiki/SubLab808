@@ -2,6 +2,7 @@ name: build
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
@@ -31,3 +32,29 @@ jobs:
         with:
           name: SubLab808-VST3-${{ github.sha }}
           path: build/SubLab808_artefacts/Release/VST3/SubLab808.vst3
+
+  sanitizers:
+    name: ASan + UBSan (tests and host test)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache JUCE
+        uses: actions/cache@v4
+        with:
+          path: build-asan/_deps
+          key: juce-91ad83ae34a81e0833b1a2b0866f54846370ae53
+      - name: Configure
+        run: >
+          cmake -S . -B build-asan -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_C_FLAGS="-fsanitize=address,undefined"
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
+          -DCMAKE_MODULE_LINKER_FLAGS="-fsanitize=address,undefined"
+      - name: Build
+        run: cmake --build build-asan --target SubLab808Tests SubLab808_VST3 SubLab808HostTests -j "$(sysctl -n hw.ncpu)"
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: ctest --test-dir build-asan --output-on-failure

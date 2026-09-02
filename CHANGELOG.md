@@ -6,7 +6,8 @@
 - Idle voices stop rendering once envelope, click and filter have decayed.
 - Program changes from the editor are reported to the host; tail length reduced to 8 s.
 - Parameter identifiers carry version hints (VST3 IDs unchanged).
-- Tests: legato click detector, sample-rate invariance of the envelope, staged diagnostics in the VST3 host test.
+- Fixed the VST3 host test overflowing the wrapper's scratch buffers by processing a 2048-sample block after preparing for 512 (intermittent silence or abort in CI); it now renders in host-sized blocks.
+- Tests: legato click detector, sample-rate invariance of the envelope, staged diagnostics in the VST3 host test, AddressSanitizer/UBSan CI job.
 - CI: builds with the documented Unix Makefiles generator, caches JUCE, uploads the VST3 artefact.
 
 ## 1.3.1
