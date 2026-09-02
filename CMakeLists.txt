@@ -1,10 +1,13 @@
 cmake_minimum_required(VERSION 3.25)
-set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version" FORCE)
+if(CMAKE_HOST_APPLE)
+    # Must be set before project(); Apple-only so the test suite still configures elsewhere.
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version" FORCE)
+    set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "Apple Silicon build" FORCE)
+endif()
 project(SubLab808 VERSION 1.3.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "Apple Silicon build" FORCE)
 
 include(FetchContent)
 set(SUBLAB808_JUCE_PATH "" CACHE PATH "Optional path to a local JUCE checkout")
@@ -41,7 +44,8 @@ juce_generate_juce_header(SubLab808)
 target_sources(SubLab808 PRIVATE
     Source/PluginProcessor.cpp Source/PluginProcessor.h
     Source/PluginEditor.cpp Source/PluginEditor.h)
-target_compile_definitions(SubLab808 PUBLIC JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0)
+target_compile_definitions(SubLab808 PUBLIC JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0
+    SUBLAB808_VERSION_STRING="${PROJECT_VERSION}")
 target_link_libraries(SubLab808 PRIVATE juce::juce_audio_utils juce::juce_dsp
     PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_lto_flags juce::juce_recommended_warning_flags)
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Legato: a new note played while another is held with Glide active now slides without retriggering the envelope, phase and click (previously every slide clicked from a phase reset).
+- Idle voices stop rendering once envelope, click and filter have decayed.
+- Program changes from the editor are reported to the host; tail length reduced to 8 s.
+- Parameter identifiers carry version hints (VST3 IDs unchanged).
+- Tests: legato click detector, sample-rate invariance of the envelope, staged diagnostics in the VST3 host test.
+- CI: builds with the documented Unix Makefiles generator, caches JUCE, uploads the VST3 artefact.
+
 ## 1.3.1
 
 - Added an automated VST3 bundle scan and host-instantiation test.

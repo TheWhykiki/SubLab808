@@ -9,7 +9,7 @@ Die Klangerzeugung ist neu implementiert und verwendet keine Binärdaten oder Sa
 - Release: Loslasszeit im Gate-Modus
 - Pitch Punch: anfänglicher Pitch-Abfall in Halbtönen
 - Pitch Decay: Dauer des Pitch-Abfalls
-- Glide: Portamento zwischen MIDI-Noten
+- Glide: Portamento zwischen MIDI-Noten; wird eine neue Note gespielt, während die vorige gehalten ist, gleitet die Tonhöhe ohne Neuauslösung (Legato)
 - Tune: Stimmung in Halbtönen
 - Body: zweite Harmonische für mehr Durchsetzung
 - Click: kurzer Attack-Transient
