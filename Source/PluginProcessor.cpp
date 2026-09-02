@@ -33,7 +33,11 @@ SubLab808Processor::SubLab808Processor()
     : AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true)),
       parameters(*this, nullptr, "PARAMETERS", makeLayout())
 {
-    setCurrentProgram(0);
+    clearHeldKeys();
+    ControlOperation initialProgram;
+    initialProgram.programIndex = 0;
+    initialProgram.notifyHost = false;
+    submitControlOperation(std::move(initialProgram));
     for (const auto& field : presetFields) parameters.addParameterListener(field.id, this);
     parameters.addParameterListener("oneshot", this);
 }
@@ -64,22 +68,121 @@ const juce::String SubLab808Processor::getProgramName(int index)
 void SubLab808Processor::setCurrentProgram(int index)
 {
     if (! juce::isPositiveAndBelow(index, getNumPrograms())) return;
-    applyingPreset.store(true);
+
+    ControlOperation operation;
+    operation.programIndex = index;
+    submitControlOperation(std::move(operation));
+}
+
+void SubLab808Processor::submitControlOperation(ControlOperation operation)
+{
+    const auto caller = juce::Thread::getCurrentThreadId();
+    std::unique_lock lock(controlMutex);
+
+    const auto enqueue = [this] (ControlOperation pending) {
+        // Preserve finite FIFO cascades such as A -> B -> A, while placing a hard
+        // ceiling on pathological listeners that request a new program forever.
+        if (controlOperationBudget == 0) return;
+        --controlOperationBudget;
+        pendingControlOperations.push_back(std::move(pending));
+    };
+
+    // Calls made recursively from our own listener callbacks are deferred until
+    // the outermost operation finishes. This prevents an old listener traversal
+    // from resuming after a newer preset has already been published.
+    if (controlOwner == caller) {
+        if (stateRestoreActive.load()) return;
+        enqueue(std::move(operation));
+        return;
+    }
+
+    // AudioProcessor setters are synchronous: an independent control thread waits
+    // for the current writer, then applies its operation before returning. Callers
+    // must not create a cross-thread wait cycle by joining such a setter from one
+    // of the processor's own synchronous callbacks.
+    while (controlOwner != nullptr)
+        controlCondition.wait(lock);
+
+    controlOwner = caller;
+    controlOperationBudget = maxControlOperationsPerDrain - 1;
+    lock.unlock();
+
+    for (;;) {
+        performControlOperation(operation);
+
+        lock.lock();
+        if (pendingControlOperations.empty()) {
+            controlOwner = nullptr;
+            controlOperationBudget = 0;
+            lock.unlock();
+            controlCondition.notify_all();
+            return;
+        }
+        operation = std::move(pendingControlOperations.front());
+        pendingControlOperations.pop_front();
+        lock.unlock();
+    }
+}
+
+void SubLab808Processor::performControlOperation(const ControlOperation& operation)
+{
+    bool programChanged = false;
+    {
+        beginStateTransaction();
+        const juce::ScopeGuard finishTransaction { [this] { endStateTransaction(); } };
+        if (operation.kind == ControlOperation::Kind::program)
+            programChanged = applyProgramNow(operation.programIndex);
+        else
+            applyStateNow(operation.state);
+    }
+
+    if (programChanged && operation.notifyHost) {
+        updateHostDisplay(ChangeDetails().withProgramChanged(true));
+    }
+}
+
+bool SubLab808Processor::applyProgramNow(int index)
+{
+    if (! juce::isPositiveAndBelow(index, getNumPrograms())) return false;
+
+    if (currentProgram.load() == index && parametersMatchProgram(index)) {
+        presetModified.store(false);
+        return false;
+    }
+
+    struct ParameterUpdate { juce::RangedAudioParameter* parameter; float normalisedValue; };
+    std::array<ParameterUpdate, presetFields.size() + 1> updates {};
+    size_t updateCount = 0;
+
+    internalParameterChangeDepth.fetch_add(1);
     const auto& preset = factoryPresets[(size_t) index];
+    const auto stage = [&] (juce::RangedAudioParameter* parameter, float normalisedValue) {
+        if (parameter == nullptr) return;
+        parameter->setValue(normalisedValue);
+        updates[updateCount++] = { parameter, parameter->getValue() };
+    };
     for (const auto& field : presetFields)
         if (auto* parameter = parameters.getParameter(field.id))
-            parameter->setValueNotifyingHost(parameter->convertTo0to1(preset.values.*field.member));
-    if (auto* parameter = parameters.getParameter("oneshot"))
-        parameter->setValueNotifyingHost(preset.oneShot ? 1.0f : 0.0f);
+            stage(parameter, parameter->convertTo0to1(preset.values.*field.member));
+    stage(parameters.getParameter("oneshot"), preset.oneShot ? 1.0f : 0.0f);
+
+    for (size_t i = 0; i < updateCount; ++i)
+        updates[i].parameter->sendValueChangedMessageToListeners(updates[i].normalisedValue);
+
     currentProgram.store(index);
-    presetModified.store(false);
-    applyingPreset.store(false);
-    updateHostDisplay(ChangeDetails().withProgramChanged(true));
+    // Do not blindly clear this flag: a host automation write may interleave with
+    // the parameter notifications above. Check once while callbacks are suppressed,
+    // then again after opening the callback gate to close both race windows.
+    presetModified.store(! parametersMatchProgram(index));
+    internalParameterChangeDepth.fetch_sub(1);
+    if (! parametersMatchProgram(index)) presetModified.store(true);
+
+    return true;
 }
 
 void SubLab808Processor::parameterChanged(const juce::String&, float)
 {
-    if (! applyingPreset.load()) presetModified.store(true);
+    if (internalParameterChangeDepth.load() == 0) presetModified.store(true);
 }
 
 uint64_t SubLab808Processor::packEditorSize(int width, int height) noexcept
@@ -119,35 +222,67 @@ juce::AudioProcessorValueTreeState::ParameterLayout SubLab808Processor::makeLayo
     return { p.begin(), p.end() };
 }
 
+SubLab808Processor::RuntimeParameters SubLab808Processor::readRuntimeParameters() const
+{
+    RuntimeParameters result;
+    result.decay = parameters.getRawParameterValue("decay")->load();
+    result.release = parameters.getRawParameterValue("release")->load();
+    result.punch = parameters.getRawParameterValue("punch")->load();
+    result.pitchDecay = parameters.getRawParameterValue("pitchdecay")->load();
+    result.glide = parameters.getRawParameterValue("glide")->load();
+    result.tune = parameters.getRawParameterValue("tune")->load();
+    result.body = parameters.getRawParameterValue("body")->load();
+    result.click = parameters.getRawParameterValue("click")->load();
+    result.drive = parameters.getRawParameterValue("drive")->load();
+    result.tone = parameters.getRawParameterValue("tone")->load();
+    result.velocity = parameters.getRawParameterValue("velocity")->load();
+    result.output = parameters.getRawParameterValue("output")->load();
+    result.oneShot = parameters.getRawParameterValue("oneshot")->load() >= 0.5f;
+    return result;
+}
+
+void SubLab808Processor::refreshRuntimeParameters() noexcept
+{
+    const auto before = parameterTransactionSequence.load(std::memory_order_acquire);
+    if ((before & 1u) != 0) return;
+
+    const auto candidate = readRuntimeParameters();
+    const auto after = parameterTransactionSequence.load(std::memory_order_acquire);
+    if (before == after) runtimeParameters = candidate;
+}
+
 void SubLab808Processor::prepareToPlay(double sr, int)
 {
     sampleRate = sr;
     resetSound();
+    runtimeParameters = readRuntimeParameters();
     clickCoef = std::exp(-1.0f / (0.0006f * (float) sampleRate));
     ampCoef.reset(sampleRate, 0.02); pitchCoef.reset(sampleRate, 0.02);
     glideCoef.reset(sampleRate, 0.02); releaseCoef.reset(sampleRate, 0.02);
     drive.reset(sampleRate, 0.02); outputGain.reset(sampleRate, 0.02);
     filterCoef.reset(sampleRate, 0.02); body.reset(sampleRate, 0.02);
-    const auto decay = parameters.getRawParameterValue("decay")->load();
-    const auto pitchDecay = parameters.getRawParameterValue("pitchdecay")->load();
-    const auto release = parameters.getRawParameterValue("release")->load();
-    const auto glide = parameters.getRawParameterValue("glide")->load();
+    tuneSemitones.reset(sampleRate, 0.005);
+    for (auto& bend : channelBendSemitones) bend.reset(sampleRate, 0.005);
+    const auto decay = runtimeParameters.decay;
+    const auto pitchDecay = runtimeParameters.pitchDecay;
+    const auto release = runtimeParameters.release;
+    const auto glide = runtimeParameters.glide;
     ampCoef.setCurrentAndTargetValue(std::exp(-1.0f / (decay * (float) sampleRate)));
     pitchCoef.setCurrentAndTargetValue(std::exp(-1.0f / (pitchDecay * (float) sampleRate)));
     releaseCoef.setCurrentAndTargetValue(std::exp(-1.0f / (release * (float) sampleRate)));
     glideCoef.setCurrentAndTargetValue(glide <= 0.0001f ? 0.0f : (float) std::exp(-1.0 / (glide * sampleRate)));
-    drive.setCurrentAndTargetValue(juce::Decibels::decibelsToGain(parameters.getRawParameterValue("drive")->load()));
-    outputGain.setCurrentAndTargetValue(juce::Decibels::decibelsToGain(parameters.getRawParameterValue("output")->load()));
-    filterCoef.setCurrentAndTargetValue((float) std::exp(-juce::MathConstants<double>::twoPi * parameters.getRawParameterValue("tone")->load() / sampleRate));
-    body.setCurrentAndTargetValue(parameters.getRawParameterValue("body")->load() * 0.01f);
-    tuneSemitones = std::round(parameters.getRawParameterValue("tune")->load());
+    drive.setCurrentAndTargetValue(juce::Decibels::decibelsToGain(runtimeParameters.drive));
+    outputGain.setCurrentAndTargetValue(juce::Decibels::decibelsToGain(runtimeParameters.output));
+    filterCoef.setCurrentAndTargetValue((float) std::exp(-juce::MathConstants<double>::twoPi * runtimeParameters.tone / sampleRate));
+    body.setCurrentAndTargetValue(runtimeParameters.body * 0.01f);
+    tuneSemitones.setCurrentAndTargetValue(std::round(runtimeParameters.tune));
 }
 
 void SubLab808Processor::resetSound()
 {
     phase = 0.0; amp = 0.0f; pitchEnv = 0.0f; filterState = 0.0f; click = 0.0f;
     active = false; gateReleased = false; currentKey = -1;
-    channelBendSemitones.fill(0.0f);
+    for (auto& bend : channelBendSemitones) bend.setCurrentAndTargetValue(0.0f);
     clearHeldKeys();
 }
 
@@ -160,18 +295,36 @@ int SubLab808Processor::keyForMidiMessage(int channel, int note) noexcept
 
 void SubLab808Processor::removeHeldKeyFromOrder(int key)
 {
-    for (int i = numHeldKeys - 1; i >= 0; --i)
-        if (heldKeys[(size_t) i] == key) {
-            for (int j = i; j < numHeldKeys - 1; ++j) heldKeys[(size_t) j] = heldKeys[(size_t) (j + 1)];
-            --numHeldKeys;
-            return;
-        }
+    const auto previous = previousHeldKeys[(size_t) key];
+    const auto next = nextHeldKeys[(size_t) key];
+    if (previous < 0 && next < 0 && oldestHeldKey != key) return;
+
+    if (previous >= 0) nextHeldKeys[(size_t) previous] = next;
+    else oldestHeldKey = next;
+    if (next >= 0) previousHeldKeys[(size_t) next] = previous;
+    else newestHeldKey = previous;
+    previousHeldKeys[(size_t) key] = -1;
+    nextHeldKeys[(size_t) key] = -1;
+    --numHeldKeys;
+}
+
+void SubLab808Processor::appendHeldKeyToOrder(int key)
+{
+    previousHeldKeys[(size_t) key] = newestHeldKey;
+    nextHeldKeys[(size_t) key] = -1;
+    if (newestHeldKey >= 0) nextHeldKeys[(size_t) newestHeldKey] = key;
+    else oldestHeldKey = key;
+    newestHeldKey = key;
+    ++numHeldKeys;
 }
 
 void SubLab808Processor::clearHeldKeys()
 {
     heldKeyCounts.fill(0);
+    previousHeldKeys.fill(-1);
+    nextHeldKeys.fill(-1);
     numHeldKeys = 0;
+    oldestHeldKey = newestHeldKey = -1;
 }
 
 void SubLab808Processor::triggerNote(int channel, int note, float newVelocity)
@@ -182,23 +335,23 @@ void SubLab808Processor::triggerNote(int channel, int note, float newVelocity)
     // A new note played while another one is still held and Glide is active is a legato slide:
     // the pitch glides to the new note and the running envelope, phase and click continue.
     // Retriggering here would reset the phase to zero mid-cycle and click on every slide.
-    const auto glideTime = parameters.getRawParameterValue("glide")->load();
+    const auto glideTime = runtimeParameters.glide;
     const auto currentNote = currentKey >= 0 ? currentKey % midiNoteCount : -1;
     const bool legato = active && numHeldKeys > 0 && note != currentNote && glideTime >= 0.001f;
 
     auto& holdCount = heldKeyCounts[(size_t) key];
-    if (holdCount < std::numeric_limits<uint16_t>::max()) ++holdCount;
+    if (holdCount < std::numeric_limits<uint32_t>::max()) ++holdCount;
     removeHeldKeyFromOrder(key);
-    heldKeys[(size_t) numHeldKeys++] = key;
+    appendHeldKeyToOrder(key);
 
     targetHz = juce::MidiMessage::getMidiNoteInHertz(note); // Tune is applied live in renderSample().
     if (! active || glideTime < 0.001f) currentHz = targetHz;
     if (legato) { currentKey = key; gateReleased = false; return; }
-    auto velocityAmount = parameters.getRawParameterValue("velocity")->load() * 0.01f;
+    auto velocityAmount = runtimeParameters.velocity * 0.01f;
     velocity = juce::jmap(velocityAmount, 1.0f, juce::jlimit(0.0f, 1.0f, newVelocity));
     amp = 1.0f;
-    pitchEnv = parameters.getRawParameterValue("punch")->load();
-    click = parameters.getRawParameterValue("click")->load() * 0.01f;
+    pitchEnv = runtimeParameters.punch;
+    click = runtimeParameters.click * 0.01f;
     phase = 0.0;
     currentKey = key;
     gateReleased = false;
@@ -214,10 +367,10 @@ void SubLab808Processor::releaseNote(int channel, int note)
     if (--holdCount > 0) return;
 
     removeHeldKeyFromOrder(key);
-    if (parameters.getRawParameterValue("oneshot")->load() >= 0.5f) return;
+    if (runtimeParameters.oneShot) return;
     if (key != currentKey) return;
     if (numHeldKeys > 0) {
-        currentKey = heldKeys[(size_t) (numHeldKeys - 1)];
+        currentKey = newestHeldKey;
         targetHz = juce::MidiMessage::getMidiNoteInHertz(currentKey % midiNoteCount);
         gateReleased = false;
     } else {
@@ -232,18 +385,15 @@ void SubLab808Processor::allNotesOff(int channel)
     const auto firstKey = channelIndex * midiNoteCount;
     const bool ownsCurrentVoice = currentKey >= firstKey && currentKey < firstKey + midiNoteCount;
 
-    for (int note = 0; note < midiNoteCount; ++note) heldKeyCounts[(size_t) (firstKey + note)] = 0;
-    int writeIndex = 0;
-    for (int readIndex = 0; readIndex < numHeldKeys; ++readIndex) {
-        const auto key = heldKeys[(size_t) readIndex];
-        if (key < firstKey || key >= firstKey + midiNoteCount)
-            heldKeys[(size_t) writeIndex++] = key;
+    for (int note = 0; note < midiNoteCount; ++note) {
+        const auto key = firstKey + note;
+        heldKeyCounts[(size_t) key] = 0;
+        removeHeldKeyFromOrder(key);
     }
-    numHeldKeys = writeIndex;
 
-    if (! ownsCurrentVoice || parameters.getRawParameterValue("oneshot")->load() >= 0.5f) return;
+    if (! ownsCurrentVoice || runtimeParameters.oneShot) return;
     if (numHeldKeys > 0) {
-        currentKey = heldKeys[(size_t) (numHeldKeys - 1)];
+        currentKey = newestHeldKey;
         targetHz = juce::MidiMessage::getMidiNoteInHertz(currentKey % midiNoteCount);
         gateReleased = false;
     } else {
@@ -258,18 +408,15 @@ void SubLab808Processor::allSoundOff(int channel)
     const auto firstKey = channelIndex * midiNoteCount;
     const bool ownsCurrentVoice = currentKey >= firstKey && currentKey < firstKey + midiNoteCount;
 
-    for (int note = 0; note < midiNoteCount; ++note) heldKeyCounts[(size_t) (firstKey + note)] = 0;
-    int writeIndex = 0;
-    for (int readIndex = 0; readIndex < numHeldKeys; ++readIndex) {
-        const auto key = heldKeys[(size_t) readIndex];
-        if (key < firstKey || key >= firstKey + midiNoteCount)
-            heldKeys[(size_t) writeIndex++] = key;
+    for (int note = 0; note < midiNoteCount; ++note) {
+        const auto key = firstKey + note;
+        heldKeyCounts[(size_t) key] = 0;
+        removeHeldKeyFromOrder(key);
     }
-    numHeldKeys = writeIndex;
 
     if (! ownsCurrentVoice) return;
     if (numHeldKeys > 0) {
-        currentKey = heldKeys[(size_t) (numHeldKeys - 1)];
+        currentKey = newestHeldKey;
         targetHz = juce::MidiMessage::getMidiNoteInHertz(currentKey % midiNoteCount);
         gateReleased = false;
     } else {
@@ -280,6 +427,14 @@ void SubLab808Processor::allSoundOff(int channel)
 
 float SubLab808Processor::renderSample()
 {
+    const auto voiceChannel = currentKey >= 0 ? currentKey / midiNoteCount : -1;
+    float bendSemitones = 0.0f;
+    for (int channel = 0; channel < midiChannelCount; ++channel) {
+        const auto bendNow = channelBendSemitones[(size_t) channel].getNextValue();
+        if (channel == voiceChannel) bendSemitones = bendNow;
+    }
+    const auto tuneNow = tuneSemitones.getNextValue();
+
     // Idle voice: nothing left to render once the envelope, click and filter have died away.
     if (! active && std::abs(filterState) < 1.0e-6f && click < 1.0e-6f)
     {
@@ -292,10 +447,7 @@ float SubLab808Processor::renderSample()
     }
     const auto glideNow = glideCoef.getNextValue();
     currentHz = targetHz + (currentHz - targetHz) * glideNow;
-    const auto voiceChannel = currentKey >= 0 ? currentKey / midiNoteCount : -1;
-    const auto bendSemitones = juce::isPositiveAndBelow(voiceChannel, midiChannelCount)
-                                 ? channelBendSemitones[(size_t) voiceChannel] : 0.0f;
-    auto hz = currentHz * std::pow(2.0, (pitchEnv + bendSemitones + tuneSemitones) / 12.0f);
+    auto hz = currentHz * std::pow(2.0, (pitchEnv + bendSemitones + tuneNow) / 12.0f);
     phase += hz / sampleRate;
     phase -= std::floor(phase);
     auto fundamental = std::sin((float) (juce::MathConstants<double>::twoPi * phase));
@@ -331,21 +483,22 @@ void SubLab808Processor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
 {
     juce::ScopedNoDenormals guard;
     buffer.clear();
-    auto decay = parameters.getRawParameterValue("decay")->load();
-    auto pitchDecay = parameters.getRawParameterValue("pitchdecay")->load();
-    auto release = parameters.getRawParameterValue("release")->load();
-    auto glide = parameters.getRawParameterValue("glide")->load();
-    auto driveDb = parameters.getRawParameterValue("drive")->load();
-    auto cutoff = parameters.getRawParameterValue("tone")->load();
+    refreshRuntimeParameters();
+    const auto decay = runtimeParameters.decay;
+    const auto pitchDecay = runtimeParameters.pitchDecay;
+    const auto release = runtimeParameters.release;
+    const auto glide = runtimeParameters.glide;
+    const auto driveDb = runtimeParameters.drive;
+    const auto cutoff = runtimeParameters.tone;
     ampCoef.setTargetValue(std::exp(-1.0f / (decay * (float) sampleRate)));
     pitchCoef.setTargetValue(std::exp(-1.0f / (pitchDecay * (float) sampleRate)));
     releaseCoef.setTargetValue(std::exp(-1.0f / (release * (float) sampleRate)));
     glideCoef.setTargetValue(glide <= 0.0001f ? 0.0f : (float) std::exp(-1.0 / (glide * sampleRate)));
     filterCoef.setTargetValue((float) std::exp(-juce::MathConstants<double>::twoPi * cutoff / sampleRate));
     drive.setTargetValue(juce::Decibels::decibelsToGain(driveDb));
-    outputGain.setTargetValue(juce::Decibels::decibelsToGain(parameters.getRawParameterValue("output")->load()));
-    body.setTargetValue(parameters.getRawParameterValue("body")->load() * 0.01f);
-    tuneSemitones = std::round(parameters.getRawParameterValue("tune")->load()); // live, unlike note-on only
+    outputGain.setTargetValue(juce::Decibels::decibelsToGain(runtimeParameters.output));
+    body.setTargetValue(runtimeParameters.body * 0.01f);
+    tuneSemitones.setTargetValue(std::round(runtimeParameters.tune)); // live, unlike note-on only
 
     auto midiIterator = midi.begin();
     const auto midiEnd = midi.end();
@@ -359,12 +512,17 @@ void SubLab808Processor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
             else if (message.isPitchWheel()) {
                 const auto channelIndex = message.getChannel() - 1;
                 if (juce::isPositiveAndBelow(channelIndex, midiChannelCount))
-                    channelBendSemitones[(size_t) channelIndex]
-                        = 2.0f * (float) (message.getPitchWheelValue() - 8192) / 8192.0f;
+                    channelBendSemitones[(size_t) channelIndex].setTargetValue(
+                        2.0f * (float) (message.getPitchWheelValue() - 8192) / 8192.0f);
             }
             else if (message.isNoteOff()) releaseNote(message.getChannel(), message.getNoteNumber());
             else if (message.isAllNotesOff()) allNotesOff(message.getChannel());
             else if (message.isAllSoundOff()) allSoundOff(message.getChannel());
+            else if (message.isResetAllControllers()) {
+                const auto channelIndex = message.getChannel() - 1;
+                if (juce::isPositiveAndBelow(channelIndex, midiChannelCount))
+                    channelBendSemitones[(size_t) channelIndex].setTargetValue(0.0f);
+            }
             ++midiIterator;
         }
         float sample = renderSample();
@@ -382,13 +540,67 @@ juce::AudioProcessorEditor* SubLab808Processor::createEditor()
 
 void SubLab808Processor::getStateInformation(juce::MemoryBlock& dest)
 {
+    uint64_t observedGeneration = 0;
+    {
+        const juce::ScopedLock lock(stateSnapshotLock);
+        if (stateTransactionActive) {
+            dest = lastCommittedState;
+            return;
+        }
+        observedGeneration = stateSnapshotGeneration;
+    }
+
+    auto snapshot = createStateSnapshot();
+    {
+        const juce::ScopedLock lock(stateSnapshotLock);
+        if (stateTransactionActive || stateSnapshotGeneration != observedGeneration)
+            dest = lastCommittedState;
+        else {
+            lastCommittedState = snapshot;
+            dest = std::move(snapshot);
+        }
+    }
+}
+
+juce::MemoryBlock SubLab808Processor::createStateSnapshot()
+{
+    juce::MemoryBlock result;
     auto state = parameters.copyState();
     const auto size = getEditorSize();
     state.setProperty("factoryProgram", currentProgram.load(), nullptr);
     state.setProperty("presetModified", presetModified.load(), nullptr);
     state.setProperty("editorWidth", size.x, nullptr);
     state.setProperty("editorHeight", size.y, nullptr);
-    if (auto xml = state.createXml()) copyXmlToBinary(*xml, dest);
+    if (auto xml = state.createXml()) copyXmlToBinary(*xml, result);
+    return result;
+}
+
+void SubLab808Processor::beginStateTransaction()
+{
+    auto baseline = createStateSnapshot();
+    {
+        const juce::ScopedLock lock(stateSnapshotLock);
+        lastCommittedState = std::move(baseline);
+        stateTransactionActive = true;
+        ++stateSnapshotGeneration;
+    }
+    const auto previous = parameterTransactionSequence.fetch_add(1, std::memory_order_acq_rel);
+    juce::ignoreUnused(previous);
+    jassert((previous & 1u) == 0);
+}
+
+void SubLab808Processor::endStateTransaction()
+{
+    auto committed = createStateSnapshot();
+    {
+        const juce::ScopedLock lock(stateSnapshotLock);
+        lastCommittedState = std::move(committed);
+        stateTransactionActive = false;
+        ++stateSnapshotGeneration;
+    }
+    const auto previous = parameterTransactionSequence.fetch_add(1, std::memory_order_release);
+    juce::ignoreUnused(previous);
+    jassert((previous & 1u) != 0);
 }
 
 bool SubLab808Processor::parametersMatchProgram(int index)
@@ -403,26 +615,48 @@ bool SubLab808Processor::parametersMatchProgram(int index)
     return oneShot != nullptr && (oneShot->load() >= 0.5f) == preset.oneShot;
 }
 
+bool SubLab808Processor::applyStateNow(const juce::ValueTree& state)
+{
+    if (! state.isValid() || state.getType() != parameters.state.getType()) return false;
+
+    stateRestoreActive.store(true);
+    const juce::ScopeGuard finishRestore { [this] { stateRestoreActive.store(false); } };
+    const auto restoredProgram = juce::jlimit(0, getNumPrograms() - 1,
+                                              (int) state.getProperty("factoryProgram", 0));
+    const auto hasModifiedFlag = state.hasProperty("presetModified");
+    const auto wasModified = (bool) state.getProperty("presetModified", false);
+    const auto restoredWidth = (int) state.getProperty("editorWidth", 860);
+    const auto restoredHeight = (int) state.getProperty("editorHeight", 520);
+
+    internalParameterChangeDepth.fetch_add(1);
+    parameters.replaceState(state);
+    currentProgram.store(restoredProgram);
+    setEditorSize(restoredWidth, restoredHeight);
+    const auto matchesFactoryProgram = parametersMatchProgram(restoredProgram);
+    presetModified.store((hasModifiedFlag && wasModified) || ! matchesFactoryProgram);
+    internalParameterChangeDepth.fetch_sub(1);
+    if (! parametersMatchProgram(restoredProgram)) presetModified.store(true);
+
+    if (auto* messageManager = juce::MessageManager::getInstanceWithoutCreating();
+        messageManager != nullptr && messageManager->isThisTheMessageThread())
+        if (auto* editor = getActiveEditor()) {
+            const auto restoredSize = getEditorSize();
+            editor->setSize(restoredSize.x, restoredSize.y);
+        }
+    return true;
+}
+
 void SubLab808Processor::setStateInformation(const void* data, int size)
 {
     if (auto xml = getXmlFromBinary(data, size)) {
         auto state = juce::ValueTree::fromXml(*xml);
         if (! state.isValid() || state.getType() != parameters.state.getType()) return;
-        currentProgram.store(juce::jlimit(0, getNumPrograms() - 1, (int) state.getProperty("factoryProgram", 0)));
-        const auto hasModifiedFlag = state.hasProperty("presetModified");
-        const auto wasModified = (bool) state.getProperty("presetModified", false);
-        setEditorSize((int) state.getProperty("editorWidth", 860),
-                      (int) state.getProperty("editorHeight", 520));
-        applyingPreset.store(true);
-        parameters.replaceState(state);
-        applyingPreset.store(false);
-        presetModified.store(hasModifiedFlag ? wasModified : ! parametersMatchProgram(currentProgram.load()));
-        if (auto* messageManager = juce::MessageManager::getInstanceWithoutCreating();
-            messageManager != nullptr && messageManager->isThisTheMessageThread())
-            if (auto* editor = getActiveEditor()) {
-                const auto restoredSize = getEditorSize();
-                editor->setSize(restoredSize.x, restoredSize.y);
-            }
+
+        ControlOperation operation;
+        operation.kind = ControlOperation::Kind::state;
+        operation.notifyHost = false;
+        operation.state = state.createCopy();
+        submitControlOperation(std::move(operation));
     }
 }
 

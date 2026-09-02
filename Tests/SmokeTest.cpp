@@ -1,5 +1,8 @@
 #include <JuceHeader.h>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <mutex>
 #include "PluginProcessor.h"
 #include <thread>
 
@@ -8,6 +11,16 @@ void setParameter(SubLab808Processor& processor, const char* id, float value)
 {
     if (auto* parameter = processor.parameters.getParameter(id))
         parameter->setValueNotifyingHost(parameter->convertTo0to1(value));
+}
+
+bool matchesFactoryProgram(const SubLab808Processor& processor, int program)
+{
+    for (const auto* id : { "decay", "release", "punch", "pitchdecay", "glide", "tune",
+                            "body", "click", "drive", "tone", "velocity", "output" })
+        if (std::abs(processor.parameters.getRawParameterValue(id)->load()
+                     - processor.getFactoryPresetValue(program, id)) > 0.0005f) return false;
+    return (processor.parameters.getRawParameterValue("oneshot")->load() >= 0.5f)
+        == (processor.getFactoryPresetValue(program, "oneshot") >= 0.5f);
 }
 
 juce::MemoryBlock withoutStateProperty(const juce::MemoryBlock& state, const char* property)
@@ -19,6 +32,196 @@ juce::MemoryBlock withoutStateProperty(const juce::MemoryBlock& state, const cha
     }
     return result;
 }
+
+juce::MemoryBlock withStateProperty(const juce::MemoryBlock& state, const char* property, const juce::var& value)
+{
+    juce::MemoryBlock result;
+    if (auto xml = juce::AudioProcessor::getXmlFromBinary(state.getData(), (int) state.getSize())) {
+        xml->setAttribute(property, value.toString());
+        juce::AudioProcessor::copyXmlToBinary(*xml, result);
+    }
+    return result;
+}
+
+juce::MemoryBlock legacyDirtyTrunkStateFixture()
+{
+    // Frozen pre-presetModified APVTS schema. Keeping this independent from the
+    // current serializer catches accidental root, child or parameter-ID changes.
+    static constexpr auto xmlText = R"xml(
+<PARAMETERS factoryProgram="3" editorWidth="860" editorHeight="520">
+  <PARAM id="decay" value="1.1"/>
+  <PARAM id="release" value="0.12"/>
+  <PARAM id="punch" value="18.0"/>
+  <PARAM id="pitchdecay" value="0.055"/>
+  <PARAM id="glide" value="0.045"/>
+  <PARAM id="tune" value="0.0"/>
+  <PARAM id="body" value="42.0"/>
+  <PARAM id="click" value="12.0"/>
+  <PARAM id="drive" value="16.0"/>
+  <PARAM id="tone" value="3200.0"/>
+  <PARAM id="velocity" value="85.0"/>
+  <PARAM id="output" value="-5.0"/>
+  <PARAM id="oneshot" value="1.0"/>
+</PARAMETERS>)xml";
+
+    juce::MemoryBlock result;
+    if (auto xml = juce::XmlDocument::parse(juce::String::fromUTF8(xmlText)))
+        juce::AudioProcessor::copyXmlToBinary(*xml, result);
+    return result;
+}
+
+struct ReentrantPresetEdit final : juce::AudioProcessorParameter::Listener
+{
+    ReentrantPresetEdit(juce::RangedAudioParameter& parameterIn, float replacementValue)
+        : parameter(parameterIn), replacement(parameter.convertTo0to1(replacementValue)) {}
+
+    void parameterValueChanged(int, float) override
+    {
+        if (! armed) return;
+        armed = false;
+        parameter.setValueNotifyingHost(replacement);
+    }
+
+    void parameterGestureChanged(int, bool) override {}
+
+    juce::RangedAudioParameter& parameter;
+    float replacement;
+    bool armed = true;
+};
+
+struct ReentrantProgramSelection final : juce::AudioProcessorParameter::Listener
+{
+    ReentrantProgramSelection(SubLab808Processor& processorIn, int requestedProgram)
+        : processor(processorIn), program(requestedProgram) {}
+
+    void parameterValueChanged(int, float) override
+    {
+        if (! armed) return;
+        armed = false;
+        processor.setCurrentProgram(program);
+        observedProgramAfterCall = processor.getCurrentProgram();
+        observedDecayAfterCall = processor.parameters.getRawParameterValue("decay")->load();
+    }
+
+    void parameterGestureChanged(int, bool) override {}
+
+    SubLab808Processor& processor;
+    int program;
+    int observedProgramAfterCall = -1;
+    float observedDecayAfterCall = -1.0f;
+    bool armed = true;
+};
+
+struct EchoingProgramHost final : juce::AudioProcessorListener
+{
+    explicit EchoingProgramHost(SubLab808Processor& processorIn) : processor(processorIn) {}
+
+    void audioProcessorParameterChanged(juce::AudioProcessor*, int, float) override {}
+
+    void audioProcessorChanged(juce::AudioProcessor*, const ChangeDetails& details) override
+    {
+        if (! details.programChanged) return;
+        ++programNotifications;
+        processor.setCurrentProgram(processor.getCurrentProgram());
+    }
+
+    SubLab808Processor& processor;
+    int programNotifications = 0;
+};
+
+struct CascadingProgramHost final : juce::AudioProcessorListener
+{
+    explicit CascadingProgramHost(SubLab808Processor& processorIn) : processor(processorIn) {}
+
+    void audioProcessorParameterChanged(juce::AudioProcessor*, int, float) override {}
+
+    void audioProcessorChanged(juce::AudioProcessor*, const ChangeDetails& details) override
+    {
+        if (! details.programChanged) return;
+        programs.push_back(processor.getCurrentProgram());
+        if (step == 0) {
+            ++step;
+            processor.setCurrentProgram(2);
+        } else if (step == 1) {
+            ++step;
+            processor.setCurrentProgram(1);
+        }
+    }
+
+    SubLab808Processor& processor;
+    std::vector<int> programs;
+    int step = 0;
+};
+
+struct CrossThreadStateHost final : juce::AudioProcessorListener
+{
+    explicit CrossThreadStateHost(SubLab808Processor& processorIn) : processor(processorIn) {}
+
+    void audioProcessorParameterChanged(juce::AudioProcessor*, int, float) override {}
+
+    void audioProcessorChanged(juce::AudioProcessor*, const ChangeDetails& details) override
+    {
+        if (! details.programChanged) return;
+        std::thread stateReader([this] {
+            juce::MemoryBlock state;
+            processor.getStateInformation(state);
+            stateReadSucceeded = ! state.isEmpty();
+        });
+        stateReader.join();
+    }
+
+    SubLab808Processor& processor;
+    std::atomic<bool> stateReadSucceeded { false };
+};
+
+struct BlockingParameterListener final : juce::AudioProcessorParameter::Listener
+{
+    void parameterValueChanged(int, float) override
+    {
+        std::unique_lock lock(mutex);
+        entered = true;
+        condition.notify_all();
+        condition.wait(lock, [this] { return released; });
+    }
+
+    void parameterGestureChanged(int, bool) override {}
+
+    void waitUntilEntered()
+    {
+        std::unique_lock lock(mutex);
+        condition.wait(lock, [this] { return entered; });
+    }
+
+    void release()
+    {
+        {
+            const std::lock_guard lock(mutex);
+            released = true;
+        }
+        condition.notify_all();
+    }
+
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool entered = false, released = false;
+};
+
+struct StateCapturingParameterListener final : juce::AudioProcessorParameter::Listener
+{
+    explicit StateCapturingParameterListener(SubLab808Processor& processorIn) : processor(processorIn) {}
+
+    void parameterValueChanged(int, float) override
+    {
+        juce::MemoryBlock state;
+        processor.getStateInformation(state);
+        snapshots.push_back(std::move(state));
+    }
+
+    void parameterGestureChanged(int, bool) override {}
+
+    SubLab808Processor& processor;
+    std::vector<juce::MemoryBlock> snapshots;
+};
 
 float renderGateTail(bool oneShot)
 {
@@ -214,6 +417,21 @@ int renderChannelPitchCrossings(int bendChannel)
     return countPositiveCrossings(audio, 2048, 18000);
 }
 
+int renderCrossingsAfterResetAllControllers(bool sendReset)
+{
+    SubLab808Processor processor;
+    setParameter(processor, "decay", 4.0f); setParameter(processor, "punch", 0.0f);
+    setParameter(processor, "click", 0.0f); setParameter(processor, "body", 0.0f);
+    setParameter(processor, "drive", 0.0f);
+    processor.prepareToPlay(48000.0, 512);
+    juce::AudioBuffer<float> audio(2, 24000); juce::MidiBuffer midi;
+    midi.addEvent(juce::MidiMessage::noteOn(2, 48, (juce::uint8) 110), 0);
+    midi.addEvent(juce::MidiMessage::pitchWheel(2, 16383), 0);
+    if (sendReset) midi.addEvent(juce::MidiMessage::controllerEvent(2, 121, 0), 1024);
+    processor.processBlock(audio, midi);
+    return countPositiveCrossings(audio, 4096, 18000);
+}
+
 std::pair<int, int> renderBentGateReleaseCrossings(bool useAllNotesOff)
 {
     SubLab808Processor processor;
@@ -378,6 +596,158 @@ int main()
         if (! std::isfinite(programPeak) || programPeak < 0.0001f || programPeak > 1.001f) return 3;
     }
 
+    // A re-entrant host/listener edit during preset application must not leave the
+    // UI claiming an untouched factory preset when the final parameter state differs.
+    {
+        SubLab808Processor interleaved;
+        interleaved.setCurrentProgram(0);
+        auto* decay = interleaved.parameters.getParameter("decay");
+        if (decay == nullptr) return 29;
+        ReentrantPresetEdit edit(*decay, 3.7f);
+        decay->addListener(&edit);
+        interleaved.setCurrentProgram(1);
+        decay->removeListener(&edit);
+        if (std::abs(interleaved.parameters.getRawParameterValue("decay")->load() - 3.7f) > 0.01f
+            || ! interleaved.isPresetModified()) return 29;
+    }
+
+    // A program requested from inside an older parameter notification is deferred
+    // until that listener traversal returns, then applied before the outer call ends.
+    {
+        SubLab808Processor queued;
+        queued.setCurrentProgram(0);
+        auto* decay = queued.parameters.getParameter("decay");
+        if (decay == nullptr) return 30;
+        ReentrantProgramSelection selection(queued, 2);
+        decay->addListener(&selection);
+        queued.setCurrentProgram(1);
+        decay->removeListener(&selection);
+        if (selection.observedProgramAfterCall == 2
+            || queued.getCurrentProgram() != 2 || queued.isPresetModified()) return 30;
+        for (const auto* id : { "decay", "release", "punch", "pitchdecay", "glide", "tune",
+                                "body", "click", "drive", "tone", "velocity", "output" })
+            if (std::abs(queued.parameters.getRawParameterValue(id)->load()
+                         - queued.getFactoryPresetValue(2, id)) > 0.0005f) return 30;
+        if ((queued.parameters.getRawParameterValue("oneshot")->load() >= 0.5f)
+            != (queued.getFactoryPresetValue(2, "oneshot") >= 0.5f)) return 30;
+    }
+
+    // A host that synchronously echoes ProgramChanged back as setCurrentProgram(current)
+    // must be coalesced instead of recursively notifying forever.
+    {
+        SubLab808Processor echoed;
+        EchoingProgramHost host(echoed);
+        echoed.addListener(&host);
+        echoed.setCurrentProgram(1);
+        echoed.removeListener(&host);
+        if (host.programNotifications != 1 || echoed.getCurrentProgram() != 1
+            || echoed.isPresetModified()) return 33;
+    }
+
+    // Re-entrant program requests retain FIFO order. In particular, a legitimate
+    // A -> B -> A cascade must not lose the final A while breaking echo cycles.
+    {
+        SubLab808Processor cascaded;
+        CascadingProgramHost host(cascaded);
+        cascaded.addListener(&host);
+        cascaded.setCurrentProgram(1);
+        cascaded.removeListener(&host);
+        if (host.programs != std::vector<int> { 1, 2, 1 }
+            || cascaded.getCurrentProgram() != 1
+            || cascaded.isPresetModified()
+            || ! matchesFactoryProgram(cascaded, 1)) return 40;
+    }
+
+
+    // No internal program lock may be held while ProgramChanged invokes the host:
+    // a host that synchronously waits for cross-thread state capture must terminate.
+    {
+        SubLab808Processor callbackSafe;
+        CrossThreadStateHost host(callbackSafe);
+        callbackSafe.addListener(&host);
+        callbackSafe.setCurrentProgram(1);
+        callbackSafe.removeListener(&host);
+        if (! host.stateReadSucceeded.load()) return 35;
+    }
+
+    // An independent cross-thread setter that overlaps a parameter callback must
+    // wait and then apply synchronously; callback timing may never drop the request.
+    {
+        SubLab808Processor serialized;
+        auto* decay = serialized.parameters.getParameter("decay");
+        if (decay == nullptr) return 37;
+        BlockingParameterListener blocker;
+        decay->addListener(&blocker);
+        std::thread firstWriter([&] { serialized.setCurrentProgram(1); });
+        blocker.waitUntilEntered();
+        juce::MemoryBlock snapshotDuringCallback;
+        serialized.getStateInformation(snapshotDuringCallback);
+
+        std::atomic<bool> secondStarted { false }, secondReturned { false };
+        std::thread secondWriter([&] {
+            secondStarted.store(true);
+            serialized.setCurrentProgram(2);
+            secondReturned.store(true);
+        });
+        while (! secondStarted.load()) std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        const auto returnedBeforeRelease = secondReturned.load();
+        blocker.release();
+        firstWriter.join();
+        secondWriter.join();
+        decay->removeListener(&blocker);
+        SubLab808Processor restoredSnapshot;
+        restoredSnapshot.setStateInformation(snapshotDuringCallback.getData(),
+                                              (int) snapshotDuringCallback.getSize());
+        if (returnedBeforeRelease || ! secondReturned.load()
+            || serialized.getCurrentProgram() != 2
+            || ! matchesFactoryProgram(serialized, 2)
+            || restoredSnapshot.getCurrentProgram() != 0
+            || ! matchesFactoryProgram(restoredSnapshot, 0)) return 37;
+    }
+
+    // State capture from every in-flight preset parameter notification must return
+    // the previous complete snapshot, never a partially published new preset.
+    {
+        SubLab808Processor snapshotSource;
+        snapshotSource.setCurrentProgram(0);
+        StateCapturingParameterListener capture(snapshotSource);
+        std::vector<juce::RangedAudioParameter*> listenedParameters;
+        for (const auto* id : { "decay", "release", "punch", "pitchdecay", "glide", "tune",
+                                "body", "click", "drive", "tone", "velocity", "output", "oneshot" })
+            if (auto* parameter = snapshotSource.parameters.getParameter(id)) {
+                parameter->addListener(&capture);
+                listenedParameters.push_back(parameter);
+            }
+        snapshotSource.setCurrentProgram(1);
+        for (auto* parameter : listenedParameters) parameter->removeListener(&capture);
+        if (capture.snapshots.size() != listenedParameters.size()) return 38;
+        for (const auto& snapshot : capture.snapshots) {
+            SubLab808Processor restored;
+            restored.setStateInformation(snapshot.getData(), (int) snapshot.getSize());
+            if (restored.getCurrentProgram() != 0 || restored.isPresetModified()
+                || ! matchesFactoryProgram(restored, 0)) return 38;
+        }
+        juce::MemoryBlock committed;
+        snapshotSource.getStateInformation(committed);
+        SubLab808Processor restored;
+        restored.setStateInformation(committed.getData(), (int) committed.getSize());
+        if (restored.getCurrentProgram() != 1 || restored.isPresetModified()
+            || ! matchesFactoryProgram(restored, 1)) return 38;
+    }
+
+    // Re-selecting a factory preset also repairs a stale Custom marker when a user
+    // has manually returned every parameter to the exact factory values.
+    {
+        SubLab808Processor repaired;
+        repaired.setCurrentProgram(0);
+        setParameter(repaired, "decay", 2.0f);
+        setParameter(repaired, "decay", repaired.getFactoryPresetValue(0, "decay"));
+        if (! repaired.isPresetModified()) return 36;
+        repaired.setCurrentProgram(0);
+        if (repaired.isPresetModified() || ! matchesFactoryProgram(repaired, 0)) return 36;
+    }
+
     processor.setCurrentProgram(3); setParameter(processor, "drive", 13.7f);
     juce::MemoryBlock state; processor.getStateInformation(state);
     if (state.isEmpty()) return 4;
@@ -416,14 +786,25 @@ int main()
                 if (parameter == nullptr || value < parameter->getNormalisableRange().start || value > parameter->getNormalisableRange().end) return 16;
             }
     }
-    // Holding more notes than the tracking list can store must neither crash nor leave a stuck voice.
+    // Exercise every channel/note key plus repeated move-to-newest operations. The
+    // intrusive order must retain all 2048 keys and finish without a stuck voice.
     {
         SubLab808Processor many;
         setParameter(many, "oneshot", 0.0f); setParameter(many, "release", 0.01f); setParameter(many, "decay", 4.0f);
         many.prepareToPlay(48000.0, 512);
         juce::AudioBuffer<float> manyAudio(2, 48000); juce::MidiBuffer manyMidi;
-        for (int n = 0; n < 40; ++n) manyMidi.addEvent(juce::MidiMessage::noteOn(1, 24 + n, (juce::uint8) 100), n * 10);
-        for (int n = 0; n < 40; ++n) manyMidi.addEvent(juce::MidiMessage::noteOff(1, 24 + n), 2000 + n * 10);
+        int samplePosition = 0;
+        for (int channel = 1; channel <= 16; ++channel)
+            for (int note = 0; note < 128; ++note)
+                manyMidi.addEvent(juce::MidiMessage::noteOn(channel, note, (juce::uint8) 100), samplePosition++);
+        for (int retrigger = 0; retrigger < 128; ++retrigger) {
+            manyMidi.addEvent(juce::MidiMessage::noteOn(1, 0, (juce::uint8) 100), 4096 + retrigger * 2);
+            manyMidi.addEvent(juce::MidiMessage::noteOff(1, 0), 4097 + retrigger * 2);
+        }
+        samplePosition = 8192;
+        for (int channel = 1; channel <= 16; ++channel)
+            for (int note = 0; note < 128; ++note)
+                manyMidi.addEvent(juce::MidiMessage::noteOff(channel, note), samplePosition++);
         many.processBlock(manyAudio, manyMidi);
         if (manyAudio.getMagnitude(0, 40000, 8000) > 0.001f) return 17;
     }
@@ -454,6 +835,11 @@ int main()
         const auto ownerBend = renderChannelPitchCrossings(2);
         const auto expectedUnbent = (int) std::round(juce::MidiMessage::getMidiNoteInHertz(48) * 18000.0 / 48000.0);
         if (std::abs(foreignBend - expectedUnbent) > 1 || ownerBend <= foreignBend + 2) return 25;
+    }
+    {
+        const auto bent = renderCrossingsAfterResetAllControllers(false);
+        const auto reset = renderCrossingsAfterResetAllControllers(true);
+        if (reset >= bent - 2) return 31;
     }
     for (const auto useAllNotesOff : { false, true }) {
         const auto [beforeRelease, duringRelease] = renderBentGateReleaseCrossings(useAllNotesOff);
@@ -488,6 +874,20 @@ int main()
     processor.setCurrentProgram(3); setParameter(processor, "drive", 12.0f);
     if (processor.getProgramName(3) != "Dirty Trunk" || ! processor.isPresetModified()) return 20;
     {
+        const auto frozenLegacyFactoryState = legacyDirtyTrunkStateFixture();
+        if (frozenLegacyFactoryState.isEmpty()) return 21;
+        processor.setCurrentProgram(0);
+        auto* restoreDecay = processor.parameters.getParameter("decay");
+        if (restoreDecay == nullptr) return 21;
+        ReentrantProgramSelection restoreCallback(processor, 2);
+        restoreDecay->addListener(&restoreCallback);
+        processor.setStateInformation(frozenLegacyFactoryState.getData(), (int) frozenLegacyFactoryState.getSize());
+        restoreDecay->removeListener(&restoreCallback);
+        if (processor.getCurrentProgram() != 3 || processor.isPresetModified()
+            || restoreCallback.armed || restoreCallback.observedProgramAfterCall != 0
+            || std::abs(processor.parameters.getRawParameterValue("drive")->load() - 16.0f) > 0.01f) return 21;
+
+        processor.setCurrentProgram(3); setParameter(processor, "drive", 12.0f);
         juce::MemoryBlock editedState; processor.getStateInformation(editedState);
         const auto legacyEditedState = withoutStateProperty(editedState, "presetModified");
         processor.setCurrentProgram(0);
@@ -500,9 +900,59 @@ int main()
         processor.setCurrentProgram(0);
         processor.setStateInformation(legacyFactoryState.getData(), (int) legacyFactoryState.getSize());
         if (processor.isPresetModified()) return 22;
+
+        processor.setCurrentProgram(3);
+        setParameter(processor, "drive", 13.7f);
+        juce::MemoryBlock mismatchedState; processor.getStateInformation(mismatchedState);
+        const auto falselyCleanState = withStateProperty(mismatchedState, "presetModified", false);
+        processor.setCurrentProgram(0);
+        processor.setStateInformation(falselyCleanState.getData(), (int) falselyCleanState.getSize());
+        if (! processor.isPresetModified()) return 32;
     }
     if (! restoresOpenEditorSize()) return 26;
     if (! editorSizeSnapshotsStayCoherent()) return 28;
+
+    // Program application and state restore share one control-state transaction;
+    // concurrent callers may win in either order, but may never leave a hybrid.
+    {
+        SubLab808Processor serialized;
+        const auto restoreState = legacyDirtyTrunkStateFixture();
+        std::atomic<bool> start { false };
+        std::vector<juce::MemoryBlock> concurrentSnapshots;
+        std::thread programs([&] {
+            while (! start.load()) std::this_thread::yield();
+            for (int i = 0; i < 100; ++i) serialized.setCurrentProgram((i & 1) == 0 ? 1 : 2);
+        });
+        std::thread restores([&] {
+            while (! start.load()) std::this_thread::yield();
+            for (int i = 0; i < 100; ++i)
+                serialized.setStateInformation(restoreState.getData(), (int) restoreState.getSize());
+        });
+        std::thread stateReader([&] {
+            while (! start.load()) std::this_thread::yield();
+            for (int i = 0; i < 128; ++i) {
+                juce::MemoryBlock snapshot;
+                serialized.getStateInformation(snapshot);
+                concurrentSnapshots.push_back(std::move(snapshot));
+            }
+        });
+        start.store(true);
+        programs.join();
+        restores.join();
+        stateReader.join();
+        const auto finalProgram = serialized.getCurrentProgram();
+        if (! juce::isPositiveAndBelow(finalProgram, serialized.getNumPrograms())
+            || ! matchesFactoryProgram(serialized, finalProgram)
+            || serialized.isPresetModified()) return 34;
+        for (const auto& snapshot : concurrentSnapshots) {
+            SubLab808Processor restored;
+            restored.setStateInformation(snapshot.getData(), (int) snapshot.getSize());
+            const auto savedProgram = restored.getCurrentProgram();
+            if (! juce::isPositiveAndBelow(savedProgram, restored.getNumPrograms())
+                || ! matchesFactoryProgram(restored, savedProgram)
+                || restored.isPresetModified()) return 41;
+        }
+    }
 
     SubLab808Processor hotProcessor;
     setParameter(hotProcessor, "output", 6.0f); setParameter(hotProcessor, "drive", 24.0f);

@@ -34,6 +34,10 @@ Copy the bundle to `~/Library/Audio/Plug-Ins/VST3/`, then restart Cubase or resc
 
 `SubLab808Smoke` verifies audio generation, every factory preset, parameter/state restoration, Gate and One Shot modes, channel-isolated MIDI and Pitch Bend, tail behavior, output bounds, editor construction, size restoration, and in-memory UI rendering. `SubLab808BundleLoad` scans and instantiates the built VST3 through JUCE's VST3 host implementation, then renders MIDI-driven audio through the bundle through its reported maximum tail.
 
+## Control-thread contract
+
+Program changes and state restores are synchronous and serialized. Independent control threads may call them concurrently, and state capture remains available while a change is being published. A synchronous JUCE parameter or host callback must not start and join a worker that calls `setCurrentProgram()` or `setStateInformation()` back on the same processor: JUCE holds its own parameter-listener lock for the duration of such callbacks, so that cross-thread wait cycle is invalid regardless of the plugin's control-state serialization.
+
 Release builds must be created from a clean build directory. Verify the compatibility target with:
 
 ```sh
