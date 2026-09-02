@@ -56,6 +56,7 @@ void SubLab808Processor::setCurrentProgram(int index)
     currentProgram.store(index);
     presetModified.store(false);
     applyingPreset.store(false);
+    updateHostDisplay(ChangeDetails().withProgramChanged(true));
 }
 
 void SubLab808Processor::parameterChanged(const juce::String&, float)
@@ -67,19 +68,19 @@ juce::AudioProcessorValueTreeState::ParameterLayout SubLab808Processor::makeLayo
 {
     using P = juce::AudioParameterFloat;
     std::vector<std::unique_ptr<juce::RangedAudioParameter>> p;
-    p.push_back(std::make_unique<P>("decay", "Decay", juce::NormalisableRange<float>(0.08f, 4.0f, 0.001f, 0.35f), 0.8f));
-    p.push_back(std::make_unique<P>("release", "Release", juce::NormalisableRange<float>(0.01f, 1.5f, 0.001f, 0.4f), 0.12f));
-    p.push_back(std::make_unique<P>("punch", "Pitch Punch", juce::NormalisableRange<float>(0.0f, 48.0f, 1.0f), 18.0f));
-    p.push_back(std::make_unique<P>("pitchdecay", "Pitch Decay", juce::NormalisableRange<float>(0.005f, 0.3f, 0.001f, 0.4f), 0.045f));
-    p.push_back(std::make_unique<P>("glide", "Glide", juce::NormalisableRange<float>(0.0f, 0.5f, 0.001f, 0.4f), 0.03f));
-    p.push_back(std::make_unique<P>("tune", "Tune", juce::NormalisableRange<float>(-12.0f, 12.0f, 1.0f), 0.0f));
-    p.push_back(std::make_unique<P>("body", "Body", juce::NormalisableRange<float>(0.0f, 100.0f, 1.0f), 18.0f));
-    p.push_back(std::make_unique<P>("click", "Click", juce::NormalisableRange<float>(0.0f, 100.0f, 1.0f), 12.0f));
-    p.push_back(std::make_unique<P>("drive", "Drive", juce::NormalisableRange<float>(0.0f, 24.0f, 0.1f), 5.0f));
-    p.push_back(std::make_unique<P>("tone", "Tone", juce::NormalisableRange<float>(80.0f, 12000.0f, 1.0f, 0.35f), 5000.0f));
-    p.push_back(std::make_unique<P>("velocity", "Velocity", juce::NormalisableRange<float>(0.0f, 100.0f, 1.0f), 80.0f));
-    p.push_back(std::make_unique<P>("output", "Output", juce::NormalisableRange<float>(-24.0f, 6.0f, 0.1f), -3.0f));
-    p.push_back(std::make_unique<juce::AudioParameterBool>("oneshot", "One Shot", true));
+    p.push_back(std::make_unique<P>(juce::ParameterID { "decay", 1 }, "Decay", juce::NormalisableRange<float>(0.08f, 4.0f, 0.001f, 0.35f), 0.8f));
+    p.push_back(std::make_unique<P>(juce::ParameterID { "release", 1 }, "Release", juce::NormalisableRange<float>(0.01f, 1.5f, 0.001f, 0.4f), 0.12f));
+    p.push_back(std::make_unique<P>(juce::ParameterID { "punch", 1 }, "Pitch Punch", juce::NormalisableRange<float>(0.0f, 48.0f, 1.0f), 18.0f));
+    p.push_back(std::make_unique<P>(juce::ParameterID { "pitchdecay", 1 }, "Pitch Decay", juce::NormalisableRange<float>(0.005f, 0.3f, 0.001f, 0.4f), 0.045f));
+    p.push_back(std::make_unique<P>(juce::ParameterID { "glide", 1 }, "Glide", juce::NormalisableRange<float>(0.0f, 0.5f, 0.001f, 0.4f), 0.03f));
+    p.push_back(std::make_unique<P>(juce::ParameterID { "tune", 1 }, "Tune", juce::NormalisableRange<float>(-12.0f, 12.0f, 1.0f), 0.0f));
+    p.push_back(std::make_unique<P>(juce::ParameterID { "body", 1 }, "Body", juce::NormalisableRange<float>(0.0f, 100.0f, 1.0f), 18.0f));
+    p.push_back(std::make_unique<P>(juce::ParameterID { "click", 1 }, "Click", juce::NormalisableRange<float>(0.0f, 100.0f, 1.0f), 12.0f));
+    p.push_back(std::make_unique<P>(juce::ParameterID { "drive", 1 }, "Drive", juce::NormalisableRange<float>(0.0f, 24.0f, 0.1f), 5.0f));
+    p.push_back(std::make_unique<P>(juce::ParameterID { "tone", 1 }, "Tone", juce::NormalisableRange<float>(80.0f, 12000.0f, 1.0f, 0.35f), 5000.0f));
+    p.push_back(std::make_unique<P>(juce::ParameterID { "velocity", 1 }, "Velocity", juce::NormalisableRange<float>(0.0f, 100.0f, 1.0f), 80.0f));
+    p.push_back(std::make_unique<P>(juce::ParameterID { "output", 1 }, "Output", juce::NormalisableRange<float>(-24.0f, 6.0f, 0.1f), -3.0f));
+    p.push_back(std::make_unique<juce::AudioParameterBool>(juce::ParameterID { "oneshot", 1 }, "One Shot", true));
     return { p.begin(), p.end() };
 }
 
@@ -119,10 +120,16 @@ void SubLab808Processor::triggerNote(int note, float newVelocity)
             for (int j = i; j < numHeldNotes - 1; ++j) heldNotes[(size_t) j] = heldNotes[(size_t) (j + 1)];
             --numHeldNotes;
         }
+    // A new note played while another one is still held and Glide is active is a legato slide:
+    // the pitch glides to the new note and the running envelope, phase and click continue.
+    // Retriggering here would reset the phase to zero mid-cycle and click on every slide.
+    const auto glideTime = parameters.getRawParameterValue("glide")->load();
+    const bool legato = active && numHeldNotes > 0 && glideTime >= 0.001f;
     if (numHeldNotes < (int) heldNotes.size()) heldNotes[(size_t) numHeldNotes++] = note;
     auto tune = parameters.getRawParameterValue("tune")->load();
     targetHz = juce::MidiMessage::getMidiNoteInHertz(note + (int) tune);
-    if (! active || parameters.getRawParameterValue("glide")->load() < 0.001f) currentHz = targetHz;
+    if (! active || glideTime < 0.001f) currentHz = targetHz;
+    if (legato) { currentNote = note; gateReleased = false; return; }
     auto velocityAmount = parameters.getRawParameterValue("velocity")->load() * 0.01f;
     velocity = juce::jmap(velocityAmount, 1.0f, juce::jlimit(0.0f, 1.0f, newVelocity));
     amp = 1.0f;
@@ -156,6 +163,12 @@ void SubLab808Processor::releaseNote(int note)
 
 float SubLab808Processor::renderSample()
 {
+    // Idle voice: nothing left to render once the envelope, click and filter have died away.
+    if (! active && std::abs(filterState) < 1.0e-6f && click < 1.0e-6f)
+    {
+        filterState = 0.0f;
+        return 0.0f;
+    }
     const auto glideNow = glideCoef.getNextValue();
     currentHz = targetHz + (currentHz - targetHz) * glideNow;
     auto hz = currentHz * std::pow(2.0, (pitchEnv + bendSemitones) / 12.0f);
@@ -214,7 +227,7 @@ void SubLab808Processor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
         while (midiIterator != midiEnd && (*midiIterator).samplePosition <= i) {
             const auto message = (*midiIterator).getMessage();
             if (message.isNoteOn()) triggerNote(message.getNoteNumber(), message.getFloatVelocity());
-            else if (message.isPitchWheel()) bendSemitones = 2.0f * (message.getPitchWheelValue() - 8192) / 8192.0f;
+            else if (message.isPitchWheel()) bendSemitones = 2.0f * (float) (message.getPitchWheelValue() - 8192) / 8192.0f;
             else if (message.isNoteOff()) releaseNote(message.getNoteNumber());
             else if (message.isAllNotesOff()) { numHeldNotes = 0; currentNote = -1; gateReleased = true; bendSemitones = 0.0f; }
             else if (message.isAllSoundOff()) resetSound();

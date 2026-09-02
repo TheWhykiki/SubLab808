@@ -1,0 +1,11 @@
+Internal ctest changing into directory: /Users/whykiki/workspace/SubLab808/build
+Test project /Users/whykiki/workspace/SubLab808/build
+    Start 1: SubLab808Smoke
+1/2 Test #1: SubLab808Smoke ...................   Passed    0.23 sec
+    Start 2: SubLab808BundleLoad
+2/2 Test #2: SubLab808BundleLoad ..............   Passed    0.03 sec
+
+100% tests passed, 0 tests failed out of 2
+
+Total Test time (real) =   0.26 sec
+CTEST EXIT 0

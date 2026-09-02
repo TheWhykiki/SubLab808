@@ -116,7 +116,7 @@ void SubLab808Editor::paint(juce::Graphics& g)
     g.setColour(juce::Colour(0xffff4f2e)); g.drawText("808", 169, 22, 80, 42, juce::Justification::centredLeft);
     g.setColour(juce::Colour(0xff7e8b96)); g.setFont(juce::FontOptions(11.0f));
     g.drawText("MONOPHONIC BASS SYNTHESIZER  /  APPLE SILICON", 36, 61, 360, 18, juce::Justification::centredLeft);
-    auto panel = juce::Rectangle<float>(24.0f, 98.0f, getWidth() - 48.0f, getHeight() - 128.0f);
+    auto panel = juce::Rectangle<float>(24.0f, 98.0f, (float) getWidth() - 48.0f, (float) getHeight() - 128.0f);
     g.setColour(juce::Colour(0xff11161b)); g.fillRoundedRectangle(panel, 12.0f);
     g.setColour(juce::Colour(0xff273039)); g.drawRoundedRectangle(panel, 12.0f, 1.0f);
     g.setColour(juce::Colour(0xff1f272e)); g.drawVerticalLine(getWidth() / 2, 118.0f, (float) getHeight() - 52.0f);
