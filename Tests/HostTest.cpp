@@ -10,10 +10,23 @@ void stage(const char* name) { currentStage = name; std::fprintf(stderr, "[host-
 void onAbort(int) { std::fprintf(stderr, "[host-test] aborted during: %s\n", currentStage); std::fflush(stderr); std::_Exit(99); }
 }
 
+int runHostTest(int argc, char** argv);
+
 int main(int argc, char** argv)
 {
     std::signal(SIGABRT, onAbort);
-    juce::ScopedJuceInitialiser_GUI initialiseJuce;
+    int result = 0;
+    {
+        juce::ScopedJuceInitialiser_GUI initialiseJuce;
+        result = runHostTest(argc, argv);
+        stage(result == 0 ? "shutting down JUCE" : "shutting down JUCE after failure");
+    }
+    stage("exited cleanly");
+    return result;
+}
+
+int runHostTest(int argc, char** argv)
+{
     if (argc != 2) { std::fprintf(stderr, "usage: SubLab808HostTests <path-to-vst3>\n"); return 1; }
 
     const juce::String pluginPath(argv[1]);
@@ -44,6 +57,13 @@ int main(int argc, char** argv)
     instance->processBlock(audio, midi);
     const auto peak = audio.getMagnitude(0, audio.getNumSamples());
     if (! std::isfinite(peak) || peak <= 0.0001f || peak > 1.001f) { std::fprintf(stderr, "[host-test] bad peak %f\n", (double) peak); return 5; }
+
+    // Tear down in explicit steps so an abort during shutdown names the responsible stage.
+    stage("releasing plugin instance");
+    instance->releaseResources();
+    instance.reset();
+    stage("unloading module (descriptions, format manager)");
+    descriptions.clear();
     stage("done");
     return 0;
 }
