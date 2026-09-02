@@ -34,6 +34,42 @@ int countPositiveCrossings(const juce::AudioBuffer<float>& audio, int start, int
     return crossings;
 }
 
+// Largest sample-to-sample step after a legato slide. A clean 65-98 Hz sine moves at most a few
+// hundredths per sample; a phase reset mid-cycle produces a step of several tenths.
+float renderLegatoStep()
+{
+    SubLab808Processor processor;
+    setParameter(processor, "decay", 4.0f); setParameter(processor, "punch", 0.0f);
+    setParameter(processor, "click", 0.0f); setParameter(processor, "body", 0.0f);
+    setParameter(processor, "drive", 0.0f); setParameter(processor, "glide", 0.1f);
+    setParameter(processor, "oneshot", 0.0f);
+    processor.prepareToPlay(48000.0, 512);
+    juce::AudioBuffer<float> audio(2, 8192); juce::MidiBuffer midi;
+    midi.addEvent(juce::MidiMessage::noteOn(1, 36, (juce::uint8) 110), 0);
+    midi.addEvent(juce::MidiMessage::noteOn(1, 43, (juce::uint8) 110), 4096); // 36 still held
+    processor.processBlock(audio, midi);
+    float maxStep = 0.0f;
+    for (int i = 4000; i < 8192; ++i)
+        maxStep = std::max(maxStep, std::abs(audio.getSample(0, i) - audio.getSample(0, i - 1)));
+    return maxStep;
+}
+
+// Envelope level 0.5 s into a note; must not depend on the sample rate.
+float renderLevelAtHalfSecond(double sampleRate)
+{
+    SubLab808Processor processor;
+    setParameter(processor, "decay", 0.6f); setParameter(processor, "punch", 0.0f);
+    setParameter(processor, "click", 0.0f); setParameter(processor, "body", 0.0f);
+    setParameter(processor, "drive", 0.0f);
+    processor.prepareToPlay(sampleRate, 512);
+    const auto total = (int) (sampleRate * 0.6);
+    juce::AudioBuffer<float> audio(2, total); juce::MidiBuffer midi;
+    midi.addEvent(juce::MidiMessage::noteOn(1, 36, (juce::uint8) 110), 0);
+    processor.processBlock(audio, midi);
+    const auto start = (int) (sampleRate * 0.5), window = (int) (sampleRate * 0.03);
+    return audio.getMagnitude(0, start, window);
+}
+
 int renderPitchCrossings(int wheelValue)
 {
     SubLab808Processor processor;
@@ -85,6 +121,12 @@ int main()
 
     if (! (renderGateTail(false) < renderGateTail(true) * 0.1f)) return 8;
     if (! (renderPitchCrossings(16383) > renderPitchCrossings(8192) + 2)) return 9;
+
+    if (! (renderLegatoStep() < 0.05f)) return 13;
+    {
+        const auto at48 = renderLevelAtHalfSecond(48000.0), at96 = renderLevelAtHalfSecond(96000.0);
+        if (at48 < 0.01f || std::abs(at48 - at96) > 0.05f * at48) return 14;
+    }
 
     SubLab808Processor hotProcessor;
     setParameter(hotProcessor, "output", 6.0f); setParameter(hotProcessor, "drive", 24.0f);
