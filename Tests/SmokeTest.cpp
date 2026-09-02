@@ -1,4 +1,5 @@
 #include <JuceHeader.h>
+#include <cstdio>
 #include "PluginProcessor.h"
 
 namespace {
@@ -70,6 +71,26 @@ float renderLevelAtHalfSecond(double sampleRate)
     return audio.getMagnitude(0, start, window);
 }
 
+// Zero crossings over 0.5 s when Tune is changed while the note is held: the pitch must follow live.
+int renderCrossingsWithTuneChangedMidNote(float tuneAfterHalf)
+{
+    SubLab808Processor processor;
+    setParameter(processor, "punch", 0.0f); setParameter(processor, "click", 0.0f);
+    setParameter(processor, "body", 0.0f); setParameter(processor, "decay", 4.0f);
+    setParameter(processor, "tune", 0.0f);
+    processor.prepareToPlay(48000.0, 512);
+    juce::AudioBuffer<float> audio(2, 24000); juce::MidiBuffer midi;
+    midi.addEvent(juce::MidiMessage::noteOn(1, 36, (juce::uint8) 110), 0);
+    processor.processBlock(audio, midi);                   // first 0.5 s at tune 0
+    setParameter(processor, "tune", tuneAfterHalf);
+    midi.clear();
+    processor.processBlock(audio, midi);                   // next 0.5 s, note still held
+    int crossings = 0;
+    for (int i = 1; i < 24000; ++i)
+        if ((audio.getSample(0, i - 1) < 0.0f) != (audio.getSample(0, i) < 0.0f)) ++crossings;
+    return crossings;
+}
+
 int renderPitchCrossings(int wheelValue)
 {
     SubLab808Processor processor;
@@ -123,6 +144,37 @@ int main()
     if (! (renderPitchCrossings(16383) > renderPitchCrossings(8192) + 2)) return 9;
 
     if (! (renderLegatoStep() < 0.05f)) return 13;
+    // Tune must act live: +12 st doubles the zero-crossing rate of the held note.
+    {
+        const auto untuned = renderCrossingsWithTuneChangedMidNote(0.0f), tunedUp = renderCrossingsWithTuneChangedMidNote(12.0f);
+        if (untuned < 50 || tunedUp < untuned * 19 / 10 || tunedUp > untuned * 21 / 10)
+        {
+            std::fprintf(stderr, "tune test: crossings untuned=%d tunedUp=%d\n", untuned, tunedUp);
+            return 15;
+        }
+    }
+    // Every factory preset value must lie inside its parameter range (guards the preset table).
+    {
+        SubLab808Processor table;
+        for (int program = 0; program < table.getNumPrograms(); ++program)
+            for (const auto* id : { "decay", "release", "punch", "pitchdecay", "glide", "tune", "body", "click", "drive", "tone", "velocity", "output" })
+            {
+                auto* parameter = dynamic_cast<juce::RangedAudioParameter*> (table.parameters.getParameter(id));
+                const auto value = table.getFactoryPresetValue(program, id);
+                if (parameter == nullptr || value < parameter->getNormalisableRange().start || value > parameter->getNormalisableRange().end) return 16;
+            }
+    }
+    // Holding more notes than the tracking list can store must neither crash nor leave a stuck voice.
+    {
+        SubLab808Processor many;
+        setParameter(many, "oneshot", 0.0f); setParameter(many, "release", 0.01f); setParameter(many, "decay", 4.0f);
+        many.prepareToPlay(48000.0, 512);
+        juce::AudioBuffer<float> manyAudio(2, 48000); juce::MidiBuffer manyMidi;
+        for (int n = 0; n < 40; ++n) manyMidi.addEvent(juce::MidiMessage::noteOn(1, 24 + n, (juce::uint8) 100), n * 10);
+        for (int n = 0; n < 40; ++n) manyMidi.addEvent(juce::MidiMessage::noteOff(1, 24 + n), 2000 + n * 10);
+        many.processBlock(manyAudio, manyMidi);
+        if (manyAudio.getMagnitude(0, 40000, 8000) > 0.001f) return 17;
+    }
     {
         const auto at48 = renderLevelAtHalfSecond(48000.0), at96 = renderLevelAtHalfSecond(96000.0);
         if (at48 < 0.01f || std::abs(at48 - at96) > 0.05f * at48) return 14;

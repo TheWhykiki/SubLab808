@@ -95,8 +95,8 @@ void SubLab808Editor::addDial(Dial& dial, const juce::String& id, const juce::St
     if (id == "decay" || id == "release" || id == "pitchdecay" || id == "glide") dial.slider.setNumDecimalPlacesToDisplay(3);
     else if (id == "drive" || id == "output") dial.slider.setNumDecimalPlacesToDisplay(1);
     else dial.slider.setNumDecimalPlacesToDisplay(0);
-    auto* parameter = audioProcessor.parameters.getParameter(id);
-    dial.slider.setDoubleClickReturnValue(true, parameter->convertFrom0to1(parameter->getDefaultValue()));
+    if (auto* parameter = audioProcessor.parameters.getParameter(id))
+        dial.slider.setDoubleClickReturnValue(true, parameter->convertFrom0to1(parameter->getDefaultValue()));
     dial.label.setText(title, juce::dontSendNotification);
     dial.label.setJustificationType(juce::Justification::centred);
     dial.label.setColour(juce::Label::textColourId, juce::Colour(0xffaab4bd));
@@ -111,11 +111,14 @@ void SubLab808Editor::paint(juce::Graphics& g)
     juce::ColourGradient bg(juce::Colour(0xff161c22), 0, 0, juce::Colour(0xff090c10), 0, (float) getHeight(), false);
     g.setGradientFill(bg); g.fillAll();
     g.setColour(juce::Colour(0xffff4f2e)); g.fillRect(0, 0, getWidth(), 4);
-    g.setColour(juce::Colour(0xfff4f6f8)); g.setFont(juce::FontOptions(30.0f, juce::Font::bold));
-    g.drawText("SUBLAB", 34, 22, 180, 42, juce::Justification::centredLeft);
-    g.setColour(juce::Colour(0xffff4f2e)); g.drawText("808", 169, 22, 80, 42, juce::Justification::centredLeft);
+    // Place "808" directly after the measured width of "SUBLAB" so a font fallback cannot overlap them.
+    const juce::Font titleFont(juce::FontOptions(30.0f, juce::Font::bold));
+    g.setFont(titleFont);
+    const auto titleWidth = juce::GlyphArrangement::getStringWidthInt(titleFont, "SUBLAB");
+    g.setColour(juce::Colour(0xfff4f6f8)); g.drawText("SUBLAB", 34, 22, titleWidth + 4, 42, juce::Justification::centredLeft);
+    g.setColour(juce::Colour(0xffff4f2e)); g.drawText("808", 34 + titleWidth + 6, 22, 80, 42, juce::Justification::centredLeft);
     g.setColour(juce::Colour(0xff7e8b96)); g.setFont(juce::FontOptions(11.0f));
-    g.drawText("MONOPHONIC BASS SYNTHESIZER  /  APPLE SILICON", 36, 61, 360, 18, juce::Justification::centredLeft);
+    g.drawText(juce::String("MONOPHONIC BASS SYNTHESIZER  /  APPLE SILICON  /  v") + SUBLAB808_VERSION_STRING, 36, 61, 420, 18, juce::Justification::centredLeft);
     auto panel = juce::Rectangle<float>(24.0f, 98.0f, (float) getWidth() - 48.0f, (float) getHeight() - 128.0f);
     g.setColour(juce::Colour(0xff11161b)); g.fillRoundedRectangle(panel, 12.0f);
     g.setColour(juce::Colour(0xff273039)); g.drawRoundedRectangle(panel, 12.0f, 1.0f);

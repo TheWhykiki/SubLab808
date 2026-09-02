@@ -5,6 +5,10 @@
 - CI now fails unless the built VST3 contains exactly the intended ARM64 architecture.
 - Host-test failures report invalid MIDI capability and plugin names explicitly; removed the unsafe SIGABRT handler.
 - UI snapshot validation encodes in memory instead of leaving generated files in the checkout.
+- Tune now acts live on a held note (previously only at note-on); note-on behaviour is unchanged.
+- Factory presets use named fields instead of a positional value array; a test checks every preset value against its parameter range.
+- Held-note tracking grows to 32 notes and forgets the oldest instead of the newest when full; All Notes Off respects One Shot like a note-off.
+- Editor: "808" is positioned from the measured title width; the header shows the version.
 - Legato: a new note played while another is held with Glide active now slides without retriggering the envelope, phase and click (previously every slide clicked from a phase reset).
 - Idle voices stop rendering once envelope, click and filter have decayed.
 - Program changes from the editor are reported to the host; tail length reduced to 8 s.

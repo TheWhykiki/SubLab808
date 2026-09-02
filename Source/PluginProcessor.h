@@ -19,6 +19,7 @@ public:
     bool isMidiEffect() const override { return false; }
     double getTailLengthSeconds() const override { return 8.0; } // max decay 4 s + release 1.5 s + margin
     int getNumPrograms() override;
+    float getFactoryPresetValue(int index, const juce::String& parameterId) const;
     int getCurrentProgram() override { return currentProgram.load(); }
     void setCurrentProgram(int) override;
     const juce::String getProgramName(int) override;
@@ -39,14 +40,14 @@ private:
     float renderSample();
     void parameterChanged(const juce::String&, float) override;
     double sampleRate = 44100.0, phase = 0.0, currentHz = 55.0, targetHz = 55.0;
-    float amp = 0.0f, pitchEnv = 0.0f, filterState = 0.0f, velocity = 1.0f;
+    float amp = 0.0f, pitchEnv = 0.0f, filterState = 0.0f, velocity = 1.0f, tuneSemitones = 0.0f;
     float click = 0.0f, clickCoef = 0.965f, bendSemitones = 0.0f;
     juce::SmoothedValue<float> ampCoef, pitchCoef, glideCoef, releaseCoef;
     juce::SmoothedValue<float> drive, outputGain, filterCoef, body;
     uint32_t noiseState = 0x6d2b79f5u;
     std::atomic<int> currentProgram { 0 };
     std::atomic<bool> presetModified { false }, applyingPreset { false };
-    std::array<int, 16> heldNotes {};
+    std::array<int, 32> heldNotes {};
     int numHeldNotes = 0;
     int currentNote = -1;
     bool gateReleased = false;
