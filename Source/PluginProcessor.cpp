@@ -2,20 +2,30 @@
 #include "PluginEditor.h"
 
 namespace {
-struct FactoryPreset { const char* name; std::array<float, 12> values; bool oneShot; };
-constexpr std::array<FactoryPreset, 8> factoryPresets {{
-    { "Deep Foundation", { 1.40f, 0.18f, 12.0f, 0.070f, 0.030f, 0.0f, 10.0f, 5.0f, 2.0f, 1800.0f, 72.0f, -3.0f }, true },
-    { "Modern Knock",    { 0.72f, 0.09f, 24.0f, 0.035f, 0.015f, 0.0f, 25.0f, 22.0f, 7.0f, 5200.0f, 90.0f, -3.0f }, true },
-    { "Long Slide",      { 2.80f, 0.32f, 10.0f, 0.090f, 0.180f, 0.0f, 16.0f, 4.0f, 4.0f, 2600.0f, 65.0f, -4.0f }, false },
-    { "Dirty Trunk",     { 1.10f, 0.12f, 18.0f, 0.055f, 0.045f, 0.0f, 42.0f, 12.0f, 16.0f, 3200.0f, 85.0f, -5.0f }, true },
-    { "Short Punch",     { 0.28f, 0.05f, 32.0f, 0.022f, 0.000f, 0.0f, 30.0f, 38.0f, 9.0f, 7800.0f, 100.0f, -2.0f }, true },
-    { "Soft Pillow",     { 1.75f, 0.40f, 7.0f, 0.110f, 0.060f, 0.0f, 5.0f, 0.0f, 1.0f, 1250.0f, 55.0f, -2.5f }, false },
-    { "Upper Bass",      { 0.90f, 0.10f, 15.0f, 0.045f, 0.025f, 12.0f, 36.0f, 18.0f, 8.0f, 6400.0f, 82.0f, -4.0f }, true },
-    { "Sub Destroyer",   { 1.55f, 0.16f, 28.0f, 0.030f, 0.040f, -12.0f, 55.0f, 15.0f, 22.0f, 4100.0f, 95.0f, -7.0f }, true }
-}};
-constexpr std::array<const char*, 12> presetParameterIds {
-    "decay", "release", "punch", "pitchdecay", "glide", "tune", "body", "click", "drive", "tone", "velocity", "output"
+// Preset values are named, so a column cannot be silently swapped; each field maps to its
+// parameter through presetFields below (also used to validate ranges in the smoke tests).
+struct PresetValues
+{
+    float decay, release, punch, pitchDecay, glide, tune, body, click, drive, tone, velocity, output;
 };
+struct FactoryPreset { const char* name; PresetValues values; bool oneShot; };
+constexpr std::array<FactoryPreset, 8> factoryPresets {{
+    { "Deep Foundation", { .decay = 1.40f, .release = 0.18f, .punch = 12.0f, .pitchDecay = 0.070f, .glide = 0.030f, .tune = 0.0f, .body = 10.0f, .click = 5.0f, .drive = 2.0f, .tone = 1800.0f, .velocity = 72.0f, .output = -3.0f }, true },
+    { "Modern Knock",    { .decay = 0.72f, .release = 0.09f, .punch = 24.0f, .pitchDecay = 0.035f, .glide = 0.015f, .tune = 0.0f, .body = 25.0f, .click = 22.0f, .drive = 7.0f, .tone = 5200.0f, .velocity = 90.0f, .output = -3.0f }, true },
+    { "Long Slide",      { .decay = 2.80f, .release = 0.32f, .punch = 10.0f, .pitchDecay = 0.090f, .glide = 0.180f, .tune = 0.0f, .body = 16.0f, .click = 4.0f, .drive = 4.0f, .tone = 2600.0f, .velocity = 65.0f, .output = -4.0f }, false },
+    { "Dirty Trunk",     { .decay = 1.10f, .release = 0.12f, .punch = 18.0f, .pitchDecay = 0.055f, .glide = 0.045f, .tune = 0.0f, .body = 42.0f, .click = 12.0f, .drive = 16.0f, .tone = 3200.0f, .velocity = 85.0f, .output = -5.0f }, true },
+    { "Short Punch",     { .decay = 0.28f, .release = 0.05f, .punch = 32.0f, .pitchDecay = 0.022f, .glide = 0.000f, .tune = 0.0f, .body = 30.0f, .click = 38.0f, .drive = 9.0f, .tone = 7800.0f, .velocity = 100.0f, .output = -2.0f }, true },
+    { "Soft Pillow",     { .decay = 1.75f, .release = 0.40f, .punch = 7.0f, .pitchDecay = 0.110f, .glide = 0.060f, .tune = 0.0f, .body = 5.0f, .click = 0.0f, .drive = 1.0f, .tone = 1250.0f, .velocity = 55.0f, .output = -2.5f }, false },
+    { "Upper Bass",      { .decay = 0.90f, .release = 0.10f, .punch = 15.0f, .pitchDecay = 0.045f, .glide = 0.025f, .tune = 12.0f, .body = 36.0f, .click = 18.0f, .drive = 8.0f, .tone = 6400.0f, .velocity = 82.0f, .output = -4.0f }, true },
+    { "Sub Destroyer",   { .decay = 1.55f, .release = 0.16f, .punch = 28.0f, .pitchDecay = 0.030f, .glide = 0.040f, .tune = -12.0f, .body = 55.0f, .click = 15.0f, .drive = 22.0f, .tone = 4100.0f, .velocity = 95.0f, .output = -7.0f }, true }
+}};
+struct PresetField { const char* id; float PresetValues::* member; };
+constexpr std::array<PresetField, 12> presetFields {{
+    { "decay", &PresetValues::decay }, { "release", &PresetValues::release }, { "punch", &PresetValues::punch },
+    { "pitchdecay", &PresetValues::pitchDecay }, { "glide", &PresetValues::glide }, { "tune", &PresetValues::tune },
+    { "body", &PresetValues::body }, { "click", &PresetValues::click }, { "drive", &PresetValues::drive },
+    { "tone", &PresetValues::tone }, { "velocity", &PresetValues::velocity }, { "output", &PresetValues::output }
+}};
 }
 
 SubLab808Processor::SubLab808Processor()
@@ -23,17 +33,26 @@ SubLab808Processor::SubLab808Processor()
       parameters(*this, nullptr, "PARAMETERS", makeLayout())
 {
     setCurrentProgram(0);
-    for (const auto* id : presetParameterIds) parameters.addParameterListener(id, this);
+    for (const auto& field : presetFields) parameters.addParameterListener(field.id, this);
     parameters.addParameterListener("oneshot", this);
 }
 
 SubLab808Processor::~SubLab808Processor()
 {
-    for (const auto* id : presetParameterIds) parameters.removeParameterListener(id, this);
+    for (const auto& field : presetFields) parameters.removeParameterListener(field.id, this);
     parameters.removeParameterListener("oneshot", this);
 }
 
 int SubLab808Processor::getNumPrograms() { return (int) factoryPresets.size(); }
+
+float SubLab808Processor::getFactoryPresetValue(int index, const juce::String& parameterId) const
+{
+    if (! juce::isPositiveAndBelow(index, (int) factoryPresets.size())) return 0.0f;
+    if (parameterId == "oneshot") return factoryPresets[(size_t) index].oneShot ? 1.0f : 0.0f;
+    for (const auto& field : presetFields)
+        if (parameterId == field.id) return factoryPresets[(size_t) index].values.*field.member;
+    return 0.0f;
+}
 
 const juce::String SubLab808Processor::getProgramName(int index)
 {
@@ -48,9 +67,9 @@ void SubLab808Processor::setCurrentProgram(int index)
     if (! juce::isPositiveAndBelow(index, getNumPrograms())) return;
     applyingPreset.store(true);
     const auto& preset = factoryPresets[(size_t) index];
-    for (size_t i = 0; i < presetParameterIds.size(); ++i)
-        if (auto* parameter = parameters.getParameter(presetParameterIds[i]))
-            parameter->setValueNotifyingHost(parameter->convertTo0to1(preset.values[i]));
+    for (const auto& field : presetFields)
+        if (auto* parameter = parameters.getParameter(field.id))
+            parameter->setValueNotifyingHost(parameter->convertTo0to1(preset.values.*field.member));
     if (auto* parameter = parameters.getParameter("oneshot"))
         parameter->setValueNotifyingHost(preset.oneShot ? 1.0f : 0.0f);
     currentProgram.store(index);
@@ -105,6 +124,7 @@ void SubLab808Processor::prepareToPlay(double sr, int)
     outputGain.setCurrentAndTargetValue(juce::Decibels::decibelsToGain(parameters.getRawParameterValue("output")->load()));
     filterCoef.setCurrentAndTargetValue((float) std::exp(-juce::MathConstants<double>::twoPi * parameters.getRawParameterValue("tone")->load() / sampleRate));
     body.setCurrentAndTargetValue(parameters.getRawParameterValue("body")->load() * 0.01f);
+    tuneSemitones = std::round(parameters.getRawParameterValue("tune")->load());
 }
 
 void SubLab808Processor::resetSound()
@@ -125,9 +145,13 @@ void SubLab808Processor::triggerNote(int note, float newVelocity)
     // Retriggering here would reset the phase to zero mid-cycle and click on every slide.
     const auto glideTime = parameters.getRawParameterValue("glide")->load();
     const bool legato = active && numHeldNotes > 0 && glideTime >= 0.001f;
-    if (numHeldNotes < (int) heldNotes.size()) heldNotes[(size_t) numHeldNotes++] = note;
-    auto tune = parameters.getRawParameterValue("tune")->load();
-    targetHz = juce::MidiMessage::getMidiNoteInHertz(note + (int) tune);
+    if (numHeldNotes == (int) heldNotes.size()) // full: forget the oldest note instead of the new one
+    {
+        for (int j = 0; j < numHeldNotes - 1; ++j) heldNotes[(size_t) j] = heldNotes[(size_t) (j + 1)];
+        --numHeldNotes;
+    }
+    heldNotes[(size_t) numHeldNotes++] = note;
+    targetHz = juce::MidiMessage::getMidiNoteInHertz(note); // Tune is applied live in renderSample()
     if (! active || glideTime < 0.001f) currentHz = targetHz;
     if (legato) { currentNote = note; gateReleased = false; return; }
     auto velocityAmount = parameters.getRawParameterValue("velocity")->load() * 0.01f;
@@ -152,8 +176,7 @@ void SubLab808Processor::releaseNote(int note)
     if (note != currentNote) return;
     if (numHeldNotes > 0) {
         currentNote = heldNotes[(size_t) (numHeldNotes - 1)];
-        auto tune = parameters.getRawParameterValue("tune")->load();
-        targetHz = juce::MidiMessage::getMidiNoteInHertz(currentNote + (int) tune);
+        targetHz = juce::MidiMessage::getMidiNoteInHertz(currentNote);
         gateReleased = false;
     } else {
         currentNote = -1;
@@ -171,7 +194,7 @@ float SubLab808Processor::renderSample()
     }
     const auto glideNow = glideCoef.getNextValue();
     currentHz = targetHz + (currentHz - targetHz) * glideNow;
-    auto hz = currentHz * std::pow(2.0, (pitchEnv + bendSemitones) / 12.0f);
+    auto hz = currentHz * std::pow(2.0, (pitchEnv + bendSemitones + tuneSemitones) / 12.0f);
     phase += hz / sampleRate;
     phase -= std::floor(phase);
     auto fundamental = std::sin((float) (juce::MathConstants<double>::twoPi * phase));
@@ -217,6 +240,7 @@ void SubLab808Processor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
     drive.setTargetValue(juce::Decibels::decibelsToGain(driveDb));
     outputGain.setTargetValue(juce::Decibels::decibelsToGain(parameters.getRawParameterValue("output")->load()));
     body.setTargetValue(parameters.getRawParameterValue("body")->load() * 0.01f);
+    tuneSemitones = std::round(parameters.getRawParameterValue("tune")->load()); // live, unlike note-on only
 
     auto midiIterator = midi.begin();
     const auto midiEnd = midi.end();
@@ -229,7 +253,11 @@ void SubLab808Processor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
             if (message.isNoteOn()) triggerNote(message.getNoteNumber(), message.getFloatVelocity());
             else if (message.isPitchWheel()) bendSemitones = 2.0f * (float) (message.getPitchWheelValue() - 8192) / 8192.0f;
             else if (message.isNoteOff()) releaseNote(message.getNoteNumber());
-            else if (message.isAllNotesOff()) { numHeldNotes = 0; currentNote = -1; gateReleased = true; bendSemitones = 0.0f; }
+            else if (message.isAllNotesOff())
+            {
+                numHeldNotes = 0; currentNote = -1; bendSemitones = 0.0f;
+                if (parameters.getRawParameterValue("oneshot")->load() < 0.5f) gateReleased = true; // one-shot keeps decaying
+            }
             else if (message.isAllSoundOff()) resetSound();
             ++midiIterator;
         }
