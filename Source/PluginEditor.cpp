@@ -37,10 +37,11 @@ void SubLabLookAndFeel::drawRotarySlider(juce::Graphics& g, int x, int y, int w,
 SubLab808Editor::SubLab808Editor(SubLab808Processor& p)
     : AudioProcessorEditor(&p), audioProcessor(p), dials { &decay, &release, &punch, &pitchDecay, &glide, &tune, &body, &click, &drive, &tone, &velocity, &output }
 {
+    const auto initialSize = audioProcessor.getEditorSize();
     setLookAndFeel(&look);
     setResizable(true, true);
     setResizeLimits(820, 430, 1100, 680);
-    setSize(audioProcessor.editorWidth.load(), audioProcessor.editorHeight.load());
+    setSize(initialSize.x, initialSize.y);
     addDial(decay, "decay", "DECAY", " s");
     addDial(release, "release", "RELEASE", " s");
     addDial(punch, "punch", "PITCH PUNCH", " st");
@@ -149,12 +150,13 @@ void SubLab808Editor::resized()
             dial->slider.setBounds(cell);
         }
     }
-    audioProcessor.editorWidth.store(getWidth());
-    audioProcessor.editorHeight.store(getHeight());
+    audioProcessor.setEditorSize(getWidth(), getHeight());
 }
 
 void SubLab808Editor::timerCallback()
 {
+    const auto storedSize = audioProcessor.getEditorSize();
+    if (getWidth() != storedSize.x || getHeight() != storedSize.y) setSize(storedSize.x, storedSize.y);
     meter = juce::jmax(audioProcessor.outputMeter.exchange(0.0f), meter * 0.88f);
     presetBox.setSelectedId(audioProcessor.isPresetModified() ? 0 : audioProcessor.getCurrentProgram() + 1,
                             juce::dontSendNotification);

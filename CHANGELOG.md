@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Corrected the maximum host-reported tail to 47 s, matching the exponential 4 s decay time constant.
+- The oscillator now stops exactly at the envelope silence threshold; worst-case output is silent by the reported tail.
+- Repeated and more than 16 simultaneous MIDI notes now retain correct last-note priority without lost Note Off state.
+- MIDI note ownership, pitch bend, All Notes Off and All Sound Off are isolated correctly per channel.
+- Pitch bend remains attached to the sounding voice throughout its Gate release.
+- One Shot notes no longer retune or enter release in response to Note Off / All Notes Off.
+- Factory program names remain stable for host caches; the editor continues to show modified sounds as Custom.
+- Legacy states without a modified flag are classified by their actual factory parameter values; invalid state roots are ignored.
+- Restored editor dimensions now update an editor that is already open.
+- Editor dimensions are published as one atomic snapshot so worker-thread state restores cannot mix width and height.
+- Parameter smoothing now continues while the synth is silent, so the next note starts with current automated values.
+- GitHub Actions are pinned to immutable commit revisions.
+- CI archives and reloads the downloadable VST3 so executable permissions and bundle integrity are verified.
+- The loaded VST3 wrapper is rendered through its reported maximum tail, not only checked for metadata.
+- The completed VST3 is re-signed after JUCE writes its module metadata, keeping the final resource seal valid.
+- Final signing defaults to ad hoc but accepts a Developer ID identity for release builds.
 - CI now fails unless the built VST3 contains exactly the intended ARM64 architecture.
 - Host-test failures report invalid MIDI capability and plugin names explicitly; removed the unsafe SIGABRT handler.
 - UI snapshot validation encodes in memory instead of leaving generated files in the checkout.

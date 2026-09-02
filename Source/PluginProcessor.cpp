@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include <limits>
 
 namespace {
 // Preset values are named, so a column cannot be silently swapped; each field maps to its
@@ -57,9 +58,7 @@ float SubLab808Processor::getFactoryPresetValue(int index, const juce::String& p
 const juce::String SubLab808Processor::getProgramName(int index)
 {
     if (! juce::isPositiveAndBelow(index, getNumPrograms())) return {};
-    auto name = juce::String(factoryPresets[(size_t) index].name);
-    if (index == currentProgram.load() && presetModified.load()) name += " (Modified)";
-    return name;
+    return factoryPresets[(size_t) index].name;
 }
 
 void SubLab808Processor::setCurrentProgram(int index)
@@ -81,6 +80,23 @@ void SubLab808Processor::setCurrentProgram(int index)
 void SubLab808Processor::parameterChanged(const juce::String&, float)
 {
     if (! applyingPreset.load()) presetModified.store(true);
+}
+
+uint64_t SubLab808Processor::packEditorSize(int width, int height) noexcept
+{
+    return (uint64_t) (uint32_t) width << 32 | (uint32_t) height;
+}
+
+juce::Point<int> SubLab808Processor::getEditorSize() const noexcept
+{
+    const auto packed = editorSize.load();
+    return { (int) (uint32_t) (packed >> 32), (int) (uint32_t) packed };
+}
+
+void SubLab808Processor::setEditorSize(int width, int height) noexcept
+{
+    editorSize.store(packEditorSize(juce::jlimit(820, 1100, width),
+                                    juce::jlimit(430, 680, height)));
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout SubLab808Processor::makeLayout()
@@ -130,57 +146,135 @@ void SubLab808Processor::prepareToPlay(double sr, int)
 void SubLab808Processor::resetSound()
 {
     phase = 0.0; amp = 0.0f; pitchEnv = 0.0f; filterState = 0.0f; click = 0.0f;
-    bendSemitones = 0.0f; active = false; gateReleased = false; currentNote = -1; numHeldNotes = 0;
+    active = false; gateReleased = false; currentKey = -1;
+    channelBendSemitones.fill(0.0f);
+    clearHeldKeys();
 }
 
-void SubLab808Processor::triggerNote(int note, float newVelocity)
+int SubLab808Processor::keyForMidiMessage(int channel, int note) noexcept
 {
-    for (int i = numHeldNotes - 1; i >= 0; --i)
-        if (heldNotes[(size_t) i] == note) {
-            for (int j = i; j < numHeldNotes - 1; ++j) heldNotes[(size_t) j] = heldNotes[(size_t) (j + 1)];
-            --numHeldNotes;
+    if (! juce::isPositiveAndBelow(channel, midiChannelCount + 1)
+        || ! juce::isPositiveAndBelow(note, midiNoteCount)) return -1;
+    return (channel - 1) * midiNoteCount + note;
+}
+
+void SubLab808Processor::removeHeldKeyFromOrder(int key)
+{
+    for (int i = numHeldKeys - 1; i >= 0; --i)
+        if (heldKeys[(size_t) i] == key) {
+            for (int j = i; j < numHeldKeys - 1; ++j) heldKeys[(size_t) j] = heldKeys[(size_t) (j + 1)];
+            --numHeldKeys;
+            return;
         }
+}
+
+void SubLab808Processor::clearHeldKeys()
+{
+    heldKeyCounts.fill(0);
+    numHeldKeys = 0;
+}
+
+void SubLab808Processor::triggerNote(int channel, int note, float newVelocity)
+{
+    const auto key = keyForMidiMessage(channel, note);
+    if (key < 0) return;
+
     // A new note played while another one is still held and Glide is active is a legato slide:
     // the pitch glides to the new note and the running envelope, phase and click continue.
     // Retriggering here would reset the phase to zero mid-cycle and click on every slide.
     const auto glideTime = parameters.getRawParameterValue("glide")->load();
-    const bool legato = active && numHeldNotes > 0 && glideTime >= 0.001f;
-    if (numHeldNotes == (int) heldNotes.size()) // full: forget the oldest note instead of the new one
-    {
-        for (int j = 0; j < numHeldNotes - 1; ++j) heldNotes[(size_t) j] = heldNotes[(size_t) (j + 1)];
-        --numHeldNotes;
-    }
-    heldNotes[(size_t) numHeldNotes++] = note;
-    targetHz = juce::MidiMessage::getMidiNoteInHertz(note); // Tune is applied live in renderSample()
+    const auto currentNote = currentKey >= 0 ? currentKey % midiNoteCount : -1;
+    const bool legato = active && numHeldKeys > 0 && note != currentNote && glideTime >= 0.001f;
+
+    auto& holdCount = heldKeyCounts[(size_t) key];
+    if (holdCount < std::numeric_limits<uint16_t>::max()) ++holdCount;
+    removeHeldKeyFromOrder(key);
+    heldKeys[(size_t) numHeldKeys++] = key;
+
+    targetHz = juce::MidiMessage::getMidiNoteInHertz(note); // Tune is applied live in renderSample().
     if (! active || glideTime < 0.001f) currentHz = targetHz;
-    if (legato) { currentNote = note; gateReleased = false; return; }
+    if (legato) { currentKey = key; gateReleased = false; return; }
     auto velocityAmount = parameters.getRawParameterValue("velocity")->load() * 0.01f;
     velocity = juce::jmap(velocityAmount, 1.0f, juce::jlimit(0.0f, 1.0f, newVelocity));
     amp = 1.0f;
     pitchEnv = parameters.getRawParameterValue("punch")->load();
     click = parameters.getRawParameterValue("click")->load() * 0.01f;
     phase = 0.0;
-    currentNote = note;
+    currentKey = key;
     gateReleased = false;
     active = true;
 }
 
-void SubLab808Processor::releaseNote(int note)
+void SubLab808Processor::releaseNote(int channel, int note)
 {
-    for (int i = numHeldNotes - 1; i >= 0; --i)
-        if (heldNotes[(size_t) i] == note) {
-            for (int j = i; j < numHeldNotes - 1; ++j) heldNotes[(size_t) j] = heldNotes[(size_t) (j + 1)];
-            --numHeldNotes;
-            break;
-        }
-    if (note != currentNote) return;
-    if (numHeldNotes > 0) {
-        currentNote = heldNotes[(size_t) (numHeldNotes - 1)];
-        targetHz = juce::MidiMessage::getMidiNoteInHertz(currentNote);
+    const auto key = keyForMidiMessage(channel, note);
+    if (key < 0) return;
+    auto& holdCount = heldKeyCounts[(size_t) key];
+    if (holdCount == 0) return;
+    if (--holdCount > 0) return;
+
+    removeHeldKeyFromOrder(key);
+    if (parameters.getRawParameterValue("oneshot")->load() >= 0.5f) return;
+    if (key != currentKey) return;
+    if (numHeldKeys > 0) {
+        currentKey = heldKeys[(size_t) (numHeldKeys - 1)];
+        targetHz = juce::MidiMessage::getMidiNoteInHertz(currentKey % midiNoteCount);
         gateReleased = false;
     } else {
-        currentNote = -1;
-        if (parameters.getRawParameterValue("oneshot")->load() < 0.5f) gateReleased = true;
+        gateReleased = true;
+    }
+}
+
+void SubLab808Processor::allNotesOff(int channel)
+{
+    if (! juce::isPositiveAndBelow(channel, midiChannelCount + 1)) return;
+    const auto channelIndex = channel - 1;
+    const auto firstKey = channelIndex * midiNoteCount;
+    const bool ownsCurrentVoice = currentKey >= firstKey && currentKey < firstKey + midiNoteCount;
+
+    for (int note = 0; note < midiNoteCount; ++note) heldKeyCounts[(size_t) (firstKey + note)] = 0;
+    int writeIndex = 0;
+    for (int readIndex = 0; readIndex < numHeldKeys; ++readIndex) {
+        const auto key = heldKeys[(size_t) readIndex];
+        if (key < firstKey || key >= firstKey + midiNoteCount)
+            heldKeys[(size_t) writeIndex++] = key;
+    }
+    numHeldKeys = writeIndex;
+
+    if (! ownsCurrentVoice || parameters.getRawParameterValue("oneshot")->load() >= 0.5f) return;
+    if (numHeldKeys > 0) {
+        currentKey = heldKeys[(size_t) (numHeldKeys - 1)];
+        targetHz = juce::MidiMessage::getMidiNoteInHertz(currentKey % midiNoteCount);
+        gateReleased = false;
+    } else {
+        gateReleased = true;
+    }
+}
+
+void SubLab808Processor::allSoundOff(int channel)
+{
+    if (! juce::isPositiveAndBelow(channel, midiChannelCount + 1)) return;
+    const auto channelIndex = channel - 1;
+    const auto firstKey = channelIndex * midiNoteCount;
+    const bool ownsCurrentVoice = currentKey >= firstKey && currentKey < firstKey + midiNoteCount;
+
+    for (int note = 0; note < midiNoteCount; ++note) heldKeyCounts[(size_t) (firstKey + note)] = 0;
+    int writeIndex = 0;
+    for (int readIndex = 0; readIndex < numHeldKeys; ++readIndex) {
+        const auto key = heldKeys[(size_t) readIndex];
+        if (key < firstKey || key >= firstKey + midiNoteCount)
+            heldKeys[(size_t) writeIndex++] = key;
+    }
+    numHeldKeys = writeIndex;
+
+    if (! ownsCurrentVoice) return;
+    if (numHeldKeys > 0) {
+        currentKey = heldKeys[(size_t) (numHeldKeys - 1)];
+        targetHz = juce::MidiMessage::getMidiNoteInHertz(currentKey % midiNoteCount);
+        gateReleased = false;
+    } else {
+        phase = 0.0; amp = 0.0f; pitchEnv = 0.0f; filterState = 0.0f; click = 0.0f;
+        active = false; gateReleased = false; currentKey = -1;
     }
 }
 
@@ -189,11 +283,18 @@ float SubLab808Processor::renderSample()
     // Idle voice: nothing left to render once the envelope, click and filter have died away.
     if (! active && std::abs(filterState) < 1.0e-6f && click < 1.0e-6f)
     {
+        // Parameter automation must keep progressing during silence. Otherwise the next note
+        // starts with stale drive, tone, body or output values and changes timbre for ~20 ms.
+        ampCoef.skip(1); pitchCoef.skip(1); glideCoef.skip(1); releaseCoef.skip(1);
+        drive.skip(1); outputGain.skip(1); filterCoef.skip(1); body.skip(1);
         filterState = 0.0f;
         return 0.0f;
     }
     const auto glideNow = glideCoef.getNextValue();
     currentHz = targetHz + (currentHz - targetHz) * glideNow;
+    const auto voiceChannel = currentKey >= 0 ? currentKey / midiNoteCount : -1;
+    const auto bendSemitones = juce::isPositiveAndBelow(voiceChannel, midiChannelCount)
+                                 ? channelBendSemitones[(size_t) voiceChannel] : 0.0f;
     auto hz = currentHz * std::pow(2.0, (pitchEnv + bendSemitones + tuneSemitones) / 12.0f);
     phase += hz / sampleRate;
     phase -= std::floor(phase);
@@ -211,7 +312,11 @@ float SubLab808Processor::renderSample()
     filterState = (1.0f - filterNow) * sample + filterNow * filterState;
     amp *= gateReleased ? releaseCoef.getNextValue() : ampCoef.getNextValue();
     pitchEnv *= pitchCoef.getNextValue();
-    if (amp < 0.00001f) active = false;
+    if (amp < amplitudeSilenceThreshold) {
+        amp = 0.0f;
+        active = false;
+        currentKey = -1;
+    }
     const auto postGain = filterState * outputGain.getNextValue();
     return std::tanh(postGain * 1.2f);
 }
@@ -250,15 +355,16 @@ void SubLab808Processor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
     {
         while (midiIterator != midiEnd && (*midiIterator).samplePosition <= i) {
             const auto message = (*midiIterator).getMessage();
-            if (message.isNoteOn()) triggerNote(message.getNoteNumber(), message.getFloatVelocity());
-            else if (message.isPitchWheel()) bendSemitones = 2.0f * (float) (message.getPitchWheelValue() - 8192) / 8192.0f;
-            else if (message.isNoteOff()) releaseNote(message.getNoteNumber());
-            else if (message.isAllNotesOff())
-            {
-                numHeldNotes = 0; currentNote = -1; bendSemitones = 0.0f;
-                if (parameters.getRawParameterValue("oneshot")->load() < 0.5f) gateReleased = true; // one-shot keeps decaying
+            if (message.isNoteOn()) triggerNote(message.getChannel(), message.getNoteNumber(), message.getFloatVelocity());
+            else if (message.isPitchWheel()) {
+                const auto channelIndex = message.getChannel() - 1;
+                if (juce::isPositiveAndBelow(channelIndex, midiChannelCount))
+                    channelBendSemitones[(size_t) channelIndex]
+                        = 2.0f * (float) (message.getPitchWheelValue() - 8192) / 8192.0f;
             }
-            else if (message.isAllSoundOff()) resetSound();
+            else if (message.isNoteOff()) releaseNote(message.getChannel(), message.getNoteNumber());
+            else if (message.isAllNotesOff()) allNotesOff(message.getChannel());
+            else if (message.isAllSoundOff()) allSoundOff(message.getChannel());
             ++midiIterator;
         }
         float sample = renderSample();
@@ -277,25 +383,46 @@ juce::AudioProcessorEditor* SubLab808Processor::createEditor()
 void SubLab808Processor::getStateInformation(juce::MemoryBlock& dest)
 {
     auto state = parameters.copyState();
+    const auto size = getEditorSize();
     state.setProperty("factoryProgram", currentProgram.load(), nullptr);
     state.setProperty("presetModified", presetModified.load(), nullptr);
-    state.setProperty("editorWidth", editorWidth.load(), nullptr);
-    state.setProperty("editorHeight", editorHeight.load(), nullptr);
+    state.setProperty("editorWidth", size.x, nullptr);
+    state.setProperty("editorHeight", size.y, nullptr);
     if (auto xml = state.createXml()) copyXmlToBinary(*xml, dest);
+}
+
+bool SubLab808Processor::parametersMatchProgram(int index)
+{
+    if (! juce::isPositiveAndBelow(index, getNumPrograms())) return false;
+    const auto& preset = factoryPresets[(size_t) index];
+    for (const auto& field : presetFields) {
+        const auto* value = parameters.getRawParameterValue(field.id);
+        if (value == nullptr || std::abs(value->load() - preset.values.*field.member) > 0.0005f) return false;
+    }
+    const auto* oneShot = parameters.getRawParameterValue("oneshot");
+    return oneShot != nullptr && (oneShot->load() >= 0.5f) == preset.oneShot;
 }
 
 void SubLab808Processor::setStateInformation(const void* data, int size)
 {
     if (auto xml = getXmlFromBinary(data, size)) {
         auto state = juce::ValueTree::fromXml(*xml);
+        if (! state.isValid() || state.getType() != parameters.state.getType()) return;
         currentProgram.store(juce::jlimit(0, getNumPrograms() - 1, (int) state.getProperty("factoryProgram", 0)));
+        const auto hasModifiedFlag = state.hasProperty("presetModified");
         const auto wasModified = (bool) state.getProperty("presetModified", false);
-        editorWidth.store(juce::jlimit(820, 1100, (int) state.getProperty("editorWidth", 860)));
-        editorHeight.store(juce::jlimit(430, 680, (int) state.getProperty("editorHeight", 520)));
+        setEditorSize((int) state.getProperty("editorWidth", 860),
+                      (int) state.getProperty("editorHeight", 520));
         applyingPreset.store(true);
         parameters.replaceState(state);
         applyingPreset.store(false);
-        presetModified.store(wasModified);
+        presetModified.store(hasModifiedFlag ? wasModified : ! parametersMatchProgram(currentProgram.load()));
+        if (auto* messageManager = juce::MessageManager::getInstanceWithoutCreating();
+            messageManager != nullptr && messageManager->isThisTheMessageThread())
+            if (auto* editor = getActiveEditor()) {
+                const auto restoredSize = getEditorSize();
+                editor->setSize(restoredSize.x, restoredSize.y);
+            }
     }
 }
 

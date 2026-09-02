@@ -49,6 +49,21 @@ target_compile_definitions(SubLab808 PUBLIC JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 J
 target_link_libraries(SubLab808 PRIVATE juce::juce_audio_utils juce::juce_dsp
     PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_lto_flags juce::juce_recommended_warning_flags)
 
+if(APPLE)
+    # JUCE generates moduleinfo.json after its initial ad-hoc signing step. Sign the completed
+    # bundle last so the downloadable artifact has a valid resource seal.
+    find_program(SUBLAB808_CODESIGN_EXECUTABLE codesign REQUIRED)
+    set(SUBLAB808_CODESIGN_IDENTITY "-" CACHE STRING "Final VST3 signing identity; '-' selects ad-hoc signing")
+    set(SUBLAB808_CODESIGN_OPTIONS --force --deep --sign "${SUBLAB808_CODESIGN_IDENTITY}")
+    if(NOT SUBLAB808_CODESIGN_IDENTITY STREQUAL "-")
+        list(APPEND SUBLAB808_CODESIGN_OPTIONS --options runtime --timestamp)
+    endif()
+    add_custom_command(TARGET SubLab808_VST3 POST_BUILD
+        COMMAND "${SUBLAB808_CODESIGN_EXECUTABLE}" ${SUBLAB808_CODESIGN_OPTIONS} "$<TARGET_BUNDLE_DIR:SubLab808_VST3>"
+        COMMENT "Signing completed SubLab808 VST3 bundle"
+        VERBATIM)
+endif()
+
 juce_add_console_app(SubLab808Tests PRODUCT_NAME "SubLab808 Tests")
 juce_generate_juce_header(SubLab808Tests)
 target_sources(SubLab808Tests PRIVATE

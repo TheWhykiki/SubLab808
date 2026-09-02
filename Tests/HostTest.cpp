@@ -4,6 +4,17 @@
 // Every stage reports to stderr so a CI failure identifies where the host test died.
 namespace {
 void stage(const char* name) { std::fprintf(stderr, "[host-test] %s\n", name); std::fflush(stderr); }
+
+bool setNormalisedParameter(juce::AudioProcessor& processor, const char* name, float value)
+{
+    for (auto* parameter : processor.getParameters())
+        if (parameter->getName(128) == name) {
+            parameter->setValueNotifyingHost(value);
+            return true;
+        }
+    std::fprintf(stderr, "[host-test] parameter not found: %s\n", name);
+    return false;
+}
 }
 
 int runHostTest(int argc, char** argv);
@@ -50,6 +61,11 @@ int runHostTest(int argc, char** argv)
         std::fprintf(stderr, "[host-test] unexpected plugin name: %s\n", instance->getName().toRawUTF8());
         return 4;
     }
+    const auto tail = instance->getTailLengthSeconds();
+    if (! std::isfinite(tail) || tail < 46.1 || tail > 47.1) {
+        std::fprintf(stderr, "[host-test] invalid tail: %.3f s\n", tail);
+        return 6;
+    }
 
     stage("rendering audio");
     // A VST3 host promises never to exceed the block size passed to prepareToPlay(); the JUCE
@@ -69,6 +85,41 @@ int runHostTest(int argc, char** argv)
         peak = juce::jmax(peak, audio.getMagnitude(0, audio.getNumSamples()));
     }
     if (! std::isfinite(peak) || peak <= 0.0001f || peak > 1.001f) { std::fprintf(stderr, "[host-test] bad peak %f\n", (double) peak); return 5; }
+
+    stage("validating loaded-plugin tail");
+    instance->releaseResources();
+    const bool tailParametersSet = setNormalisedParameter(*instance, "Decay", 1.0f)
+        && setNormalisedParameter(*instance, "Pitch Punch", 1.0f)
+        && setNormalisedParameter(*instance, "Click", 1.0f)
+        && setNormalisedParameter(*instance, "Body", 1.0f)
+        && setNormalisedParameter(*instance, "Drive", 1.0f)
+        && setNormalisedParameter(*instance, "Tone", 0.0f)
+        && setNormalisedParameter(*instance, "Velocity", 1.0f)
+        && setNormalisedParameter(*instance, "Output", 1.0f)
+        && setNormalisedParameter(*instance, "One Shot", 1.0f);
+    if (! tailParametersSet) return 7;
+
+    instance->prepareToPlay(48000.0, blockSize);
+    midi.addEvent(juce::MidiMessage::noteOn(1, 36, (juce::uint8) 127), 0);
+    midi.addEvent(juce::MidiMessage::noteOff(1, 36), 1);
+    const auto tailBlocks = (int) std::ceil(tail * 48000.0 / blockSize);
+    const auto eightSecondBlock = (8 * 48000) / blockSize;
+    float peakAtEightSeconds = 0.0f, finalTailPeak = 0.0f;
+    for (int block = 0; block < tailBlocks; ++block)
+    {
+        audio.clear();
+        instance->processBlock(audio, midi);
+        midi.clear();
+        const auto blockPeak = audio.getMagnitude(0, audio.getNumSamples());
+        if (! std::isfinite(blockPeak)) return 8;
+        if (block == eightSecondBlock) peakAtEightSeconds = blockPeak;
+        if (block == tailBlocks - 1) finalTailPeak = blockPeak;
+    }
+    if (peakAtEightSeconds < 0.01f || finalTailPeak > 1.0e-5f) {
+        std::fprintf(stderr, "[host-test] invalid rendered tail: 8s=%g final=%g\n",
+                     (double) peakAtEightSeconds, (double) finalTailPeak);
+        return 8;
+    }
 
     // Tear down in explicit steps so an abort during shutdown names the responsible stage.
     stage("releasing plugin instance");
