@@ -1,10 +1,79 @@
 #include <JuceHeader.h>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstdio>
 #include <mutex>
+#include <new>
 #include "PluginProcessor.h"
 #include <thread>
+#if defined(__APPLE__)
+#include <malloc/malloc.h>
+#endif
+
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define SUBLAB808_ADDRESS_SANITIZER 1
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__)
+#define SUBLAB808_ADDRESS_SANITIZER 1
+#endif
+#ifndef SUBLAB808_ADDRESS_SANITIZER
+#define SUBLAB808_ADDRESS_SANITIZER 0
+#endif
+
+#if defined(__APPLE__) && !SUBLAB808_ADDRESS_SANITIZER
+namespace allocationProbe
+{
+thread_local bool enabled = false;
+thread_local size_t allocations = 0;
+
+static void begin() noexcept
+{
+    allocations = 0;
+    enabled = true;
+}
+
+static size_t end() noexcept
+{
+    enabled = false;
+    return allocations;
+}
+}
+
+// JUCE's long MidiMessage storage uses std::malloc directly, not operator new. Delegate to the
+// default zone so this test executable can count those calls without changing allocator semantics.
+extern "C" void* malloc(std::size_t size)
+{
+    if (allocationProbe::enabled)
+        ++allocationProbe::allocations;
+    auto* memory = malloc_zone_malloc(malloc_default_zone(), size);
+    if (memory == nullptr)
+        errno = ENOMEM;
+    return memory;
+}
+
+void* operator new(std::size_t size)
+{
+    if (allocationProbe::enabled)
+        ++allocationProbe::allocations;
+    if (auto* memory = std::malloc(size == 0 ? 1 : size))
+        return memory;
+    throw std::bad_alloc {};
+}
+
+void* operator new[](std::size_t size)
+{
+    return ::operator new(size);
+}
+
+void operator delete(void* memory) noexcept { std::free(memory); }
+void operator delete[](void* memory) noexcept { std::free(memory); }
+void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
+void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
+#endif
 
 namespace {
 void setParameter(SubLab808Processor& processor, const char* id, float value)
@@ -820,6 +889,50 @@ int main()
     {
         const auto [afterFirstOff, afterSecondOff] = renderRepeatedNoteGateLevels();
         if (afterFirstOff < 0.05f || afterSecondOff > afterFirstOff * 0.1f) return 16;
+    }
+    {
+        // SysEx is irrelevant to this synth and must be skipped without preventing a channel
+        // message at the same sample position from reaching the voice.
+        SubLab808Processor sysex;
+        sysex.prepareToPlay(48000.0, 512);
+        juce::AudioBuffer<float> sysexAudio(2, 512);
+        juce::MidiBuffer sysexMidi;
+        std::array<juce::uint8, 64> payload {};
+        for (size_t index = 0; index < payload.size(); ++index)
+            payload[index] = static_cast<juce::uint8>(index & 0x7f);
+        sysexMidi.addEvent(juce::MidiMessage::createSysExMessage(payload.data(),
+                                                                 static_cast<int>(payload.size())), 0);
+        sysexMidi.addEvent(juce::MidiMessage::noteOn(1, 36, static_cast<juce::uint8>(127)), 0);
+
+#if defined(__APPLE__) && !SUBLAB808_ADDRESS_SANITIZER
+        // Keep the probe honest: the pinned JUCE implementation must register a long-message
+        // allocation before the corrected processBlock path is required to register none.
+        allocationProbe::begin();
+        const auto calibrationMessage = (*sysexMidi.begin()).getMessage();
+        const auto calibrationAllocations = allocationProbe::end();
+        if (calibrationMessage.getRawDataSize() <= 8 || calibrationAllocations == 0)
+            return 44;
+#endif
+
+        juce::AudioBuffer<float> warmAudio(2, 512);
+        juce::MidiBuffer warmMidi;
+        warmMidi.addEvent(juce::MidiMessage::noteOn(1, 36, static_cast<juce::uint8>(100)), 0);
+        warmMidi.addEvent(juce::MidiMessage::controllerEvent(1, 120, 0), 256);
+        sysex.processBlock(warmAudio, warmMidi);
+
+#if defined(__APPLE__) && !SUBLAB808_ADDRESS_SANITIZER
+        allocationProbe::begin();
+#endif
+        sysex.processBlock(sysexAudio, sysexMidi);
+#if defined(__APPLE__) && !SUBLAB808_ADDRESS_SANITIZER
+        const auto realtimeAllocations = allocationProbe::end();
+        if (realtimeAllocations != 0)
+        {
+            std::fprintf(stderr, "SysEx processBlock allocations: %zu\n", realtimeAllocations);
+            return 43;
+        }
+#endif
+        if (sysexAudio.getMagnitude(0, 0, sysexAudio.getNumSamples()) < 0.01f) return 42;
     }
     {
         const auto [afterWrongChannelOff, afterOwnerOff] = renderCrossChannelNoteOffLevels();

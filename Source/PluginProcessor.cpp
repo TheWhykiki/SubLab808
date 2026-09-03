@@ -507,7 +507,18 @@ void SubLab808Processor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
     for (int i = 0; i < buffer.getNumSamples(); ++i)
     {
         while (midiIterator != midiEnd && (*midiIterator).samplePosition <= i) {
-            const auto message = (*midiIterator).getMessage();
+            const auto metadata = *midiIterator;
+            ++midiIterator;
+
+            // This instrument only consumes MIDI channel messages, which are at most three
+            // bytes long. Avoid materialising owning MidiMessage objects for SysEx payloads:
+            // messages larger than MidiMessage's inline storage would otherwise allocate and
+            // free heap memory inside processBlock().
+            if (metadata.numBytes <= 0 || metadata.numBytes > 3
+                || (metadata.data[0] & 0xf0u) == 0xf0u)
+                continue;
+
+            const auto message = metadata.getMessage();
             if (message.isNoteOn()) triggerNote(message.getChannel(), message.getNoteNumber(), message.getFloatVelocity());
             else if (message.isPitchWheel()) {
                 const auto channelIndex = message.getChannel() - 1;
@@ -523,7 +534,6 @@ void SubLab808Processor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
                 if (juce::isPositiveAndBelow(channelIndex, midiChannelCount))
                     channelBendSemitones[(size_t) channelIndex].setTargetValue(0.0f);
             }
-            ++midiIterator;
         }
         float sample = renderSample();
         for (int c = 0; c < buffer.getNumChannels(); ++c) buffer.setSample(c, i, sample);
