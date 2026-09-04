@@ -1,4 +1,5 @@
 #pragma once
+#include "PresetLibrary.h"
 #include <JuceHeader.h>
 #include <condition_variable>
 #include <deque>
@@ -8,7 +9,7 @@ class SubLab808Processor final : public juce::AudioProcessor,
                                  private juce::AudioProcessorValueTreeState::Listener
 {
 public:
-    SubLab808Processor();
+    explicit SubLab808Processor(juce::File presetStorage = {});
     ~SubLab808Processor() override;
     void prepareToPlay(double, int) override;
     void releaseResources() override {}
@@ -31,6 +32,7 @@ public:
     void setStateInformation(const void*, int) override;
 
     juce::AudioProcessorValueTreeState parameters;
+    wk::PresetLibrary presets;
     std::atomic<float> outputMeter { 0.0f };
     juce::Point<int> getEditorSize() const noexcept;
     void setEditorSize(int width, int height) noexcept;

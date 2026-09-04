@@ -4,7 +4,7 @@ if(CMAKE_HOST_APPLE)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version" FORCE)
     set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "Apple Silicon build" FORCE)
 endif()
-project(SubLab808 VERSION 1.3.1 LANGUAGES C CXX)
+project(SubLab808 VERSION 1.4.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -89,3 +89,16 @@ target_link_libraries(SubLab808HostTests PRIVATE juce::juce_audio_utils
 add_dependencies(SubLab808HostTests SubLab808_VST3)
 add_test(NAME SubLab808BundleLoad COMMAND SubLab808HostTests
     "${CMAKE_BINARY_DIR}/SubLab808_artefacts/$<CONFIG>/VST3/SubLab808.vst3")
+
+# Preset persistence and complete factory-bank audio checks.
+juce_add_console_app(SubLab808PresetTests PRODUCT_NAME "SubLab808 Preset Tests")
+juce_generate_juce_header(SubLab808PresetTests)
+target_sources(SubLab808PresetTests PRIVATE Tests/PresetTests.cpp Source/PluginProcessor.cpp Source/PluginEditor.cpp)
+target_include_directories(SubLab808PresetTests PRIVATE Source)
+target_compile_definitions(SubLab808PresetTests PRIVATE
+    JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0
+    JUCE_MODAL_LOOPS_PERMITTED=1 PRESET_TEST_SUBLAB=1 JucePlugin_Name="SubLab808"
+    SUBLAB808_VERSION_STRING="${PROJECT_VERSION}")
+target_link_libraries(SubLab808PresetTests PRIVATE juce::juce_audio_utils juce::juce_dsp
+    PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
+add_test(NAME SubLab808Presets COMMAND SubLab808PresetTests)

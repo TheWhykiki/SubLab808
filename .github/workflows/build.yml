@@ -15,12 +15,14 @@ jobs:
         with:
           path: build/_deps
           key: juce-91ad83ae34a81e0833b1a2b0866f54846370ae53
+      - name: Verify factory bank
+        run: python3 scripts/generate-presets.py --check
       - name: Configure
         # Same generator as BUILDING.md; the Xcode generator adds entitlement/codesign steps that
         # are not part of the documented build and were the only difference to passing local runs.
         run: cmake -S . -B build -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release
       - name: Build
-        run: cmake --build build --target SubLab808Tests SubLab808_VST3 SubLab808HostTests -j "$(sysctl -n hw.ncpu)"
+        run: cmake --build build --target SubLab808Tests SubLab808_VST3 SubLab808HostTests SubLab808PresetTests -j "$(sysctl -n hw.ncpu)"
       - name: Test
         run: ctest --test-dir build --output-on-failure
       - name: Verify deployment target and architecture
@@ -54,6 +56,8 @@ jobs:
         with:
           path: build-asan/_deps
           key: juce-91ad83ae34a81e0833b1a2b0866f54846370ae53
+      - name: Verify factory bank
+        run: python3 scripts/generate-presets.py --check
       - name: Configure
         run: >
           cmake -S . -B build-asan -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=RelWithDebInfo
@@ -63,7 +67,7 @@ jobs:
           -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
           -DCMAKE_MODULE_LINKER_FLAGS="-fsanitize=address,undefined"
       - name: Build
-        run: cmake --build build-asan --target SubLab808Tests SubLab808_VST3 SubLab808HostTests -j "$(sysctl -n hw.ncpu)"
+        run: cmake --build build-asan --target SubLab808Tests SubLab808_VST3 SubLab808HostTests SubLab808PresetTests -j "$(sysctl -n hw.ncpu)"
       - name: Test
         env:
           ASAN_OPTIONS: detect_leaks=0

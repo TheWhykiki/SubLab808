@@ -1,6 +1,6 @@
 # SubLab808
 
-Eigenständiger, nativer 808-Bass-Synth für Apple Silicon und Cubase (VST3), Version 1.3.1.
+Eigenständiger, nativer 808-Bass-Synth für Apple Silicon und Cubase (VST3), Entwicklungsstand 1.4.0.
 Die Klangerzeugung ist neu implementiert und verwendet keine Binärdaten oder Samples von 808 Lab.
 
 ## Regler
@@ -45,4 +45,17 @@ Phasenwechsel bereit und beginnen nicht erst beim Note-Off oder Retrigger zu wir
 
 ## Factory Presets
 
-Deep Foundation, Modern Knock, Long Slide, Dirty Trunk, Short Punch, Soft Pillow, Upper Bass und Sub Destroyer sind direkt über Cubase oder die Preset-Auswahl im Plugin erreichbar.
+64 eigene Factory-Presets sind über Cubase oder den Preset-Browser erreichbar. Die bisherigen acht Sounds bleiben mit ihren ursprünglichen Programmnummern und Klangeinstellungen erhalten.
+
+
+## Eigene Presets speichern
+
+Den Preset-Namen anklicken, um den Browser mit Suche, Kategorien und Favoriten zu öffnen.
+**Save** speichert Änderungen an einem eigenen Preset; **Save As** legt eine neue Variante mit Namen und Kategorie an.
+Unter **More** stehen Umbenennen, Löschen, Import und Export bereit. `*` kennzeichnet ungespeicherte Änderungen.
+
+Eigene Dateien liegen auf macOS unter `~/Library/Whykiki Audio/SubLab808/Presets` und verwenden
+`.sublab808preset`. Factory-Sounds bleiben geschützt. Der DAW-Projektzustand enthält zusätzlich den aktuellen
+Klang einschließlich ungespeicherter Änderungen und des eigenen Preset-Namens.
+
+Siehe [Preset-Katalog](Presets/CATALOG.md) und [Umsetzungs- und Abnahmeplan](PRESET_PLAN.md).
