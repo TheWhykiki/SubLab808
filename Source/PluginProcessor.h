@@ -52,6 +52,7 @@ private:
         float glide = 0.03f, tune = 0.0f, body = 18.0f, click = 12.0f;
         float drive = 5.0f, tone = 5000.0f, velocity = 80.0f, output = -3.0f;
         bool oneShot = true;
+        uint64_t clickSequenceGeneration = 0;
     };
 
     static juce::AudioProcessorValueTreeState::ParameterLayout makeLayout();
@@ -82,7 +83,9 @@ private:
     float click = 0.0f, clickCoef = 0.965f;
     juce::SmoothedValue<float> ampCoef, pitchCoef, glideCoef, releaseCoef;
     juce::SmoothedValue<float> drive, outputGain, filterCoef, body, tuneSemitones;
-    uint32_t noiseState = 0x6d2b79f5u;
+    static constexpr uint32_t initialNoiseSeed = 0x6d2b79f5u;
+    uint32_t noiseState = initialNoiseSeed;
+    std::atomic<uint64_t> clickSequenceGeneration { 0 };
     std::atomic<uint64_t> editorSize { packEditorSize(860, 520) };
     std::atomic<int> currentProgram { 0 };
     std::atomic<unsigned> internalParameterChangeDepth { 0 };

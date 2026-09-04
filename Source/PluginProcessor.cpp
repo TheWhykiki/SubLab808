@@ -238,6 +238,7 @@ SubLab808Processor::RuntimeParameters SubLab808Processor::readRuntimeParameters(
     result.velocity = parameters.getRawParameterValue("velocity")->load();
     result.output = parameters.getRawParameterValue("output")->load();
     result.oneShot = parameters.getRawParameterValue("oneshot")->load() >= 0.5f;
+    result.clickSequenceGeneration = clickSequenceGeneration.load(std::memory_order_acquire);
     return result;
 }
 
@@ -248,7 +249,13 @@ void SubLab808Processor::refreshRuntimeParameters() noexcept
 
     const auto candidate = readRuntimeParameters();
     const auto after = parameterTransactionSequence.load(std::memory_order_acquire);
-    if (before == after) runtimeParameters = candidate;
+    if (before == after) {
+        // State restore only publishes a generation on the control thread. Adopt it
+        // with the matching, committed parameters; noiseState remains audio-owned.
+        if (candidate.clickSequenceGeneration != runtimeParameters.clickSequenceGeneration)
+            noiseState = initialNoiseSeed;
+        runtimeParameters = candidate;
+    }
 }
 
 void SubLab808Processor::prepareToPlay(double sr, int)
@@ -281,6 +288,7 @@ void SubLab808Processor::prepareToPlay(double sr, int)
 void SubLab808Processor::resetSound()
 {
     phase = 0.0; amp = 0.0f; pitchEnv = 0.0f; filterState = 0.0f; click = 0.0f;
+    noiseState = initialNoiseSeed;
     active = false; gateReleased = false; currentKey = -1;
     for (auto& bend : channelBendSemitones) bend.setCurrentAndTargetValue(0.0f);
     clearHeldKeys();
@@ -462,7 +470,11 @@ float SubLab808Processor::renderSample()
     auto sample = (fundamental + bodyNow * 0.22f * harmonic + transient) * amp * velocity;
     sample = std::tanh(sample * driveNow) / std::max(1.0f, std::tanh(driveNow));
     filterState = (1.0f - filterNow) * sample + filterNow * filterState;
-    amp *= gateReleased ? releaseCoef.getNextValue() : ampCoef.getNextValue();
+    // Both ramps follow audio time, including while their envelope phase is inactive.
+    // Otherwise an earlier Release edit would only begin smoothing at NoteOff.
+    const auto decayNow = ampCoef.getNextValue();
+    const auto releaseNow = releaseCoef.getNextValue();
+    amp *= gateReleased ? releaseNow : decayNow;
     pitchEnv *= pitchCoef.getNextValue();
     if (amp < amplitudeSilenceThreshold) {
         amp = 0.0f;
@@ -646,6 +658,7 @@ bool SubLab808Processor::applyStateNow(const juce::ValueTree& state)
     presetModified.store((hasModifiedFlag && wasModified) || ! matchesFactoryProgram);
     internalParameterChangeDepth.fetch_sub(1);
     if (! parametersMatchProgram(restoredProgram)) presetModified.store(true);
+    clickSequenceGeneration.fetch_add(1, std::memory_order_release);
 
     if (auto* messageManager = juce::MessageManager::getInstanceWithoutCreating();
         messageManager != nullptr && messageManager->isThisTheMessageThread())

@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <mutex>
 #include <new>
+#include <limits>
 #include "PluginProcessor.h"
 #include <thread>
 #if defined(__APPLE__)
@@ -261,6 +262,12 @@ struct BlockingParameterListener final : juce::AudioProcessorParameter::Listener
         condition.wait(lock, [this] { return entered; });
     }
 
+    bool waitUntilEnteredFor(std::chrono::milliseconds timeout)
+    {
+        std::unique_lock lock(mutex);
+        return condition.wait_for(lock, timeout, [this] { return entered; });
+    }
+
     void release()
     {
         {
@@ -406,6 +413,217 @@ float renderPeakAfterIdleOutputChange(bool changeWhileIdle)
     midi.addEvent(juce::MidiMessage::noteOn(1, 36, (juce::uint8) 127), 0);
     processor.processBlock(audio, midi);
     return audio.getMagnitude(0, 0, 128);
+}
+
+float maximumSampleDifference(const juce::AudioBuffer<float>& first,
+                              const juce::AudioBuffer<float>& second)
+{
+    if (first.getNumChannels() != second.getNumChannels()
+        || first.getNumSamples() != second.getNumSamples())
+        return std::numeric_limits<float>::infinity();
+    float difference = 0.0f;
+    for (int channel = 0; channel < first.getNumChannels(); ++channel)
+        for (int sample = 0; sample < first.getNumSamples(); ++sample) {
+            const auto a = first.getSample(channel, sample), b = second.getSample(channel, sample);
+            if (! std::isfinite(a) || ! std::isfinite(b))
+                return std::numeric_limits<float>::infinity();
+            difference = std::max(difference, std::abs(a - b));
+        }
+    return difference;
+}
+
+juce::AudioBuffer<float> renderAfterInactiveEnvelopeChange(bool changeDuringVoice, bool changeRelease)
+{
+    SubLab808Processor processor;
+    setParameter(processor, "oneshot", 0.0f);
+    setParameter(processor, "punch", 0.0f); setParameter(processor, "click", 0.0f);
+    setParameter(processor, "body", 0.0f); setParameter(processor, "drive", 0.0f);
+    setParameter(processor, "glide", 0.0f);
+    setParameter(processor, "decay", changeDuringVoice && ! changeRelease ? 0.08f : 4.0f);
+    setParameter(processor, "release", changeDuringVoice && changeRelease ? 0.01f : 1.5f);
+    processor.prepareToPlay(48000.0, 512);
+
+    juce::AudioBuffer<float> audio(2, 512); juce::MidiBuffer midi;
+    midi.addEvent(juce::MidiMessage::noteOn(1, 36, (juce::uint8) 110), 0);
+    // Enter release before rendering even the first sample, so both reference histories
+    // are identical while Decay is inactive. In the other case keep the note held.
+    if (! changeRelease) midi.addEvent(juce::MidiMessage::noteOff(1, 36), 0);
+    processor.processBlock(audio, midi);
+    setParameter(processor, changeRelease ? "release" : "decay", changeRelease ? 1.5f : 4.0f);
+    midi.clear();
+    for (int block = 0; block < 4; ++block) processor.processBlock(audio, midi); // >20 ms
+
+    juce::AudioBuffer<float> result(2, 2048);
+    if (changeRelease) midi.addEvent(juce::MidiMessage::noteOff(1, 36), 0);
+    else midi.addEvent(juce::MidiMessage::noteOn(1, 36, (juce::uint8) 110), 0);
+    for (int block = 0; block < 4; ++block) {
+        processor.processBlock(audio, midi); midi.clear();
+        for (int channel = 0; channel < 2; ++channel)
+            result.copyFrom(channel, block * 512, audio, channel, 0, 512);
+    }
+    return result;
+}
+
+void setClickTestParameters(SubLab808Processor& processor)
+{
+    setParameter(processor, "punch", 0.0f); setParameter(processor, "click", 80.0f);
+    setParameter(processor, "body", 0.0f); setParameter(processor, "drive", 0.0f);
+    setParameter(processor, "tone", 12000.0f); setParameter(processor, "glide", 0.0f);
+}
+
+juce::AudioBuffer<float> renderClickPhrase(SubLab808Processor& processor)
+{
+    juce::AudioBuffer<float> result(2, 2048), audio(2, 512); juce::MidiBuffer midi;
+    // Stop any preceding voice without resetting the performance's random sequence.
+    midi.addEvent(juce::MidiMessage::controllerEvent(1, 120, 0), 0);
+    midi.addEvent(juce::MidiMessage::noteOn(1, 36, (juce::uint8) 110), 16);
+    for (int block = 0; block < 4; ++block) {
+        processor.processBlock(audio, midi); midi.clear();
+        for (int channel = 0; channel < 2; ++channel)
+            result.copyFrom(channel, block * 512, audio, channel, 0, 512);
+    }
+    return result;
+}
+
+bool stateRestorePreservesRunningVoice()
+{
+    SubLab808Processor reference, restored;
+    juce::AudioBuffer<float> expected(2, 512), actual(2, 512);
+    for (auto* processor : { &reference, &restored }) {
+        setParameter(*processor, "click", 0.0f); setParameter(*processor, "decay", 4.0f);
+        setParameter(*processor, "release", 0.01f); setParameter(*processor, "oneshot", 0.0f);
+        processor->prepareToPlay(48000.0, 512);
+        juce::MidiBuffer start;
+        start.addEvent(juce::MidiMessage::pitchWheel(1, 12288), 0);
+        start.addEvent(juce::MidiMessage::noteOn(1, 36, (juce::uint8) 110), 0);
+        processor->processBlock(actual, start);
+    }
+    juce::MemoryBlock state; restored.getStateInformation(state);
+    std::thread restore([&] { restored.setStateInformation(state.getData(), (int) state.getSize()); });
+    restore.join();
+    float difference = 0.0f, heldPeak = 0.0f;
+    for (int block = 0; block < 16; ++block) {
+        juce::MidiBuffer midi;
+        if (block == 1) midi.addEvent(juce::MidiMessage::noteOff(1, 36), 128);
+        reference.processBlock(expected, midi);
+        restored.processBlock(actual, midi);
+        difference = std::max(difference, maximumSampleDifference(expected, actual));
+        if (block == 0) heldPeak = actual.getMagnitude(0, actual.getNumSamples());
+    }
+    std::fprintf(stderr, "[acceptance] restore preserves running voice/bend/NoteOff: max difference %.9g\n", (double) difference);
+    return difference == 0.0f && heldPeak > 0.001f && actual.getMagnitude(0, actual.getNumSamples()) < 1.0e-5f;
+}
+
+bool clickRestoreOverlapsRendering()
+{
+    SubLab808Processor reference, processor, stateSource;
+    for (auto* instance : { &reference, &processor, &stateSource }) setClickTestParameters(*instance);
+    setParameter(stateSource, "output", -12.0f);
+    juce::MemoryBlock state; stateSource.getStateInformation(state);
+    for (auto* instance : { &reference, &processor }) {
+        instance->prepareToPlay(48000.0, 512);
+        renderClickPhrase(*instance);
+    }
+
+    auto* output = processor.parameters.getParameter("output");
+    if (output == nullptr) return false;
+    BlockingParameterListener blocker;
+    output->addListener(&blocker);
+    std::thread restore([&] { processor.setStateInformation(state.getData(), (int) state.getSize()); });
+    if (! blocker.waitUntilEnteredFor(std::chrono::seconds(2))) {
+        blocker.release(); restore.join(); output->removeListener(&blocker);
+        return false;
+    }
+
+    // Hold replaceState inside its notification. Audio must finish without waiting for
+    // that transaction, using the previous complete parameters and random sequence.
+    juce::AudioBuffer<float> duringRestore;
+    std::mutex renderMutex;
+    std::condition_variable rendered;
+    bool renderFinished = false;
+    std::thread render([&] {
+        duringRestore = renderClickPhrase(processor);
+        { const std::lock_guard lock(renderMutex); renderFinished = true; }
+        rendered.notify_one();
+    });
+    bool finishedBeforeCommit = false;
+    {
+        std::unique_lock lock(renderMutex);
+        finishedBeforeCommit = rendered.wait_for(lock, std::chrono::seconds(2), [&] { return renderFinished; });
+    }
+    blocker.release(); restore.join(); render.join(); output->removeListener(&blocker);
+    const auto beforeCommitDifference = maximumSampleDifference(renderClickPhrase(reference), duringRestore);
+
+    // After commit, settle the changed output gain during silence without advancing
+    // the random sequence. The next phrase must start at the restored seed.
+    juce::AudioBuffer<float> silence(2, 512); juce::MidiBuffer stop;
+    stop.addEvent(juce::MidiMessage::controllerEvent(1, 120, 0), 0);
+    for (int block = 0; block < 4; ++block) { processor.processBlock(silence, stop); stop.clear(); }
+    stateSource.prepareToPlay(48000.0, 512);
+    const auto afterCommitDifference = maximumSampleDifference(renderClickPhrase(stateSource), renderClickPhrase(processor));
+    std::fprintf(stderr, "[acceptance] overlapping restore: render finished before commit=%d, pre/post max differences %.9g / %.9g\n",
+                 (int) finishedBeforeCommit, (double) beforeCommitDifference, (double) afterCommitDifference);
+    return finishedBeforeCommit && beforeCommitDifference == 0.0f && afterCommitDifference == 0.0f;
+}
+
+bool rejectedStatePreservesClickSequence()
+{
+    SubLab808Processor reference, processor;
+    for (auto* instance : { &reference, &processor }) {
+        setClickTestParameters(*instance);
+        instance->prepareToPlay(48000.0, 512);
+        renderClickPhrase(*instance);
+    }
+    const std::array<unsigned char, 4> malformed { 0x13, 0x37, 0x42, 0x00 };
+    juce::MemoryBlock wrongRoot;
+    juce::AudioProcessor::copyXmlToBinary(juce::XmlElement("NOT_SUBLAB808_STATE"), wrongRoot);
+    float difference = 0.0f;
+    for (int rejectedCase = 0; rejectedCase < 3; ++rejectedCase) {
+        if (rejectedCase == 0) processor.setStateInformation(malformed.data(), (int) malformed.size());
+        else if (rejectedCase == 1) processor.setStateInformation(wrongRoot.getData(), (int) wrongRoot.getSize());
+        else processor.setStateInformation(nullptr, 0);
+        difference = std::max(difference, maximumSampleDifference(renderClickPhrase(reference), renderClickPhrase(processor)));
+    }
+    std::fprintf(stderr, "[acceptance] rejected states preserve Click sequence: 3 cases, max difference %.9g\n", (double) difference);
+    return difference == 0.0f;
+}
+
+bool acceptanceRegressions()
+{
+    const auto releaseDifference = maximumSampleDifference(renderAfterInactiveEnvelopeChange(false, true),
+                                                           renderAfterInactiveEnvelopeChange(true, true));
+    const auto decayDifference = maximumSampleDifference(renderAfterInactiveEnvelopeChange(false, false),
+                                                         renderAfterInactiveEnvelopeChange(true, false));
+    std::fprintf(stderr, "[acceptance] inactive Release smoother max difference: %.9g\n", (double) releaseDifference);
+    std::fprintf(stderr, "[acceptance] inactive Decay smoother max difference: %.9g\n", (double) decayDifference);
+
+    SubLab808Processor processor;
+    setClickTestParameters(processor);
+    juce::MemoryBlock savedState; processor.getStateInformation(savedState);
+    processor.prepareToPlay(48000.0, 512);
+    const auto firstPhrase = renderClickPhrase(processor);
+    const auto continuedPhrase = renderClickPhrase(processor);
+    const auto continuationDifference = maximumSampleDifference(firstPhrase, continuedPhrase);
+    processor.prepareToPlay(48000.0, 512);
+    const auto prepareDifference = maximumSampleDifference(firstPhrase, renderClickPhrase(processor));
+    // Restore on a control thread, without prepareToPlay: the audio thread must adopt
+    // the new seed itself, while ordinary repeated notes keep advancing the sequence.
+    std::thread restore([&] { processor.setStateInformation(savedState.getData(), (int) savedState.getSize()); });
+    restore.join();
+    const auto restoreDifference = maximumSampleDifference(firstPhrase, renderClickPhrase(processor));
+    SubLab808Processor restoredInstance;
+    restoredInstance.setStateInformation(savedState.getData(), (int) savedState.getSize());
+    restoredInstance.prepareToPlay(48000.0, 512);
+    const auto newInstanceDifference = maximumSampleDifference(firstPhrase, renderClickPhrase(restoredInstance));
+    std::fprintf(stderr, "[acceptance] Click continuation/prepare/restore/new-instance max differences: %.9g / %.9g / %.9g / %.9g\n",
+                 (double) continuationDifference, (double) prepareDifference,
+                 (double) restoreDifference, (double) newInstanceDifference);
+    const auto preservedVoice = stateRestorePreservesRunningVoice();
+    const auto overlappingRestore = clickRestoreOverlapsRendering();
+    const auto rejectedState = rejectedStatePreservesClickSequence();
+    return preservedVoice && overlappingRestore && rejectedState && releaseDifference == 0.0f && decayDifference == 0.0f
+        && std::isfinite(continuationDifference) && continuationDifference > 0.001f
+        && prepareDifference == 0.0f && restoreDifference == 0.0f && newInstanceDifference == 0.0f;
 }
 
 std::pair<float, float> renderRepeatedNoteGateLevels()
@@ -648,6 +866,7 @@ float renderWorstCasePeakAtReportedTail()
 int main()
 {
     juce::ScopedJuceInitialiser_GUI initialiseJuce;
+    if (! acceptanceRegressions()) return 45;
     SubLab808Processor processor; processor.prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 4096); juce::MidiBuffer midi;
     midi.addEvent(juce::MidiMessage::noteOn(1, 36, (juce::uint8) 110), 0);

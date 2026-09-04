@@ -1,9 +1,77 @@
 #include <JuceHeader.h>
 #include <cstdio>
+#include <limits>
 
 // Every stage reports to stderr so a CI failure identifies where the host test died.
 namespace {
 void stage(const char* name) { std::fprintf(stderr, "[host-test] %s\n", name); std::fflush(stderr); }
+
+struct AudioInspection
+{
+    bool finite = true;
+    float peak = 0.0f;
+    int invalidChannel = -1, invalidSample = -1;
+};
+
+AudioInspection inspectAudio(const juce::AudioBuffer<float>& audio)
+{
+    AudioInspection result;
+    // Peak reductions can hide a NaN when comparisons select another finite value.
+    // Check each channel/sample before reducing, and retain the exact failing location.
+    for (int channel = 0; channel < audio.getNumChannels(); ++channel) {
+        const auto* samples = audio.getReadPointer(channel);
+        for (int sample = 0; sample < audio.getNumSamples(); ++sample) {
+            if (! std::isfinite(samples[sample])) {
+                result.finite = false;
+                result.invalidChannel = channel;
+                result.invalidSample = sample;
+                return result;
+            }
+            result.peak = std::max(result.peak, std::abs(samples[sample]));
+        }
+    }
+    return result;
+}
+
+bool audioValidatorSelfTest()
+{
+    juce::AudioBuffer<float> audio(2, 8);
+    const auto reset = [&] {
+        for (int channel = 0; channel < audio.getNumChannels(); ++channel)
+            for (int sample = 0; sample < audio.getNumSamples(); ++sample)
+                audio.setSample(channel, sample, (sample & 1) != 0 ? -0.25f : 0.5f);
+    };
+    reset();
+    const auto finite = inspectAudio(audio);
+    if (! finite.finite || finite.peak != 0.5f) return false;
+    int acceptedInvalid = 0, mislocated = 0;
+    for (const auto invalid : { std::numeric_limits<float>::quiet_NaN(),
+                               std::numeric_limits<float>::infinity(),
+                               -std::numeric_limits<float>::infinity() })
+        for (int channel = 0; channel < audio.getNumChannels(); ++channel)
+            for (const auto sample : { 0, 3, 7 }) {
+                reset();
+                audio.setSample(channel, sample, invalid);
+                const auto inspection = inspectAudio(audio);
+                if (inspection.finite) ++acceptedInvalid;
+                else if (inspection.invalidChannel != channel || inspection.invalidSample != sample) ++mislocated;
+            }
+    std::fprintf(stderr, "[host-test] sample validator: %d/18 invalid cases accepted, %d mislocated\n",
+                 acceptedInvalid, mislocated);
+    return acceptedInvalid == 0 && mislocated == 0;
+}
+
+bool inspectRenderedBlock(const juce::AudioBuffer<float>& audio, const char* context, int block, float& peak)
+{
+    const auto inspection = inspectAudio(audio);
+    if (! inspection.finite) {
+        std::fprintf(stderr, "[host-test] non-finite sample in %s: block=%d channel=%d sample=%d\n",
+                     context, block, inspection.invalidChannel, inspection.invalidSample);
+        return false;
+    }
+    peak = inspection.peak;
+    return true;
+}
 
 bool setNormalisedParameter(juce::AudioProcessor& processor, const char* name, float value)
 {
@@ -34,6 +102,8 @@ int main(int argc, char** argv)
 int runHostTest(int argc, char** argv)
 {
     if (argc != 2) { std::fprintf(stderr, "usage: SubLab808HostTests <path-to-vst3>\n"); return 1; }
+    stage("validating per-sample audio checker");
+    if (! audioValidatorSelfTest()) return 9;
 
     const juce::String pluginPath(argv[1]);
     std::fprintf(stderr, "[host-test] bundle: %s (exists: %d)\n", pluginPath.toRawUTF8(), (int) juce::File(pluginPath).exists());
@@ -82,7 +152,9 @@ int runHostTest(int argc, char** argv)
     {
         instance->processBlock(audio, midi);
         midi.clear();
-        peak = juce::jmax(peak, audio.getMagnitude(0, audio.getNumSamples()));
+        float blockPeak = 0.0f;
+        if (! inspectRenderedBlock(audio, "initial render", block, blockPeak)) return 5;
+        peak = juce::jmax(peak, blockPeak);
     }
     if (! std::isfinite(peak) || peak <= 0.0001f || peak > 1.001f) { std::fprintf(stderr, "[host-test] bad peak %f\n", (double) peak); return 5; }
 
@@ -110,8 +182,8 @@ int runHostTest(int argc, char** argv)
         audio.clear();
         instance->processBlock(audio, midi);
         midi.clear();
-        const auto blockPeak = audio.getMagnitude(0, audio.getNumSamples());
-        if (! std::isfinite(blockPeak)) return 8;
+        float blockPeak = 0.0f;
+        if (! inspectRenderedBlock(audio, "tail render", block, blockPeak)) return 8;
         if (block == eightSecondBlock) peakAtEightSeconds = blockPeak;
         if (block == tailBlocks - 1) finalTailPeak = blockPeak;
     }
