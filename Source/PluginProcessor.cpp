@@ -2,6 +2,7 @@
 #include "PluginEditor.h"
 #include "FactoryBank.h"
 #include <limits>
+#include <vector>
 
 SubLab808Processor::SubLab808Processor(juce::File presetStorage)
     : AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true)),
@@ -124,22 +125,25 @@ bool SubLab808Processor::applyProgramNow(int index)
     }
 
     struct ParameterUpdate { juce::RangedAudioParameter* parameter; float normalisedValue; };
-    std::array<ParameterUpdate, 13> updates {};
-    size_t updateCount = 0;
+    // Sized from the data-driven bank: a fixed capacity would silently overflow the
+    // moment FactoryPresets.json gains a parameter. Program changes run on the
+    // control/message path (never inside processBlock), so this may allocate.
+    std::vector<ParameterUpdate> updates;
+    const auto& preset = factoryBank()[(size_t) index];
+    updates.reserve(preset.values.size());
 
     internalParameterChangeDepth.fetch_add(1);
-    const auto& preset = factoryBank()[(size_t) index];
     const auto stage = [&] (juce::RangedAudioParameter* parameter, float normalisedValue) {
         if (parameter == nullptr) return;
         parameter->setValue(normalisedValue);
-        updates[updateCount++] = { parameter, parameter->getValue() };
+        updates.push_back({ parameter, parameter->getValue() });
     };
     for (const auto& [id, value] : preset.values)
         if (auto* parameter = parameters.getParameter(id))
             stage(parameter, parameter->convertTo0to1(value));
 
-    for (size_t i = 0; i < updateCount; ++i)
-        updates[i].parameter->sendValueChangedMessageToListeners(updates[i].normalisedValue);
+    for (const auto& update : updates)
+        update.parameter->sendValueChangedMessageToListeners(update.normalisedValue);
 
     currentProgram.store(index);
     // Do not blindly clear this flag: a host automation write may interleave with
