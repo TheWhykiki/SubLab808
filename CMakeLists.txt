@@ -102,3 +102,11 @@ target_compile_definitions(SubLab808PresetTests PRIVATE
 target_link_libraries(SubLab808PresetTests PRIVATE juce::juce_audio_utils juce::juce_dsp
     PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
 add_test(NAME SubLab808Presets COMMAND SubLab808PresetTests)
+
+if(APPLE)
+    # Test-only Cocoa observation proves that native file panels really open and
+    # close. Product code and non-macOS tests do not depend on this bridge.
+    # Keep JUCE's existing CXX toolchain for .mm files so CMAKE_CXX_FLAGS
+    # (including sanitizer instrumentation) still apply to every such source.
+    target_sources(SubLab808PresetTests PRIVATE Tests/NativeFilePanel.mm)
+endif()

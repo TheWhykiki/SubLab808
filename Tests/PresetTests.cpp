@@ -3,6 +3,9 @@
 #include <cstdio>
 #include <set>
 #include <stdexcept>
+#if JUCE_MAC
+#include "NativeFilePanel.h"
+#endif
 
 #if PRESET_TEST_SUBLAB
 using Processor = SubLab808Processor;
@@ -767,6 +770,7 @@ void checkPresetDialogLifecycles(const juce::File& root)
         checkInstanceIsolation(root.getChildFile(juce::String("Isolation-") + actionName(action)), action);
     std::puts("PASS: 29 preset lifecycle regressions (21 owner transitions, 5 queued confirmations, 3 instance-isolation cases).");
 }
+#include "NativeFileChooserLifecycle.inc"
 }
 int main(int argc, char** argv)
 {
@@ -780,10 +784,22 @@ int main(int argc, char** argv)
     artifacts.createDirectory();
     try
     {
+        if (juce::SystemStats::getEnvironmentVariable("WHYKIKI_PRESET_TEST_NATIVE_ONLY", {}) == "1")
+        {
+#if JUCE_MAC
+            checkNativeFileChooserLifecycles(root.getChildFile("NativeChoosers"));
+            return 0;
+#else
+            throw std::runtime_error("Native file-chooser tests require macOS; a non-native fallback is not accepted.");
+#endif
+        }
         checkPresetReentrancy(root.getChildFile("Reentrancy"));
         if (juce::SystemStats::getEnvironmentVariable("WHYKIKI_PRESET_TEST_REENTRANCY_ONLY", {}) == "1") return 0;
         checkPresetDialogLifecycles(root.getChildFile("Lifecycles"));
         if (juce::SystemStats::getEnvironmentVariable("WHYKIKI_PRESET_TEST_LIFECYCLE_ONLY", {}) == "1") return 0;
+#if JUCE_MAC
+        checkNativeFileChooserLifecycles(root.getChildFile("NativeChoosers"));
+#endif
 #if PRESET_TEST_SUBLAB
         checkClickPresetContract(root.getChildFile("ClickContract"));
 #endif

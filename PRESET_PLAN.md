@@ -60,6 +60,7 @@ Audio-Callbacks führen keine Preset-Dateizugriffe aus.
 6. Jedes Preset wird in drei Szenarien gerendert; Samples müssen endlich, hörbar und innerhalb der Test-Pegelgrenze sein.
 7. Die Oberfläche wird in minimaler, normaler und maximaler Größe gerendert und visuell geprüft.
 8. Editor-Lebensdauer, wartende Dialogantworten und Instanz-Isolation werden mit echten JUCE-Fenstern geprüft; synchrones Schließen durch einen Host-Listener wird separat getestet. Unveränderte Live-Werte und korrekt gespeicherte Werte werden jeweils gegen ihre eigene Darstellung geprüft, nicht durch pauschale Float-Toleranzen gleichgesetzt.
+9. Auf macOS werden Import und Export zusätzlich mit echten nativen Dateipanels bei Hide/Detach/Destroy geprüft: Panel geschlossen, Delegate gelöst, JUCE-Modal zerstört, Dateien und Zustand unverändert, erneut geöffneter Editor bedienbar. Ein nichtnativer Fallback ersetzt diesen Nachweis nicht. Host-spezifische Fensterbefehle in Cubase und REAPER bleiben eigene Abnahmeschritte.
 
 Automatische Audio-Tests prüfen technische Plausibilität und unterscheiden identische Ausgaben.
 Sie ersetzen keine musikalische Hörabnahme im Arrangement. Die Bank bleibt nach persönlichem Feedback nachjustierbar.
