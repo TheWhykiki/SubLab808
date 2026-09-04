@@ -7,6 +7,9 @@
 - Add persistent user presets with Save/Save As, rename, delete, validated import/export and conflict-safe atomic writes.
 - Preserve user preset identity, baseline and unsaved edits in DAW state; protect edited sounds during browser navigation.
 - Add persistence, invalid-file, UI and complete-bank audio tests to CI.
+- Advance both Decay and Release smoothers during sounding voices, so automation is ready before the next envelope-phase change.
+- Restart the deterministic Click sequence on prepare and successful state restore, while keeping ordinary notes and factory changes continuous and preserving the running voice.
+- Check every host-rendered sample for NaN/Inf; calibrate the validator with invalid samples and cover overlapping or rejected state restores.
 
 ## Unreleased
 

@@ -42,6 +42,69 @@ void sameValues(Processor& p, const std::map<juce::String, float>& expected)
         require(std::abs(p.parameters.getParameter(id)->getValue() - p.parameters.getParameter(id)->convertTo0to1(plain)) < 0.00003f,
                 "all parameters restored");
 }
+#if PRESET_TEST_SUBLAB
+juce::AudioBuffer<float> renderClickPhrase(Processor& processor)
+{
+    juce::AudioBuffer<float> result(2, 2048), audio(2, 512);
+    juce::MidiBuffer midi;
+    midi.addEvent(juce::MidiMessage::controllerEvent(1, 120, 0), 0);
+    midi.addEvent(juce::MidiMessage::noteOn(1, 36, static_cast<juce::uint8>(110)), 16);
+    for (int block = 0; block < 4; ++block)
+    {
+        processor.processBlock(audio, midi); midi.clear();
+        for (int channel = 0; channel < 2; ++channel)
+            result.copyFrom(channel, block * 512, audio, channel, 0, 512);
+    }
+    return result;
+}
+float sampleDifference(const juce::AudioBuffer<float>& first, const juce::AudioBuffer<float>& second)
+{
+    require(first.getNumChannels() == second.getNumChannels() && first.getNumSamples() == second.getNumSamples(),
+            "Click comparison dimensions match");
+    float difference = 0.0f;
+    for (int channel = 0; channel < first.getNumChannels(); ++channel)
+        for (int sample = 0; sample < first.getNumSamples(); ++sample)
+        {
+            const auto a = first.getSample(channel, sample), b = second.getSample(channel, sample);
+            require(std::isfinite(a) && std::isfinite(b), "finite Click contract audio");
+            difference = std::max(difference, std::abs(a - b));
+        }
+    return difference;
+}
+void checkClickPresetContract(const juce::File& directory)
+{
+    Processor subject(directory), reference(directory.getSiblingFile("ClickReference"));
+    require(subject.parameters.getRawParameterValue("click")->load() > 0.0f, "Click contract uses a non-zero transient");
+    ok(subject.presets.saveAs("Click reset contract", "Tests"));
+    const auto userPreset = subject.presets.current();
+    subject.prepareToPlay(48000.0, 512); reference.prepareToPlay(48000.0, 512);
+    const auto first = renderClickPhrase(reference);
+    require(sampleDifference(first, renderClickPhrase(subject)) == 0.0f, "initial Click phrases match");
+
+    // Exercise the real library load path, not just setCurrentProgram(). Switch away
+    // and back without processing between changes, so the final sound is unchanged
+    // and any difference from the uninterrupted reference reveals an unwanted reset.
+    ok(subject.presets.load(factoryBank()[1]));
+    ok(subject.presets.load(factoryBank()[0]));
+    require(subject.presets.current().factoryIndex == 0, "factory load selects factory identity");
+    const auto continuing = renderClickPhrase(reference);
+    const auto factoryDifference = sampleDifference(continuing, renderClickPhrase(subject));
+    const auto continuationDifference = sampleDifference(first, continuing);
+    require(continuationDifference > 0.00001f, "normal performance advances Click sequence");
+    require(factoryDifference == 0.0f, "factory preset loads preserve the continuing Click sequence");
+
+    ok(subject.presets.load(userPreset));
+    require(subject.presets.current().id == userPreset.id && ! subject.presets.isModified(), "user load selects saved baseline");
+    const auto userDifference = sampleDifference(first, renderClickPhrase(subject));
+    require(userDifference == 0.0f, "user preset load resets Click without prepareToPlay");
+    ok(subject.presets.load(userPreset));
+    const auto repeatUserDifference = sampleDifference(first, renderClickPhrase(subject));
+    require(repeatUserDifference == 0.0f, "reloading the same user preset resets Click again");
+    std::printf("PASS: Click preset contract: continuation max difference %.9g; factory/user/repeated-user %.9g / %.9g / %.9g.\n",
+                static_cast<double>(continuationDifference), static_cast<double>(factoryDifference),
+                static_cast<double>(userDifference), static_cast<double>(repeatUserDifference));
+}
+#endif
 struct Tempo : juce::AudioPlayHead
 {
     double bpm = 120;
@@ -87,6 +150,9 @@ int main(int argc, char** argv)
     artifacts.createDirectory();
     try
     {
+#if PRESET_TEST_SUBLAB
+        checkClickPresetContract(root.getChildFile("ClickContract"));
+#endif
         Processor p(root.getChildFile("Library"));
         require(p.getNumPrograms() == 64, "64 factory presets");
         require(p.presets.userPresets().empty(), "new library empty");
