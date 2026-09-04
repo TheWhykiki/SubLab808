@@ -22,3 +22,12 @@ The separate acceptance-review changes are integrated and released by the coordi
 
 Run `SubLab808PresetTests <absolute-output-directory>` to retain the audio CSV and PNG previews.
 The interactive part requires a desktop display. Tests use a temporary library and do not change real user presets.
+
+## Follow-up: preset file and dialog safety
+
+- Managed exports (including directory symlinks) are rejected without changing stored bytes. Ordinary exports, including UTF-8 file paths, remain supported.
+- Load, Save and Rename reject mismatched file identities; Import can recover the file under a fresh identity.
+- Pending Discard and Save As actions preserve a sound changed by the DAW while the dialog was open. Export uses the same sound guard.
+- Error alerts use an explicit asynchronous callback, avoiding nested modal loops when JUCE permits modal dispatch.
+- Regression UI checks wait for the requested alert across queue turns.
+- The complete local preset suites pass for both products; DSP and host checks remain green. No DSP, parameter or build configuration changed in this follow-up.

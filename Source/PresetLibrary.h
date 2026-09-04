@@ -5,6 +5,7 @@
 #include <cmath>
 #include <limits>
 #include <locale>
+#include <filesystem>
 
 namespace wk
 {
@@ -48,6 +49,15 @@ public:
     const std::vector<Preset>& factoryPresets() const { return factory; }
     juce::File storageDirectory() const { return directory; }
     juce::String extension() const { return "." + product.toLowerCase() + "preset"; }
+
+    // Used by asynchronous UI actions to avoid acting on a different DAW sound
+    // when a dialog completes. Metadata-only changes do not invalidate the sound.
+    Preset currentSound() const { return capture(); }
+    bool isCurrentSound(const Preset& expected) const
+    {
+        const auto actual = capture();
+        return actual.id == expected.id && actual.values == expected.values;
+    }
 
     std::vector<Preset> userPresets() const
     {
@@ -139,7 +149,7 @@ public:
         if (! fileLock.enter(2000)) return busy();
         const juce::ScopeGuard unlock { [this] { fileLock.exit(); } };
         Preset disk;
-        if (auto result = readFile(pathFor(existing.id), disk); result.failed()) return result;
+        if (auto result = readStored(existing.id, disk); result.failed()) return result;
         // A project remembers its own baseline. Do not overwrite edits saved by another
         // instance since this instance loaded the preset.
         if (disk.values != existing.values)
@@ -164,7 +174,7 @@ public:
         }
         if (! validId(requested.id)) return juce::Result::fail("Invalid preset identity.");
         Preset preset;
-        if (auto result = readFile(pathFor(requested.id), preset); result.failed()) return result;
+        if (auto result = readStored(requested.id, preset); result.failed()) return result;
         auto state = snapshot();
         if (! state.isValid()) return juce::Result::fail("Could not capture the current plugin state.");
         for (auto child : state)
@@ -193,7 +203,7 @@ public:
         const juce::ScopeGuard unlock { [this] { fileLock.exit(); } };
         if (nameExists(name.trim(), active.id)) return juce::Result::fail("A user preset with this name already exists.");
         Preset disk;
-        if (auto result = readFile(pathFor(active.id), disk); result.failed()) return result;
+        if (auto result = readStored(active.id, disk); result.failed()) return result;
         disk.name = name.trim();
         if (auto result = writeFile(pathFor(disk.id), disk); result.failed()) return result;
         {
@@ -236,6 +246,13 @@ public:
     }
     juce::Result exportCurrent(const juce::File& file) const
     {
+        // Export must not bypass Save's conflict checks or replace another UUID's
+        // managed file, making that preset disappear from the library.
+        juce::File resolvedFile, resolvedDirectory;
+        if (auto result = resolvePath(file, resolvedFile); result.failed()) return result;
+        if (auto result = resolvePath(directory, resolvedDirectory); result.failed()) return result;
+        if (resolvedFile == resolvedDirectory || resolvedFile.isAChildOf(resolvedDirectory))
+            return juce::Result::fail("Choose an export location outside the preset library. Use Save or Save As to store a library preset.");
         auto preset = capture();
         if (preset.factoryIndex >= 0) preset.id = juce::Uuid().toString();
         preset.factoryIndex = -1;
@@ -258,6 +275,19 @@ public:
     }
 
 private:
+    static juce::Result resolvePath(const juce::File& file, juce::File& resolved)
+    {
+        // Resolve existing ancestors as well as the file itself. Lexical ancestry
+        // alone misses a directory symlink that points into the managed library.
+        std::error_code error;
+        const auto utf8Path = file.getFullPathName().toStdString();
+        const auto path = std::filesystem::weakly_canonical(
+            std::filesystem::path(std::u8string(utf8Path.begin(), utf8Path.end())), error);
+        if (error) return juce::Result::fail("Could not verify the export location. Choose another folder.");
+        const auto utf8 = path.u8string();
+        resolved = juce::File(juce::String::fromUTF8(reinterpret_cast<const char*>(utf8.c_str())));
+        return juce::Result::ok();
+    }
     static juce::Result busy() { return juce::Result::fail("The preset library is busy. Please try again."); }
     static bool validId(const juce::String& id)
     {
@@ -338,6 +368,12 @@ private:
                 preset.values[property.name.toString()] = static_cast<float>(property.value);
             }
         return validateValues(preset);
+    }
+    juce::Result readStored(const juce::String& id, Preset& preset) const
+    {
+        if (auto result = readFile(pathFor(id), preset); result.failed()) return result;
+        return preset.id == id ? juce::Result::ok()
+            : juce::Result::fail("The preset file identity does not match its library entry. Import the file to recover it as a new preset.");
     }
     juce::Result writeFile(const juce::File& file, const Preset& preset) const
     {
