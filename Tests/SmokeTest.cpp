@@ -1249,6 +1249,14 @@ int main()
     {
         SubLab808Processor serialized;
         const auto restoreState = legacyDirtyTrunkStateFixture();
+        SubLab808Processor otherStateSource;
+        otherStateSource.setCurrentProgram(4);
+        juce::MemoryBlock otherRestoreState;
+        otherStateSource.getStateInformation(otherRestoreState);
+        juce::XmlElement foreignStateXml("NOT_SUBLAB808_STATE");
+        foreignStateXml.setAttribute("factoryProgram", 63);
+        juce::MemoryBlock foreignState;
+        juce::AudioProcessor::copyXmlToBinary(foreignStateXml, foreignState);
         std::atomic<bool> start { false };
         std::vector<juce::MemoryBlock> concurrentSnapshots;
         std::thread programs([&] {
@@ -1259,6 +1267,19 @@ int main()
             while (! start.load()) std::this_thread::yield();
             for (int i = 0; i < 100; ++i)
                 serialized.setStateInformation(restoreState.getData(), (int) restoreState.getSize());
+        });
+        // Exercise two simultaneous public state validators while APVTS handles
+        // are replaced. This stress case supports the static no-live-handle-read
+        // invariant; a successful run alone is not a thread-sanitizer proof.
+        std::thread otherRestores([&] {
+            while (! start.load()) std::this_thread::yield();
+            for (int i = 0; i < 100; ++i)
+                serialized.setStateInformation(otherRestoreState.getData(), (int) otherRestoreState.getSize());
+        });
+        std::thread rejectedRestores([&] {
+            while (! start.load()) std::this_thread::yield();
+            for (int i = 0; i < 100; ++i)
+                serialized.setStateInformation(foreignState.getData(), (int) foreignState.getSize());
         });
         std::thread stateReader([&] {
             while (! start.load()) std::this_thread::yield();
@@ -1271,19 +1292,22 @@ int main()
         start.store(true);
         programs.join();
         restores.join();
+        otherRestores.join();
+        rejectedRestores.join();
         stateReader.join();
         const auto finalProgram = serialized.getCurrentProgram();
-        if (! juce::isPositiveAndBelow(finalProgram, serialized.getNumPrograms())
+        if (finalProgram < 1 || finalProgram > 4
             || ! matchesFactoryProgram(serialized, finalProgram)
             || serialized.isPresetModified()) return 34;
         for (const auto& snapshot : concurrentSnapshots) {
             SubLab808Processor restored;
             restored.setStateInformation(snapshot.getData(), (int) snapshot.getSize());
             const auto savedProgram = restored.getCurrentProgram();
-            if (! juce::isPositiveAndBelow(savedProgram, restored.getNumPrograms())
+            if (savedProgram < 0 || savedProgram > 4
                 || ! matchesFactoryProgram(restored, savedProgram)
                 || restored.isPresetModified()) return 41;
         }
+        std::fprintf(stderr, "[state-schema] two restore writers, programs, foreign-root rejection and 128 complete snapshots passed\n");
     }
 
     SubLab808Processor hotProcessor;

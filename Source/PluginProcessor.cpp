@@ -646,7 +646,9 @@ void SubLab808Processor::setStateInformation(const void* data, int size)
 {
     if (auto xml = getXmlFromBinary(data, size)) {
         auto state = juce::ValueTree::fromXml(*xml);
-        if (! state.isValid() || state.getType() != parameters.state.getType()) return;
+        // The schema is fixed. Do not inspect the live APVTS handle before the
+        // control operation is serialized: another restore may be replacing it.
+        if (! state.hasType("PARAMETERS")) return;
 
         ControlOperation operation;
         operation.kind = ControlOperation::Kind::state;
