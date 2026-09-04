@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <set>
 #include <stdexcept>
+#include <thread>
+#include <exception>
 #if JUCE_MAC
 #include "NativeFilePanel.h"
 #endif
@@ -177,6 +179,8 @@ void checkClickPresetContract(const juce::File& directory)
                 static_cast<double>(userDifference), static_cast<double>(repeatUserDifference));
 }
 #endif
+#include "PresetSaveRestoreTests.inc"
+
 struct Tempo : juce::AudioPlayHead
 {
     double bpm = 120;
@@ -789,6 +793,8 @@ void checkReentrantLibraryAction(const juce::File& root, ReentrantAction action)
     std::printf("PASS: reentrancy %s: one mounted editor destroyed, confirmed operation committed, no stale follow-up/modal, replacement interactive.\n",
                 reentrantName(action));
 }
+#include "PresetSaveThenLoadTests.inc"
+
 void checkPresetReentrancy(const juce::File& root)
 {
     require(juce::MessageManager::getInstance()->isThisTheMessageThread(), "reentrancy tests run on message thread");
@@ -799,6 +805,7 @@ void checkPresetReentrancy(const juce::File& root)
                                ReentrantAction::saveThenLoad, ReentrantAction::userLoad })
         checkReentrantLibraryAction(root.getChildFile(reentrantName(action)), action);
     std::puts("PASS: 8 synchronous host-callback editor-destruction regressions.");
+    checkSaveThenLoadOrdering(root.getChildFile("SaveThenLoadOrdering"));
 }
 void checkPresetDialogLifecycles(const juce::File& root)
 {
@@ -833,13 +840,17 @@ int main(int argc, char** argv)
     try
     {
         const auto dirtyOnly = juce::SystemStats::getEnvironmentVariable("WHYKIKI_PRESET_TEST_DIRTY_ONLY", {}) == "1";
-        if (dirtyOnly)
+        const auto saveRestoreOnly = juce::SystemStats::getEnvironmentVariable("WHYKIKI_PRESET_TEST_SAVE_RESTORE_ONLY", {}) == "1";
+        require(! (dirtyOnly && saveRestoreOnly), "DIRTY_ONLY and SAVE_RESTORE_ONLY cannot be combined");
+        if (dirtyOnly || saveRestoreOnly)
             for (const auto* mode : { "WHYKIKI_PRESET_TEST_NATIVE_ONLY", "WHYKIKI_PRESET_TEST_REENTRANCY_ONLY",
                                       "WHYKIKI_PRESET_TEST_LIFECYCLE_ONLY" })
                 require(juce::SystemStats::getEnvironmentVariable(mode, {}) != "1",
-                        "DIRTY_ONLY cannot be combined with another focused test mode");
+                        "DIRTY_ONLY or SAVE_RESTORE_ONLY cannot be combined with another focused test mode");
         checkAuthoritativeDirtyState(root.getChildFile("AuthoritativeDirty"));
         if (dirtyOnly) return 0;
+        checkPresetSaveRestore(root.getChildFile("SaveRestore"));
+        if (saveRestoreOnly) return 0;
         if (juce::SystemStats::getEnvironmentVariable("WHYKIKI_PRESET_TEST_NATIVE_ONLY", {}) == "1")
         {
 #if JUCE_MAC

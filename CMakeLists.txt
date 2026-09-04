@@ -78,6 +78,10 @@ target_link_libraries(SubLab808Tests PRIVATE juce::juce_audio_utils juce::juce_d
 
 enable_testing()
 add_test(NAME SubLab808Smoke COMMAND SubLab808Tests)
+set_tests_properties(SubLab808Smoke PROPERTIES TIMEOUT 300)
+# A dedicated invocation makes the real listener-lock regression fail promptly.
+add_test(NAME SubLab808ListenerLock COMMAND SubLab808Tests --listener-lock-only)
+set_tests_properties(SubLab808ListenerLock PROPERTIES TIMEOUT 20)
 
 juce_add_console_app(SubLab808HostTests PRODUCT_NAME "SubLab808 Host Tests")
 juce_generate_juce_header(SubLab808HostTests)
@@ -89,6 +93,7 @@ target_link_libraries(SubLab808HostTests PRIVATE juce::juce_audio_utils
 add_dependencies(SubLab808HostTests SubLab808_VST3)
 add_test(NAME SubLab808BundleLoad COMMAND SubLab808HostTests
     "${CMAKE_BINARY_DIR}/SubLab808_artefacts/$<CONFIG>/VST3/SubLab808.vst3")
+set_tests_properties(SubLab808BundleLoad PROPERTIES TIMEOUT 300)
 
 # Preset persistence and complete factory-bank audio checks.
 juce_add_console_app(SubLab808PresetTests PRODUCT_NAME "SubLab808 Preset Tests")
@@ -102,6 +107,7 @@ target_compile_definitions(SubLab808PresetTests PRIVATE
 target_link_libraries(SubLab808PresetTests PRIVATE juce::juce_audio_utils juce::juce_dsp
     PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
 add_test(NAME SubLab808Presets COMMAND SubLab808PresetTests)
+set_tests_properties(SubLab808Presets PROPERTIES TIMEOUT 600)
 
 if(APPLE)
     # Test-only Cocoa observation proves that native file panels really open and

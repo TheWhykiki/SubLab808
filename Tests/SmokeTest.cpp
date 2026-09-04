@@ -535,8 +535,10 @@ bool clickRestoreOverlapsRendering()
         return false;
     }
 
-    // Hold replaceState inside its notification. Audio must finish without waiting for
-    // that transaction, using the previous complete parameters and random sequence.
+    // The new state is committed BEFORE this held notification. An unblocked
+    // reference gets the same restore; audio must use that complete new packet and
+    // reset generation without waiting for the notification dispatcher.
+    reference.setStateInformation(state.getData(), (int) state.getSize());
     juce::AudioBuffer<float> duringRestore;
     std::mutex renderMutex;
     std::condition_variable rendered;
@@ -546,24 +548,19 @@ bool clickRestoreOverlapsRendering()
         { const std::lock_guard lock(renderMutex); renderFinished = true; }
         rendered.notify_one();
     });
-    bool finishedBeforeCommit = false;
+    bool finishedBeforeNotificationRelease = false;
     {
         std::unique_lock lock(renderMutex);
-        finishedBeforeCommit = rendered.wait_for(lock, std::chrono::seconds(2), [&] { return renderFinished; });
+        finishedBeforeNotificationRelease = rendered.wait_for(lock, std::chrono::seconds(2), [&] { return renderFinished; });
     }
     blocker.release(); restore.join(); render.join(); output->removeListener(&blocker);
-    const auto beforeCommitDifference = maximumSampleDifference(renderClickPhrase(reference), duringRestore);
-
-    // After commit, settle the changed output gain during silence without advancing
-    // the random sequence. The next phrase must start at the restored seed.
-    juce::AudioBuffer<float> silence(2, 512); juce::MidiBuffer stop;
-    stop.addEvent(juce::MidiMessage::controllerEvent(1, 120, 0), 0);
-    for (int block = 0; block < 4; ++block) { processor.processBlock(silence, stop); stop.clear(); }
-    stateSource.prepareToPlay(48000.0, 512);
-    const auto afterCommitDifference = maximumSampleDifference(renderClickPhrase(stateSource), renderClickPhrase(processor));
-    std::fprintf(stderr, "[acceptance] overlapping restore: render finished before commit=%d, pre/post max differences %.9g / %.9g\n",
-                 (int) finishedBeforeCommit, (double) beforeCommitDifference, (double) afterCommitDifference);
-    return finishedBeforeCommit && beforeCommitDifference == 0.0f && afterCommitDifference == 0.0f;
+    const auto duringNotificationDifference = maximumSampleDifference(renderClickPhrase(reference), duringRestore);
+    // Notification completion must not reset Click a second time or restart the
+    // running voice. Compare the next full phrase with the continuing reference.
+    const auto afterNotificationDifference = maximumSampleDifference(renderClickPhrase(reference), renderClickPhrase(processor));
+    std::fprintf(stderr, "[acceptance] overlapping restore: render finished before notification release=%d, during/after max differences %.9g / %.9g\n",
+                 (int) finishedBeforeNotificationRelease, (double) duringNotificationDifference, (double) afterNotificationDifference);
+    return finishedBeforeNotificationRelease && duringNotificationDifference == 0.0f && afterNotificationDifference == 0.0f;
 }
 
 bool rejectedStatePreservesClickSequence()
@@ -863,9 +860,319 @@ float renderWorstCasePeakAtReportedTail()
 }
 }
 
-int main()
+namespace {
+constexpr const char* stateParameterIds[] { "decay", "release", "punch", "pitchdecay", "glide", "tune",
+    "body", "click", "drive", "tone", "velocity", "output", "oneshot" };
+
+juce::ValueTree capturedState(SubLab808Processor& processor)
+{
+    juce::MemoryBlock data; processor.getStateInformation(data);
+    if (auto xml = juce::AudioProcessor::getXmlFromBinary(data.getData(), (int) data.getSize()))
+        return juce::ValueTree::fromXml(*xml);
+    return {};
+}
+
+juce::MemoryBlock encodedState(const juce::ValueTree& state)
+{
+    juce::MemoryBlock data;
+    if (auto xml = state.createXml()) juce::AudioProcessor::copyXmlToBinary(*xml, data);
+    return data;
+}
+
+bool matchesCommittedState(SubLab808Processor& actual, SubLab808Processor& expected, bool checkRaw)
+{
+    if (actual.getCurrentProgram() != expected.getCurrentProgram()
+        || actual.getEditorSize() != expected.getEditorSize()
+        || actual.isPresetModified() != expected.isPresetModified()) return false;
+    const auto a = actual.presets.current(), b = expected.presets.current();
+    if (a.id != b.id || a.name != b.name || a.category != b.category || a.description != b.description
+        || a.values != b.values || a.factoryIndex != b.factoryIndex) return false;
+    for (const auto* id : stateParameterIds)
+    {
+        const auto* parameter = actual.parameters.getParameter(id);
+        if (!(std::abs(parameter->getValue() - expected.parameters.getParameter(id)->getValue()) <= 0.0f)) return false;
+        if (checkRaw)
+        {
+            const auto cached = actual.parameters.getRawParameterValue(id)->load();
+            const auto legalCached = parameter->convertFrom0to1(parameter->convertTo0to1(cached));
+            if (!(std::abs(legalCached - parameter->convertFrom0to1(parameter->getValue())) <= 0.0f)) return false;
+        }
+    }
+    return capturedState(actual).isEquivalentTo(capturedState(expected));
+}
+
+juce::MemoryBlock userRestoreFixture()
+{
+    SubLab808Processor source;
+    source.setCurrentProgram(2); source.setEditorSize(900, 550);
+    setParameter(source, "output", -7.4f);
+    auto state = capturedState(source);
+    juce::ValueTree selected("WkPresetSelection");
+    selected.setProperty("id", "1234567890abcdef1234567890abcdef", nullptr);
+    selected.setProperty("name", "Nested restore Y", nullptr);
+    selected.setProperty("category", "Tests", nullptr);
+    selected.setProperty("description", "Embedded user baseline, no library-file access", nullptr);
+    for (const auto& parameter : state)
+        if (parameter.hasType("PARAM"))
+        {
+            juce::ValueTree value("VALUE");
+            value.setProperty("id", parameter["id"], nullptr);
+            value.setProperty("value", parameter["value"], nullptr);
+            selected.addChild(value, -1, nullptr);
+        }
+    state.addChild(selected, -1, nullptr);
+    state.setProperty("fixtureExtension", "retained", nullptr);
+    return encodedState(state);
+}
+
+struct CallbackParameterListener final : juce::AudioProcessorParameter::Listener
+{
+    explicit CallbackParameterListener(std::function<void()> callback) : invoke(std::move(callback)) {}
+    void parameterValueChanged(int, float) override { invoke(); }
+    void parameterGestureChanged(int, bool) override {}
+    std::function<void()> invoke;
+};
+
+bool listenerLockRegression()
+{
+    SubLab808Processor processor, expected;
+    const auto stateY = userRestoreFixture();
+    expected.setStateInformation(stateY.getData(), (int) stateY.getSize());
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool bodyEntered = false, workerOwnsOutput = false, clickEntered = false, finished = false;
+    std::atomic<bool> setupOkay { true }, immediateY { false }, restoreReturned { false };
+    std::atomic<int> bodyCallbacks { 0 }, clickCallbacks { 0 }, workerOutputCallbacks { 0 }, ownerOutputCallbacks { 0 };
+    std::atomic<juce::Thread::ThreadID> workerId { nullptr };
+    const auto waitFor = [&] (const bool& ready) {
+        std::unique_lock lock(mutex);
+        const auto okay = condition.wait_for(lock, std::chrono::seconds(2), [&] { return ready; });
+        if (! okay) setupOkay.store(false);
+        return okay;
+    };
+    const auto signal = [&] (bool& ready) {
+        { const std::lock_guard lock(mutex); ready = true; }
+        condition.notify_all();
+    };
+    // This watchdog only terminates this test process if a lock regression prevents
+    // cleanup. No thread is ever joined inside a parameter callback.
+    std::thread watchdog([&] {
+        std::unique_lock lock(mutex);
+        if (! condition.wait_for(lock, std::chrono::seconds(8), [&] { return finished; }))
+        {
+            std::fprintf(stderr, "FAIL: listener-lock regression exceeded 8 seconds\n");
+            std::fflush(stderr);
+            std::_Exit(47);
+        }
+    });
+    CallbackParameterListener body([&] {
+        if (bodyCallbacks.fetch_add(1) != 0) return;
+        signal(bodyEntered);
+        waitFor(workerOwnsOutput); // B has the lock but is not restoring yet.
+    });
+    CallbackParameterListener click([&] {
+        if (clickCallbacks.fetch_add(1) != 0) return;
+        signal(clickEntered); // Body callback has returned; A never waits or joins after this signal.
+    });
+    CallbackParameterListener output([&] {
+        if (juce::Thread::getCurrentThreadId() != workerId.load()) { ownerOutputCallbacks.fetch_add(1); return; }
+        if (workerOutputCallbacks.fetch_add(1) != 0) return;
+        signal(workerOwnsOutput);
+        if (! waitFor(clickEntered)) return;
+        processor.setStateInformation(stateY.getData(), (int) stateY.getSize());
+        restoreReturned.store(true);
+        immediateY.store(matchesCommittedState(processor, expected, false));
+    });
+    processor.parameters.getParameter("body")->addListener(&body);
+    processor.parameters.getParameter("click")->addListener(&click);
+    auto* outputParameter = processor.parameters.getParameter("output");
+    outputParameter->addListener(&output);
+    std::thread worker([&] {
+        workerId.store(juce::Thread::getCurrentThreadId());
+        if (waitFor(bodyEntered)) outputParameter->setValueNotifyingHost(outputParameter->convertTo0to1(-8.7f));
+    });
+    processor.setCurrentProgram(1);
+    worker.join();
+    processor.parameters.getParameter("body")->removeListener(&body);
+    processor.parameters.getParameter("click")->removeListener(&click);
+    outputParameter->removeListener(&output);
+    const auto complete = setupOkay.load() && restoreReturned.load() && immediateY.load()
+        && bodyCallbacks.load() > 0 && clickCallbacks.load() > 0 && workerOutputCallbacks.load() == 1
+        && ownerOutputCallbacks.load() > 0 && matchesCommittedState(processor, expected, true);
+    signal(finished); watchdog.join();
+    std::fprintf(stderr, "[listener-lock] real body/click/output callbacks=%d/%d/%d+%d; immediate13+metadata=%d; final raw/state=%d\n",
+                 bodyCallbacks.load(), clickCallbacks.load(), workerOutputCallbacks.load(), ownerOutputCallbacks.load(),
+                 (int) immediateY.load(), (int) complete);
+    return complete;
+}
+
+struct NestedStateRestore final : juce::AudioProcessorParameter::Listener
+{
+    NestedStateRestore(SubLab808Processor& processor, SubLab808Processor& reference, const juce::MemoryBlock& state)
+        : p(processor), expected(reference), desired(state) {}
+    void parameterValueChanged(int, float) override
+    {
+        if (! armed) return;
+        armed = false;
+        if (queueBeforeRestore) p.setCurrentProgram(3);
+        p.setStateInformation(desired.getData(), (int) desired.getSize());
+        immediate = matchesCommittedState(p, expected, false);
+        if (queueAfterRestore) p.setCurrentProgram(3);
+    }
+    void parameterGestureChanged(int, bool) override {}
+    SubLab808Processor& p;
+    SubLab808Processor& expected;
+    const juce::MemoryBlock& desired;
+    bool armed = true, immediate = false, queueBeforeRestore = false, queueAfterRestore = false;
+};
+
+struct LongFiniteProgramCascade final : juce::AudioProcessorListener
+{
+    LongFiniteProgramCascade(SubLab808Processor& processor, size_t count) : p(processor), target(count) {}
+    void audioProcessorParameterChanged(juce::AudioProcessor*, int, float) override {}
+    void audioProcessorChanged(juce::AudioProcessor*, const ChangeDetails& details) override
+    {
+        if (! details.programChanged) return;
+        programs.push_back(p.getCurrentProgram());
+        if (programs.size() < target) p.setCurrentProgram(p.getCurrentProgram() == 1 ? 2 : 1);
+    }
+    SubLab808Processor& p;
+    size_t target;
+    std::vector<int> programs;
+};
+
+bool twoPhaseStateRegressions()
+{
+    SubLab808Processor x, expected, subject;
+    x.setCurrentProgram(1); x.setEditorSize(1000, 640);
+    const auto stateX = encodedState(capturedState(x)), stateY = userRestoreFixture();
+    expected.setStateInformation(stateY.getData(), (int) stateY.getSize());
+    if (expected.presets.current().id != "1234567890abcdef1234567890abcdef") return false;
+    NestedStateRestore listener(subject, expected, stateY);
+    for (const auto* id : stateParameterIds) subject.parameters.getParameter(id)->addListener(&listener);
+    subject.setStateInformation(stateX.getData(), (int) stateX.getSize());
+    for (const auto* id : stateParameterIds) subject.parameters.getParameter(id)->removeListener(&listener);
+    if (listener.armed || ! listener.immediate || ! matchesCommittedState(subject, expected, true)) return false;
+    std::fprintf(stderr, "[two-phase] nested STATE Y: immediate 13 ranged + complete snapshot/selection/metadata; raw converges after drain\n");
+
+    for (const bool queueBeforeRestore : { true, false })
+    {
+        SubLab808Processor ordered, finalReference;
+        finalReference.setStateInformation(stateY.getData(), (int) stateY.getSize());
+        if (! queueBeforeRestore) finalReference.setCurrentProgram(3);
+        NestedStateRestore orderedListener(ordered, expected, stateY);
+        orderedListener.queueBeforeRestore = queueBeforeRestore;
+        orderedListener.queueAfterRestore = ! queueBeforeRestore;
+        for (const auto* id : stateParameterIds) ordered.parameters.getParameter(id)->addListener(&orderedListener);
+        ordered.setCurrentProgram(1);
+        for (const auto* id : stateParameterIds) ordered.parameters.getParameter(id)->removeListener(&orderedListener);
+        const auto correct = ! orderedListener.armed && orderedListener.immediate
+            && matchesCommittedState(ordered, finalReference, true);
+        std::fprintf(stderr, "[two-phase] callback order %s: expected=%d actual=%d complete=%d\n",
+                     queueBeforeRestore ? "queueP then restoreY" : "restoreY then queueP",
+                     finalReference.getCurrentProgram(), ordered.getCurrentProgram(), (int) correct);
+        if (! correct) return false;
+    }
+
+    for (const size_t count : { size_t { 65 }, size_t { 96 }, size_t { 300 } })
+    {
+        SubLab808Processor processor;
+        LongFiniteProgramCascade host(processor, count);
+        processor.addListener(&host);
+        processor.setCurrentProgram(1);
+        const auto immediateCount = host.programs.size();
+        const auto continuationQueued = processor.hasPendingStateNotificationsForTesting();
+        if (count > 128)
+            for (int tick = 0; tick < 10 && host.programs.size() < count; ++tick)
+                processor.servicePendingStateNotificationsForTesting();
+        processor.removeListener(&host);
+        if (host.programs.size() != count || (count <= 128 && immediateCount != count)
+            || (count > 128 && (immediateCount >= count || ! continuationQueued))) return false;
+        for (size_t i = 0; i < count; ++i)
+            if (host.programs[i] != ((i & 1u) == 0 ? 1 : 2)) return false;
+        if (! matchesFactoryProgram(processor, host.programs.back()) || processor.isPresetModified()) return false;
+        std::fprintf(stderr, "[two-phase] finite FIFO %zu: immediate=%zu, final=%zu, continuation=%d\n",
+                     count, immediateCount, host.programs.size(), (int) continuationQueued);
+    }
+    {
+        SubLab808Processor popped;
+        ReentrantProgramSelection queueProgram(popped, 3);
+        popped.parameters.getParameter("decay")->addListener(&queueProgram);
+        bool hookCalled = false, immediate = false;
+        popped.beforeQueuedProgramCommitForTesting = [&] {
+            popped.beforeQueuedProgramCommitForTesting = {};
+            hookCalled = true;
+            // The older request has left the queue, but has not acquired the
+            // commit gate yet. A truly independent restore must invalidate it too.
+            std::thread restore([&] {
+                popped.setStateInformation(stateY.getData(), (int) stateY.getSize());
+                immediate = matchesCommittedState(popped, expected, false);
+            });
+            restore.join(); // This test hook is outside every parameter/host callback and the commit gate.
+        };
+        popped.setCurrentProgram(1);
+        popped.parameters.getParameter("decay")->removeListener(&queueProgram);
+        const auto correct = hookCalled && immediate && matchesCommittedState(popped, expected, true);
+        std::fprintf(stderr, "[two-phase] dequeued old P then independent restore Y: complete=%d\n", (int) correct);
+        if (! correct) return false;
+    }
+    for (const bool missingChild : { true, false })
+    {
+        SubLab808Processor legacy;
+        setParameter(legacy, "decay", 3.2f);
+        const auto frozen = legacyDirtyTrunkStateFixture();
+        auto xml = juce::AudioProcessor::getXmlFromBinary(frozen.getData(), (int) frozen.getSize());
+        if (xml == nullptr) return false;
+        auto tree = juce::ValueTree::fromXml(*xml);
+        auto decay = tree.getChildWithProperty("id", "decay");
+        if (! decay.isValid()) return false;
+        if (missingChild) tree.removeChild(decay, nullptr);
+        else decay.removeProperty("value", nullptr);
+        const auto state = encodedState(tree);
+        legacy.setStateInformation(state.getData(), (int) state.getSize());
+        const auto* parameter = legacy.parameters.getParameter("decay");
+        const auto expectedDefault = parameter->convertFrom0to1(parameter->getDefaultValue());
+        if (!(std::abs(parameter->convertFrom0to1(parameter->getValue()) - expectedDefault) <= 0.0f)) return false;
+        std::fprintf(stderr, "[state-schema] %s uses DEFAULT, not previous value 3.2\n", missingChild ? "missing PARAM" : "PARAM without value");
+    }
+    {
+        SubLab808Processor legacy;
+        const auto frozen = legacyDirtyTrunkStateFixture();
+        auto xml = juce::AudioProcessor::getXmlFromBinary(frozen.getData(), (int) frozen.getSize());
+        if (xml == nullptr) return false;
+        auto tree = juce::ValueTree::fromXml(*xml);
+        tree.setProperty("futureRootProperty", "keep", nullptr);
+        juce::ValueTree extension("FUTURE"); extension.setProperty("payload", "unchanged", nullptr);
+        tree.addChild(extension, -1, nullptr);
+        const auto firstDecay = tree.getChildWithProperty("id", "decay").createCopy();
+        auto lastDecay = firstDecay.createCopy(); lastDecay.setProperty("value", 2.4f, nullptr);
+        tree.addChild(lastDecay, -1, nullptr);
+        const auto state = encodedState(tree);
+        legacy.setStateInformation(state.getData(), (int) state.getSize());
+        const auto* parameter = legacy.parameters.getParameter("decay");
+        const auto legalExpected = parameter->convertFrom0to1(parameter->convertTo0to1(2.4f));
+        const auto saved = capturedState(legacy);
+        if (!(std::abs(parameter->convertFrom0to1(parameter->getValue()) - legalExpected) <= 0.0f)
+            || saved["futureRootProperty"].toString() != "keep"
+            || ! saved.getChildWithName("FUTURE").isEquivalentTo(extension)
+            || ! saved.getChildWithProperty("id", "decay").isEquivalentTo(firstDecay)) return false;
+        int duplicateCount = 0;
+        for (const auto& child : saved) if (child["id"].toString() == "decay") ++duplicateCount;
+        if (duplicateCount != 2) return false;
+        std::fprintf(stderr, "[state-schema] last duplicate known ID wins; earlier child and unknown extensions retained\n");
+    }
+    return true;
+}
+}
+
+int main(int argc, char** argv)
 {
     juce::ScopedJuceInitialiser_GUI initialiseJuce;
+    if (argc > 1)
+        return argc == 2 && juce::String(argv[1]) == "--listener-lock-only" ? (listenerLockRegression() ? 0 : 47) : 64;
+    if (! listenerLockRegression()) return 47;
+    if (! twoPhaseStateRegressions()) return 46;
+    if (juce::SystemStats::getEnvironmentVariable("WHYKIKI_SMOKE_TEST_STATE_ONLY", {}) == "1") return 0;
     if (! acceptanceRegressions()) return 45;
     SubLab808Processor processor; processor.prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 4096); juce::MidiBuffer midi;
@@ -958,8 +1265,8 @@ int main()
         if (! host.stateReadSucceeded.load()) return 35;
     }
 
-    // An independent cross-thread setter that overlaps a parameter callback must
-    // wait and then apply synchronously; callback timing may never drop the request.
+    // An independent setter commits synchronously even while an older parameter
+    // callback is held. Only its cache notifications wait for that dispatcher.
     {
         SubLab808Processor serialized;
         auto* decay = serialized.parameters.getParameter("decay");
@@ -972,13 +1279,16 @@ int main()
         serialized.getStateInformation(snapshotDuringCallback);
 
         std::atomic<bool> secondStarted { false }, secondReturned { false };
+        juce::MemoryBlock secondCommittedState;
         std::thread secondWriter([&] {
             secondStarted.store(true);
             serialized.setCurrentProgram(2);
+            serialized.getStateInformation(secondCommittedState);
             secondReturned.store(true);
         });
         while (! secondStarted.load()) std::this_thread::yield();
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (! secondReturned.load() && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
         const auto returnedBeforeRelease = secondReturned.load();
         blocker.release();
         firstWriter.join();
@@ -987,15 +1297,19 @@ int main()
         SubLab808Processor restoredSnapshot;
         restoredSnapshot.setStateInformation(snapshotDuringCallback.getData(),
                                               (int) snapshotDuringCallback.getSize());
-        if (returnedBeforeRelease || ! secondReturned.load()
+        SubLab808Processor restoredSecond;
+        restoredSecond.setStateInformation(secondCommittedState.getData(), (int) secondCommittedState.getSize());
+        if (! returnedBeforeRelease || ! secondReturned.load()
             || serialized.getCurrentProgram() != 2
             || ! matchesFactoryProgram(serialized, 2)
-            || restoredSnapshot.getCurrentProgram() != 0
-            || ! matchesFactoryProgram(restoredSnapshot, 0)) return 37;
+            || restoredSnapshot.getCurrentProgram() != 1
+            || ! matchesFactoryProgram(restoredSnapshot, 1)
+            || restoredSecond.getCurrentProgram() != 2
+            || ! matchesFactoryProgram(restoredSecond, 2)) return 37;
     }
 
     // State capture from every in-flight preset parameter notification must return
-    // the previous complete snapshot, never a partially published new preset.
+    // the complete newly committed snapshot, never a partially published preset.
     {
         SubLab808Processor snapshotSource;
         snapshotSource.setCurrentProgram(0);
@@ -1013,8 +1327,8 @@ int main()
         for (const auto& snapshot : capture.snapshots) {
             SubLab808Processor restored;
             restored.setStateInformation(snapshot.getData(), (int) snapshot.getSize());
-            if (restored.getCurrentProgram() != 0 || restored.isPresetModified()
-                || ! matchesFactoryProgram(restored, 0)) return 38;
+            if (restored.getCurrentProgram() != 1 || restored.isPresetModified()
+                || ! matchesFactoryProgram(restored, 1)) return 38;
         }
         juce::MemoryBlock committed;
         snapshotSource.getStateInformation(committed);
@@ -1216,7 +1530,7 @@ int main()
         processor.setStateInformation(frozenLegacyFactoryState.getData(), (int) frozenLegacyFactoryState.getSize());
         restoreDecay->removeListener(&restoreCallback);
         if (processor.getCurrentProgram() != 3 || processor.isPresetModified()
-            || restoreCallback.armed || restoreCallback.observedProgramAfterCall != 0
+            || restoreCallback.armed || restoreCallback.observedProgramAfterCall != 3
             || std::abs(processor.parameters.getRawParameterValue("drive")->load() - 16.0f) > 0.01f) return 21;
 
         processor.setCurrentProgram(3); setParameter(processor, "drive", 12.0f);

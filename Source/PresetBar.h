@@ -338,9 +338,10 @@ private:
             if (! rename && ! safe->checkSound(current)) return;
             const auto name = dialogLifetime->getTextEditorContents("name");
             const auto category = rename ? juce::String() : dialogLifetime->getTextEditorContents("category");
-            if (applyAndReport(safe, generation, [rename, name, category, id = current.id](PresetLibrary& library) {
-                    return rename ? library.renameCurrent(name, id) : library.saveAs(name, category);
-                }) && afterSave) afterSave();
+            bool savedSelectionStillCurrent = false;
+            if (applyAndReport(safe, generation, [rename, name, category, id = current.id, &savedSelectionStillCurrent](PresetLibrary& library) {
+                    return rename ? library.renameCurrent(name, id) : library.saveAs(name, category, &savedSelectionStillCurrent);
+                }) && afterSave && savedSelectionStillCurrent) afterSave();
         }), true);
         if (safe == nullptr || ! safe->acceptsCallback(generation)) cancelModal(dialogLifetime.getComponent());
     }

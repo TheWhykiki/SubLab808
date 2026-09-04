@@ -6,6 +6,7 @@
 #include <limits>
 #include <locale>
 #include <filesystem>
+#include <cstdint>
 
 namespace wk
 {
@@ -20,7 +21,18 @@ struct Preset
 // callback never touch the filesystem. Each product owns its directory and file type.
 class PresetLibrary
 {
+    struct CapturedPreset
+    {
+        Preset baseline, sound;
+        std::uint64_t revision = 0;
+    };
 public:
+#if defined(PRESET_TEST_SUBLAB)
+    // Defined for every translation unit in the preset-test target only. The
+    // product target has neither this scheduling hook nor its storage/calls.
+    enum class TestStep { selectionCaptured, stateCaptured, fileCommitted };
+    std::function<void(TestStep)> testStep;
+#endif
     PresetLibrary(juce::AudioProcessor& owner, juce::AudioProcessorValueTreeState& state,
                   juce::String productName, const std::vector<Preset>& factoryBank,
                   juce::File storage = {})
@@ -52,11 +64,15 @@ public:
 
     // Used by asynchronous UI actions to avoid acting on a different DAW sound
     // when a dialog completes. Metadata-only changes do not invalidate the sound.
-    Preset currentSound() const { return capture(); }
+    Preset currentSound() const
+    {
+        CapturedPreset captured;
+        return capture(captured) ? captured.sound : Preset {};
+    }
     bool isCurrentSound(const Preset& expected) const
     {
-        const auto actual = capture();
-        return actual.id == expected.id && actual.values == expected.values;
+        const auto actual = currentSound();
+        return expected.id.isNotEmpty() && actual.id == expected.id && actual.values == expected.values;
     }
 
     std::vector<Preset> userPresets() const
@@ -105,7 +121,12 @@ public:
     }
 
     // Called inside the processor's existing program/state transaction.
-    void clearSelection() { const juce::ScopedLock lock(selectionLock); selected = {}; }
+    void clearSelection()
+    {
+        const juce::ScopedLock lock(selectionLock);
+        selected = {};
+        ++selectionRevision;
+    }
     void appendSelection(juce::ValueTree& state) const
     {
         state.removeChild(state.getChildWithName("WkPresetSelection"), nullptr);
@@ -126,40 +147,51 @@ public:
         }
         const juce::ScopedLock lock(selectionLock);
         selected = std::move(candidate);
+        // A same-ID restore is still a newer state, including X -> Y -> X ABA.
+        ++selectionRevision;
     }
 
-    juce::Result saveAs(const juce::String& name, const juce::String& category)
+    juce::Result saveAs(const juce::String& name, const juce::String& category,
+                        bool* savedSelectionStillCurrent = nullptr)
     {
+        if (savedSelectionStillCurrent != nullptr) *savedSelectionStillCurrent = false;
         if (auto result = validateName(name); result.failed()) return result;
         if (! fileLock.enter(2000)) return busy();
         const juce::ScopeGuard unlock { [this] { fileLock.exit(); } };
         if (nameExists(name.trim())) return juce::Result::fail("A user preset with this name already exists. Choose another name.");
-        auto preset = capture();
+        CapturedPreset captured;
+        if (! capture(captured)) return captureBusy();
+        auto preset = captured.sound;
         preset.id = juce::Uuid().toString(); preset.name = name.trim();
         preset.category = category.trim().substring(0, 48); preset.factoryIndex = -1;
         if (preset.category.isEmpty()) preset.category = "User";
         if (auto result = writeFile(pathFor(preset.id), preset); result.failed()) return result;
-        select(preset);
+        const auto stillCurrent = selectIfRevision(preset, captured.revision);
+        if (savedSelectionStillCurrent != nullptr) *savedSelectionStillCurrent = stillCurrent;
         return juce::Result::ok();
     }
 
-    juce::Result save()
+    juce::Result save(bool* savedSelectionStillCurrent = nullptr)
     {
-        const auto existing = current();
-        if (existing.factoryIndex >= 0) return juce::Result::fail("Use Save As to create your own copy of a factory preset.");
+        if (savedSelectionStillCurrent != nullptr) *savedSelectionStillCurrent = false;
         if (! fileLock.enter(2000)) return busy();
         const juce::ScopeGuard unlock { [this] { fileLock.exit(); } };
+        CapturedPreset captured;
+        if (! capture(captured)) return captureBusy();
+        const auto& existing = captured.baseline;
+        if (existing.factoryIndex >= 0) return juce::Result::fail("Use Save As to create your own copy of a factory preset.");
         Preset disk;
         if (auto result = readStored(existing.id, disk); result.failed()) return result;
         // A project remembers its own baseline. Do not overwrite edits saved by another
         // instance since this instance loaded the preset.
         if (disk.values != existing.values)
             return juce::Result::fail("This preset was changed in another instance. Use Save As or reload it first.");
-        auto preset = capture();
+        auto preset = captured.sound;
         preset.id = disk.id; preset.name = disk.name; preset.category = disk.category;
         preset.description = disk.description; preset.factoryIndex = -1;
         if (auto result = writeFile(pathFor(preset.id), preset); result.failed()) return result;
-        select(preset);
+        const auto stillCurrent = selectIfRevision(preset, captured.revision);
+        if (savedSelectionStillCurrent != nullptr) *savedSelectionStillCurrent = stillCurrent;
         return juce::Result::ok();
     }
 
@@ -196,7 +228,9 @@ public:
     juce::Result renameCurrent(const juce::String& name, const juce::String& expectedId = {})
     {
         if (auto result = validateName(name); result.failed()) return result;
-        const auto active = current();
+        CapturedPreset captured;
+        if (! capture(captured)) return captureBusy();
+        const auto& active = captured.baseline;
         if (expectedId.isNotEmpty() && active.id != expectedId)
             return juce::Result::fail("The selected preset changed while the dialog was open. Rename was cancelled.");
         if (active.factoryIndex >= 0) return juce::Result::fail("Factory presets cannot be renamed.");
@@ -211,7 +245,11 @@ public:
             const juce::ScopedLock lock(selectionLock);
             // A host state change during disk I/O must not relabel a different sound.
             // Only the name changes; retain the current in-memory dirty baseline.
-            if (selected.id == active.id) selected.name = disk.name;
+            if (selectionRevision == captured.revision)
+            {
+                selected.name = disk.name;
+                ++selectionRevision;
+            }
         }
         changed();
         return juce::Result::ok();
@@ -254,7 +292,9 @@ public:
         if (auto result = resolvePath(directory, resolvedDirectory); result.failed()) return result;
         if (resolvedFile == resolvedDirectory || resolvedFile.isAChildOf(resolvedDirectory))
             return juce::Result::fail("Choose an export location outside the preset library. Use Save or Save As to store a library preset.");
-        auto preset = capture();
+        CapturedPreset captured;
+        if (! capture(captured)) return captureBusy();
+        auto preset = captured.sound;
         if (preset.factoryIndex >= 0) preset.id = juce::Uuid().toString();
         preset.factoryIndex = -1;
         return writeFile(file, preset);
@@ -290,6 +330,10 @@ private:
         return juce::Result::ok();
     }
     static juce::Result busy() { return juce::Result::fail("The preset library is busy. Please try again."); }
+    static juce::Result captureBusy()
+    {
+        return juce::Result::fail("The plugin state is changing. Please try saving again.");
+    }
     static bool validId(const juce::String& id)
     {
         return id.length() == 32 && id.containsOnly("0123456789abcdefABCDEF");
@@ -321,15 +365,51 @@ private:
             return juce::ValueTree::fromXml(*xml);
         return {};
     }
-    Preset capture() const
+    bool capture(CapturedPreset& result) const
     {
-        auto preset = current(); preset.values.clear();
-        for (const auto& child : snapshot())
+        // Processor commits set currentProgram before clear/restoreSelection,
+        // and their snapshots append selection under the same control gate.
+        // Never hold selectionLock across getStateInformation: that would invert
+        // the processor control gate -> selectionLock order.
+        for (unsigned attempt = 0; attempt < 8; ++attempt)
         {
-            const auto id = child["id"].toString();
-            if (parameters.getParameter(id) != nullptr) preset.values[id] = static_cast<float>(child["value"]);
+            CapturedPreset candidate;
+            {
+                const juce::ScopedLock lock(selectionLock);
+                candidate.revision = selectionRevision;
+                candidate.baseline = selected;
+                if (candidate.baseline.id.isEmpty())
+                {
+                    // Both owners implement this getter as an atomic load, with
+                    // no processor lock or callbacks while selectionLock is held.
+                    const auto index = juce::jlimit(0, static_cast<int>(factory.size()) - 1, processor.getCurrentProgram());
+                    candidate.baseline = factory[static_cast<size_t>(index)];
+                }
+            }
+#if defined(PRESET_TEST_SUBLAB)
+            if (testStep) testStep(TestStep::selectionCaptured);
+#endif
+            const auto state = snapshot();
+            if (! state.isValid()) return false;
+#if defined(PRESET_TEST_SUBLAB)
+            if (testStep) testStep(TestStep::stateCaptured);
+#endif
+            {
+                const juce::ScopedLock lock(selectionLock);
+                if (selectionRevision != candidate.revision) continue;
+            }
+            candidate.sound = candidate.baseline;
+            candidate.sound.values.clear();
+            for (const auto& child : state)
+            {
+                const auto id = child["id"].toString();
+                if (parameters.getParameter(id) != nullptr) candidate.sound.values[id] = static_cast<float>(child["value"]);
+            }
+            if (validateValues(candidate.sound).failed()) return false;
+            result = std::move(candidate);
+            return true;
         }
-        return preset;
+        return false;
     }
     juce::Result validateValues(const Preset& preset) const
     {
@@ -397,8 +477,12 @@ private:
             stream.flush();
             if (stream.getStatus().failed()) return stream.getStatus();
         }
-        return temporary.overwriteTargetFileWithTemporary() ? juce::Result::ok()
-            : juce::Result::fail("Could not replace the preset file; the previous file was preserved.");
+        if (! temporary.overwriteTargetFileWithTemporary())
+            return juce::Result::fail("Could not replace the preset file; the previous file was preserved.");
+#if defined(PRESET_TEST_SUBLAB)
+        if (testStep) testStep(TestStep::fileCommitted);
+#endif
+        return juce::Result::ok();
     }
     static juce::ValueTree selectionTree(const Preset& preset)
     {
@@ -412,10 +496,24 @@ private:
         }
         return tree;
     }
-    void select(const Preset& preset)
+    bool selectIfRevision(const Preset& preset, std::uint64_t expectedRevision)
     {
-        { const juce::ScopedLock lock(selectionLock); selected = preset; }
+        std::uint64_t committedRevision = 0;
+        bool applied = false;
+        {
+            const juce::ScopedLock lock(selectionLock);
+            if (selectionRevision == expectedRevision)
+            {
+                selected = preset;
+                committedRevision = ++selectionRevision;
+                applied = true;
+            }
+        }
+        // Disk success remains success even when a newer host restore wins.
+        // Host callbacks may themselves replace selection or destroy the editor.
         changed();
+        const juce::ScopedLock lock(selectionLock);
+        return applied && selectionRevision == committedRevision;
     }
     void changed() { processor.updateHostDisplay(juce::AudioProcessorListener::ChangeDetails().withNonParameterStateChanged(true)); }
 
@@ -427,5 +525,6 @@ private:
     juce::InterProcessLock fileLock;
     mutable juce::CriticalSection selectionLock;
     Preset selected;
+    std::uint64_t selectionRevision = 0;
 };
 } // namespace wk

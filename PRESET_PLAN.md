@@ -37,6 +37,7 @@ Der Dateiname basiert auf der ID, nicht auf Benutzereingaben. Favoriten liegen s
 
 Dateien werden über eine temporäre Datei ersetzt. Gleichzeitige Schreibvorgänge werden gesperrt;
 ein veraltetes Preset in einer zweiten Instanz darf neu gespeicherte Klangänderungen nicht unbemerkt überschreiben.
+Klang und Preset-Metadaten werden aus derselben Auswahlgeneration erfasst. Wird während Save/Save As ein neuer DAW-Zustand geladen, bleibt die erfolgreich gespeicherte Datei erhalten, aber der neuere Klang behält seine eigene Preset-ID, seinen Namen und seine Vergleichsbasis. Auch ein Restore derselben ID oder ein Wechsel X→Y→X wird erkannt. Ein dadurch veralteter Save-As-then-Load-Folgeschritt entfällt; normales Speichern mit anschließendem Laden funktioniert weiter. Dauerhafte Zustandswechsel beim Erfassen ergeben nach begrenzten Versuchen eine verständliche Fehlermeldung vor jedem Dateischreiben.
 Import validiert Produkt, Version, Namen, Vollständigkeit, Zahlentyp und Parametergrenzen, bevor etwas gespeichert wird.
 Import legt eine neue ID an und löst Namenskonflikte mit einem Suffix.
 Laden, Speichern und Umbenennen prüfen zusätzlich, ob die Datei-ID zum Bibliothekseintrag passt.
