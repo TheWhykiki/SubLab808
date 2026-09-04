@@ -22,8 +22,7 @@ if (SUBLAB808_JUCE_PATH AND EXISTS "${SUBLAB808_JUCE_PATH}/CMakeLists.txt")
 else()
     FetchContent_Declare(JUCE
         GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
-        GIT_TAG ${SUBLAB808_JUCE_COMMIT}
-        GIT_SHALLOW TRUE)
+        GIT_TAG ${SUBLAB808_JUCE_COMMIT})
     FetchContent_MakeAvailable(JUCE)
 endif()
 
@@ -95,6 +94,9 @@ target_compile_definitions(SubLab808 PUBLIC JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 J
 target_link_libraries(SubLab808 PRIVATE juce::juce_audio_utils juce::juce_dsp
     PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_lto_flags juce::juce_recommended_warning_flags)
 
+include(cmake/Updater.cmake)
+wk_add_updater(SubLab808)
+
 if(APPLE)
     # JUCE generates moduleinfo.json after its initial ad-hoc signing step. Sign the completed
     # bundle last so the downloadable artifact has a valid resource seal.
@@ -165,3 +167,7 @@ if(APPLE)
     # (including sanitizer instrumentation) still apply to every such source.
     target_sources(SubLab808PresetTests PRIVATE Tests/NativeFilePanel.mm)
 endif()
+
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME SubLab808ReleasePipeline COMMAND "${Python3_EXECUTABLE}" -B -m unittest discover
+    -s "${CMAKE_CURRENT_SOURCE_DIR}/scripts/tests" -p "test_release_pipeline.py")

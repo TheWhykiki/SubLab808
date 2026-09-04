@@ -31,6 +31,7 @@ private:
     Dial decay, release, punch, pitchDecay, glide, tune, body, click, drive, tone, velocity, output;
     std::array<Dial*, 12> dials;
     wk::PresetBar presetBar;
+    juce::TextButton updates;
     juce::ToggleButton oneShotButton { "ONE SHOT" };
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> oneShotAttachment;
     float meter = 0.0f;

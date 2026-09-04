@@ -6,3 +6,5 @@
 *.xcworkspace/xcuserdata/
 *.log
 /SubLab808-preview.png
+
+/dist/

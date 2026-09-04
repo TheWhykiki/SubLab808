@@ -1,4 +1,5 @@
 #include "PluginEditor.h"
+#include "UpdaterLauncher.h"
 
 SubLabLookAndFeel::SubLabLookAndFeel()
 {
@@ -55,6 +56,8 @@ SubLab808Editor::SubLab808Editor(SubLab808Processor& p)
     addDial(velocity, "velocity", "VELOCITY", " %");
     addDial(output, "output", "OUTPUT", " dB");
     addAndMakeVisible(presetBar);
+    wk::configureUpdaterButton(updates, "SubLab808", SUBLAB808_VERSION_STRING);
+    addAndMakeVisible(updates);
     oneShotButton.setColour(juce::ToggleButton::textColourId, juce::Colour(0xffaab4bd));
     oneShotButton.setColour(juce::ToggleButton::tickColourId, juce::Colour(0xffff4f2e));
     oneShotButton.setTitle("One Shot playback mode");
@@ -118,6 +121,7 @@ void SubLab808Editor::paint(juce::Graphics& g)
 void SubLab808Editor::resized()
 {
     presetBar.setBounds(30, 88, getWidth() - 60, 36);
+    updates.setBounds(getWidth() - 120, getHeight() - 26, 90, 20);
     oneShotButton.setBounds(getWidth() - 265, 31, 115, 28);
     auto area = getLocalBounds().reduced(36).withTrimmedTop(113).withTrimmedBottom(12);
     auto rowHeight = area.getHeight() / 2;

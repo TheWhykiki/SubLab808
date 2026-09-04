@@ -76,3 +76,9 @@ und unter Windows in `%APPDATA%\Whykiki Audio\SubLab808\Presets`; sie verwenden
 Klang einschließlich ungespeicherter Änderungen und des eigenen Preset-Namens.
 
 Siehe [Preset-Katalog](Presets/CATALOG.md) und [Umsetzungs- und Abnahmeplan](PRESET_PLAN.md).
+
+## Native Updates
+
+Die Schaltfläche **Updates...** prüft neue Versionen, lädt das passende Paket und
+führt durch die Installation mit dem macOS-Installer. Details, Release-Anforderungen
+und Testgrenzen stehen in [UPDATER.md](UPDATER.md).
