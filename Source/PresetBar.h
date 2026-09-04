@@ -197,9 +197,9 @@ private:
         dialog->addButton(rename ? "Rename" : "Save", 1, juce::KeyPress(juce::KeyPress::returnKey));
         dialog->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
         const juce::Component::SafePointer<PresetBar> safe(this);
-        dialog->enterModalState(true, juce::ModalCallbackFunction::create([safe, dialog, rename, afterSave](int result) {
+        dialog->enterModalState(true, juce::ModalCallbackFunction::create([safe, dialog, rename, afterSave, originalId = current.id](int result) {
             if (safe == nullptr || result != 1) return;
-            const auto status = rename ? safe->presets.renameCurrent(dialog->getTextEditorContents("name"))
+            const auto status = rename ? safe->presets.renameCurrent(dialog->getTextEditorContents("name"), originalId)
                 : safe->presets.saveAs(dialog->getTextEditorContents("name"), dialog->getTextEditorContents("category"));
             safe->report(status);
             if (status.wasOk() && afterSave) afterSave();
