@@ -7,6 +7,16 @@ struct UpdateFailure: LocalizedError {
     var errorDescription: String? { message }
 }
 
+struct DownloadIntegrityFailure: LocalizedError {
+    let underlying: Error
+    var errorDescription: String? { underlying.localizedDescription }
+}
+
+struct InstalledPayloadFailure: LocalizedError {
+    let underlying: Error
+    var errorDescription: String? { underlying.localizedDescription }
+}
+
 func require(_ condition: Bool, _ message: String) throws {
     if !condition { throw UpdateFailure(message) }
 }

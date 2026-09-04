@@ -95,9 +95,17 @@ struct UserCopy {
 
     func archive(to directory: URL) throws -> URL {
         try rejectSymlinkAncestors(directory)
+        let destination = directory.appendingPathComponent(url.lastPathComponent)
+        // Recover a rename that succeeded immediately before the updater was interrupted.
+        // Never merge with or replace a newly created user installation.
+        if FileManager.default.fileExists(atPath: destination.path) {
+            try rejectSymlinkAncestors(url)
+            try require(!FileManager.default.fileExists(atPath: url.path), "Nach der Sicherung wurde eine neue Benutzerinstallation angelegt. Sie bleibt erhalten.")
+            try require(try bundleFingerprint(destination) == fingerprint, "Die vorhandene Sicherung stimmt nicht mit der bisherigen Installation überein")
+            return destination
+        }
         try require(try bundleFingerprint(url) == fingerprint, "Die bisherige Benutzerinstallation wurde zwischenzeitlich geändert. Sie bleibt erhalten.")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        let destination = directory.appendingPathComponent(url.lastPathComponent)
         try require(!FileManager.default.fileExists(atPath: destination.path), "Der Sicherungsordner ist bereits belegt")
         try require(rename(url.path, destination.path) == 0, "Die bisherige Benutzerinstallation konnte nicht gesichert werden")
         do {
@@ -124,6 +132,7 @@ enum PackageService {
         try verifiedTool("/usr/sbin/spctl", ["--assess", "--type", "install", "--verbose=2", package.path],
                          message: "macOS hat dieses Installationspaket nicht freigegeben. Es wird nicht automatisch installiert.")
         let expanded = workspace.appendingPathComponent("expanded-" + UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: expanded) }
         try verifiedTool("/usr/sbin/pkgutil", ["--expand-full", package.path, expanded.path], message: "Paket konnte nicht geprüft werden")
         try PackageMetadata.validate(Data(contentsOf: expanded.appendingPathComponent("PackageInfo")), product: product, version: candidate.version)
         try require(!FileManager.default.fileExists(atPath: expanded.appendingPathComponent("Scripts").path), "Installationsskripte sind in Plugin-Updates nicht erlaubt")

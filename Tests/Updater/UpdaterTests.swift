@@ -136,6 +136,18 @@ import CryptoKit
             try require(!FileManager.default.fileExists(atPath: bundle.path), "Old bundle still shadows system install")
             try require(try bundleFingerprint(backup) == copy.fingerprint, "Backup changed")
         }
+        try test("interruption after archive rename resumes without a second move") {
+            let backup = try copy.archive(to: temporary.appendingPathComponent("backup"))
+            try require(try bundleFingerprint(backup) == copy.fingerprint, "Recovery changed archived bytes")
+        }
+        try test("new user copy after archive is preserved on resume") {
+            try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: false)
+            let changed = bundle.appendingPathComponent("new-installation")
+            try Data("keep this".utf8).write(to: changed)
+            try rejected { _ = try copy.archive(to: temporary.appendingPathComponent("backup")) }
+            try require(FileManager.default.fileExists(atPath: changed.path), "New installation was removed")
+            try FileManager.default.removeItem(at: bundle)
+        }
         try test("symlink target rejected") {
             let link = temporary.appendingPathComponent("redirect")
             try FileManager.default.createSymbolicLink(at: link, withDestinationURL: temporary.appendingPathComponent("backup"))

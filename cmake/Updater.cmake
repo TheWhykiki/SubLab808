@@ -17,6 +17,7 @@ function(wk_add_updater product)
             --product "${product}" --version "${PROJECT_VERSION}" --output "${updater_app}" ${updater_arch_args}
         DEPENDS scripts/build-updater.py Updater/main.swift Updater/UpdateCore.swift
                 Updater/HTTPClient.swift Updater/PackageService.swift
+                Updater/UpdaterApp.swift Updater/InstallationRecord.swift
         VERBATIM)
     add_custom_target(${product}Updater DEPENDS "${updater_app}/Contents/MacOS/${product}Updater")
     add_test(NAME ${product}UpdaterPolicy COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test-updater.py")

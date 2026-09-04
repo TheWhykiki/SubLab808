@@ -14,8 +14,9 @@ VST3 before launch so it survives closing the DAW and replacing the plugin.
    Click **Installieren**. The helper checks that no process still has either
    standard plugin binary open and opens the verified package in macOS Installer.
 4. Complete the normal Installer prompts, including administrator authentication
-   where macOS requires it. Keep DAWs closed and the updater open until it reports
-   **Update installiert**. This is a guided native installation, not unattended
+   where macOS requires it. Keep DAWs closed until the updater reports
+   **Update installiert**. Closing its window keeps verification running; reopen
+   the window from the Dock. This is a guided native installation, not unattended
    privileged installation. The updater never quits a DAW or enters a password.
 5. The updater verifies the system package receipt, version, every payload file
    and code signature. Only then does it move an unchanged older user-level VST3
@@ -24,10 +25,35 @@ VST3 before launch so it survives closing the DAW and replacing the plugin.
    This prevents the old user installation from shadowing the new system version.
    Preset libraries and DAW project files are untouched. Restart/rescan the DAW.
 
-An aborted Installer does not count as success. Close the updater and restart it
-from the plugin to retry a canceled installation. If verification fails after
-installation, inspect the displayed error; the old user copy remains unless it
-was already successfully archived. No automatic system-wide rollback is claimed.
+An aborted Installer does not count as success. Once Installer exits, the updater
+pauses polling and offers **Installation fortsetzen**. It first checks whether the
+installation actually completed, then rechecks DAW usage and the package hash
+before reopening Installer. An already-running Installer is brought forward;
+a second installation is never intentionally opened. If a canceled wizard leaves
+Installer running, quit Installer first. After 15 minutes automatic polling pauses
+with an explicit incomplete state; this is not treated as proof of cancellation.
+A payload mismatch after Installer exits offers an explicit repair; a migration
+failure retains the old copy and pending job for another verification attempt.
+
+Before the first Installer handoff, a private transaction record, package and
+signed copy of the updater are saved in
+`~/Library/Application Support/Whykiki Audio/Updates/SubLab808/<transaction-id>/`.
+The pending record is stored as `pending.json` in the product's Updates directory.
+Normal window closure keeps the process and product lock alive. Explicitly quitting
+offers **Später fortsetzen** and displays the saved recovery app's path. Reopen
+through the plugin's Updates button, or open that saved `SubLab808Updater.app`
+directly without a DAW. Direct launch without a pending job cannot start an update.
+No login item or background launch service is installed.
+
+Resumption reloads and validates the product-relative record and rechecks package
+trust, hash and contents before verifying the installation. A missing/corrupt
+package can be downloaded again with the original pinned release digest. The backup
+location is stable for the transaction: if the process stopped after moving the
+user copy but before recording completion, matching backup bytes complete recovery
+without another move. A newly created or modified user copy is preserved and
+requires resolution. The record is removed only after verification and migration
+succeed. Failed or deferred jobs retain their files. No automatic system-wide
+rollback is claimed.
 Do not restart another host during installation: macOS does not provide this
 helper with an atomic lock preventing other applications from loading a VST3.
 Other users' sessions may not be fully visible to the unprivileged process check.
@@ -35,6 +61,8 @@ Other users' sessions may not be fully visible to the unprivileged process check
 ## Release contract
 
 - Repository: `TheWhykiki/SubLab808`; HTTPS GitHub Releases API, no embedded token.
+- The UI distinguishes no published release, the current public release, and a
+  development build newer than that release. Only newer releases are offered.
 - Stable tags: `vMAJOR.MINOR.PATCH` or `MAJOR.MINOR.PATCH`; numeric comparison;
   no prereleases, draft releases or downgrade of either standard installation.
 - Exactly one asset named `SubLab808-MAJOR.MINOR.PATCH-macOS-arm64.pkg`,
@@ -95,12 +123,26 @@ a normal installation once. No installed plugin is changed by building/testing.
 
 ## Verification and remaining distribution gate
 
-`python3 -B scripts/test-updater.py` exercises version/product/URL/digest policies,
-Mach-O parsing, corrupt/truncated downloads, package metadata, symlink rejection,
-backup preservation and rejection of a real unsigned local PKG. It does not open
-Installer, access live releases or modify an installed plugin. CTest also runs
-`SubLab808UpdaterPolicy` and the release-pipeline contract tests; their macOS signing
-and notarization paths use fake tools. Bundle-load tests exercise the built VST3.
+`python3 -B scripts/test-updater.py` compiles every production Swift component
+(including the actual AppKit controller and HTTPClient; only the executable entry
+point is excluded) and runs three suites:
+
+- 23 policy tests: versions, product/URL/digest/Mach-O validation, package metadata,
+  real unsigned-package rejection, symlinks, backup preservation and interrupted
+  archive recovery, including a new user copy appearing after the original rename.
+- 16 controller/lifecycle tests: window closure, explicit defer, fresh-controller
+  resume, cancellation, retry, critical-operation quit protection, failed handoff,
+  DAW use, deadline, corrupted downloads, payload repair, migration failure and
+  invalid/symlinked journals. System installation operations use explicit fixtures;
+  journal and download fixture I/O is real, confined to temporary directories.
+- 10 HTTP/controller tests: actual URLSession delegates with URLProtocol transport
+  fixtures for responses, size bounds, offline errors, cancellation, redirects,
+  malformed releases and version/no-release UI states.
+
+These tests open no window or Installer and do not modify installed plugins.
+CTest includes `SubLab808UpdaterPolicy` and the existing release-pipeline contract
+tests; signing/notarization in the latter use fake tools. Bundle-load tests exercise
+the built VST3. A live GitHub download/trust probe is separate from offline tests.
 
 Before the first public updater release, perform a full signed/notarized N-to-N+1
 installation on a test Mac: user-only, system-only and duplicate installations;

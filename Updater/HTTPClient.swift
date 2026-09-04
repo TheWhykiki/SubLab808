@@ -1,5 +1,10 @@
 import Foundation
 
+enum HTTPFailure: LocalizedError {
+    case noRelease
+    var errorDescription: String? { "Für dieses Plugin ist noch kein stabiles GitHub-Release verfügbar." }
+}
+
 final class HTTPClient: NSObject, URLSessionDataDelegate, URLSessionDownloadDelegate {
     private var session: URLSession!
     private var task: URLSessionTask?
@@ -12,7 +17,7 @@ final class HTTPClient: NSObject, URLSessionDataDelegate, URLSessionDownloadDele
     private let completion: (Result<Data, Error>) -> Void
     private let metadata: Bool
 
-    init(url: URL, destination: URL? = nil, limit: Int,
+    init(url: URL, destination: URL? = nil, limit: Int, configuration: URLSessionConfiguration = .ephemeral,
          progress: @escaping (Double) -> Void = { _ in }, completion: @escaping (Result<Data, Error>) -> Void) {
         self.limit = limit
         self.destination = destination
@@ -20,7 +25,6 @@ final class HTTPClient: NSObject, URLSessionDataDelegate, URLSessionDownloadDele
         self.completion = completion
         metadata = destination == nil
         super.init()
-        let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 25
         configuration.timeoutIntervalForResource = 300
         configuration.httpShouldSetCookies = false
@@ -28,6 +32,10 @@ final class HTTPClient: NSObject, URLSessionDataDelegate, URLSessionDownloadDele
         let queue = OperationQueue()
         queue.maxConcurrentOperationCount = 1
         session = URLSession(configuration: configuration, delegate: self, delegateQueue: queue)
+        guard limit > 0 && Self.allowed(url, metadata: metadata) else {
+            finish(.failure(UpdateFailure("Ungültige Update-Adresse oder Downloadgrenze")))
+            return
+        }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
         request.setValue("Whykiki-Plugin-Updater/1", forHTTPHeaderField: "User-Agent")
         if metadata {
@@ -40,6 +48,12 @@ final class HTTPClient: NSObject, URLSessionDataDelegate, URLSessionDownloadDele
 
     func cancel() { task?.cancel() }
 
+    static func allowed(_ url: URL, metadata: Bool) -> Bool {
+        let hosts = metadata ? ["api.github.com"] : ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
+        return url.scheme == "https" && hosts.contains(url.host ?? "") && url.user == nil && url.password == nil
+            && (url.port == nil || url.port == 443)
+    }
+
     private func finish(_ result: Result<Data, Error>) {
         guard !finished else { return }
         finished = true
@@ -49,7 +63,10 @@ final class HTTPClient: NSObject, URLSessionDataDelegate, URLSessionDownloadDele
 
     private func check(_ response: URLResponse) throws {
         guard let response = response as? HTTPURLResponse else { throw UpdateFailure("Ungültige Serverantwort") }
-        if response.statusCode == 404 { throw UpdateFailure("Für dieses Plugin ist noch kein stabiles Update verfügbar.") }
+        if response.statusCode == 404 {
+            if metadata { throw HTTPFailure.noRelease }
+            throw UpdateFailure("Das Installationspaket ist auf GitHub nicht mehr verfügbar. Bitte erneut nach Updates suchen.")
+        }
         if response.statusCode == 403 || response.statusCode == 429 { throw UpdateFailure("GitHub begrenzt die Anfragen. Bitte später erneut versuchen.") }
         try require(response.statusCode == 200, "Download fehlgeschlagen (HTTP \(response.statusCode))")
         try require(response.expectedContentLength <= Int64(limit), "Die Serverantwort ist zu groß")
@@ -58,9 +75,7 @@ final class HTTPClient: NSObject, URLSessionDataDelegate, URLSessionDownloadDele
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
         redirects += 1
-        let allowed = metadata ? ["api.github.com"] : ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]
-        guard let url = request.url, url.scheme == "https", allowed.contains(url.host ?? ""),
-              url.user == nil, url.password == nil, url.port == nil || url.port == 443, redirects <= 5 else {
+        guard let url = request.url, Self.allowed(url, metadata: metadata), redirects <= 5 else {
             completionHandler(nil)
             finish(.failure(UpdateFailure("Nicht vertrauenswürdige Download-Weiterleitung")))
             return
@@ -75,6 +90,7 @@ final class HTTPClient: NSObject, URLSessionDataDelegate, URLSessionDownloadDele
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive chunk: Data) {
+        guard !finished else { return }
         guard data.count <= limit - chunk.count else {
             finish(.failure(UpdateFailure("Die Release-Antwort ist zu groß")))
             return
@@ -92,6 +108,7 @@ final class HTTPClient: NSObject, URLSessionDataDelegate, URLSessionDownloadDele
     }
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        guard !finished else { return }
         do {
             guard let response = downloadTask.response, let destination = destination else { throw UpdateFailure("Unvollständiger Download") }
             try check(response)
