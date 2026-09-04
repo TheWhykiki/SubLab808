@@ -29,6 +29,54 @@ void set(Processor& p, const char* id, float value)
     require(parameter != nullptr, "parameter exists");
     parameter->setValueNotifyingHost(parameter->convertTo0to1(value));
 }
+// setValue() changes the authoritative ranged parameter without notifying APVTS.
+// Dirty status must be correct on both sides of that intentional cache lag.
+void checkAuthoritativeDirtyState(const juce::File& root)
+{
+    int failures = 0;
+    for (const bool userPreset : { false, true })
+    {
+        Processor processor(root.getChildFile(userPreset ? "User" : "Factory"));
+        processor.setCurrentProgram(0);
+        if (userPreset) ok(processor.presets.saveAs("Dirty cache contract", "Tests"));
+        require((processor.presets.current().factoryIndex < 0) == userPreset, "dirty fixture has the intended preset identity");
+        require(! processor.presets.isModified(), "dirty fixture starts clean");
+        auto* parameter = processor.parameters.getParameter("output");
+        const auto* raw = processor.parameters.getRawParameterValue("output");
+        require(parameter != nullptr && raw != nullptr, "dirty fixture has output parameter and raw cache");
+        const auto baselineNormalised = parameter->getValue();
+        const auto baseline = parameter->convertFrom0to1(baselineNormalised);
+        const auto cachedBaseline = raw->load();
+        const auto& range = parameter->getNormalisableRange();
+        const auto changed = baseline <= range.start ? range.end : range.start;
+
+        parameter->setValue(parameter->convertTo0to1(changed));
+        const auto authoritativeChanged = parameter->convertFrom0to1(parameter->getValue());
+        require(std::abs(authoritativeChanged - baseline) > 0.0f && std::abs(raw->load() - cachedBaseline) <= 0.0f,
+                "unnotified edit changes ranged value while raw cache stays at baseline");
+        const auto dirtyBeforeNotification = processor.presets.isModified();
+        if (! dirtyBeforeNotification) ++failures;
+
+        parameter->sendValueChangedMessageToListeners(parameter->getValue());
+        require(std::abs(raw->load() - authoritativeChanged) <= 0.0f && processor.presets.isModified(),
+                "real edit notification converges raw and ranged values and remains dirty");
+
+        parameter->setValue(baselineNormalised);
+        require(std::abs(parameter->convertFrom0to1(parameter->getValue()) - baseline) <= 0.0f
+                    && std::abs(raw->load() - authoritativeChanged) <= 0.0f,
+                "unnotified reset restores ranged baseline while raw cache stays edited");
+        const auto cleanBeforeNotification = ! processor.presets.isModified();
+        if (! cleanBeforeNotification) ++failures;
+
+        parameter->sendValueChangedMessageToListeners(parameter->getValue());
+        require(std::abs(raw->load() - baseline) <= 0.0f && ! processor.presets.isModified(),
+                "real reset notification converges raw and ranged values and remains clean");
+        std::printf("%s: %s dirty cache contract: unnotified edit dirty=%d; unnotified reset clean=%d; notified values converge.\n",
+                    dirtyBeforeNotification && cleanBeforeNotification ? "PASS" : "FAIL",
+                    userPreset ? "user" : "factory", dirtyBeforeNotification ? 1 : 0, cleanBeforeNotification ? 1 : 0);
+    }
+    require(failures == 0, "dirty status follows authoritative ranged values, not the APVTS notification cache");
+}
 std::map<juce::String, float> values(Processor& p)
 {
     std::map<juce::String, float> result;
@@ -784,6 +832,14 @@ int main(int argc, char** argv)
     artifacts.createDirectory();
     try
     {
+        const auto dirtyOnly = juce::SystemStats::getEnvironmentVariable("WHYKIKI_PRESET_TEST_DIRTY_ONLY", {}) == "1";
+        if (dirtyOnly)
+            for (const auto* mode : { "WHYKIKI_PRESET_TEST_NATIVE_ONLY", "WHYKIKI_PRESET_TEST_REENTRANCY_ONLY",
+                                      "WHYKIKI_PRESET_TEST_LIFECYCLE_ONLY" })
+                require(juce::SystemStats::getEnvironmentVariable(mode, {}) != "1",
+                        "DIRTY_ONLY cannot be combined with another focused test mode");
+        checkAuthoritativeDirtyState(root.getChildFile("AuthoritativeDirty"));
+        if (dirtyOnly) return 0;
         if (juce::SystemStats::getEnvironmentVariable("WHYKIKI_PRESET_TEST_NATIVE_ONLY", {}) == "1")
         {
 #if JUCE_MAC

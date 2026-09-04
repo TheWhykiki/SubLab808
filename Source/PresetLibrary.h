@@ -90,15 +90,16 @@ public:
         for (const auto& [id, expected] : preset.values)
         {
             const auto* parameter = parameters.getParameter(id);
-            const auto* raw = parameters.getRawParameterValue(id);
-            if (parameter == nullptr || raw == nullptr) return true;
+            if (parameter == nullptr) return true;
             const auto& range = parameter->getNormalisableRange();
             const auto legal = range.snapToLegalValue(expected);
             // A fixed normalised epsilon would hide single-step changes to large
             // integer ranges such as ReverseLab's random seed (1..999999).
             const auto tolerance = juce::jmax(0.000001f, range.interval * 0.25f,
                 std::abs(legal) * std::numeric_limits<float>::epsilon() * 2.0f);
-            if (std::abs(raw->load() - legal) > tolerance) return true;
+            // APVTS raw values may lag until the parameter's notification arrives.
+            const auto actual = parameter->convertFrom0to1(parameter->getValue());
+            if (std::abs(actual - legal) > tolerance) return true;
         }
         return false;
     }

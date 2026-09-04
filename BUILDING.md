@@ -38,6 +38,8 @@ Copy the bundle to `~/Library/Audio/Plug-Ins/VST3/`, then restart Cubase or resc
 
 For a focused diagnostic run, set `WHYKIKI_PRESET_TEST_LIFECYCLE_ONLY=1` (37 cases), `WHYKIKI_PRESET_TEST_REENTRANCY_ONLY=1` (8 synchronous host-callback cases), or `WHYKIKI_PRESET_TEST_NATIVE_ONLY=1` (6 macOS-only file-panel cases) on the `SubLab808PresetTests` executable. Normal CTest runs include the applicable cases and the complete preset suite. The native test bridge activates only its own test process; it is not linked into the VST3 and does not substitute for Cubase/REAPER acceptance of host-specific window-closing behavior.
 
+`WHYKIKI_PRESET_TEST_DIRTY_ONLY=1` checks Factory/User dirty status against the actual ranged parameters while APVTS notifications deliberately lag, then verifies that real notifications bring the raw cache back into agreement. These cases also run in the full suite. Do not combine this focused mode with another: contradictory requests fail as a test-setup error.
+
 ## Control-thread contract
 
 Program changes and state restores are synchronous and serialized. Independent control threads may call them concurrently, and state capture remains available while a change is being published. A synchronous JUCE parameter or host callback must not start and join a worker that calls `setCurrentProgram()` or `setStateInformation()` back on the same processor: JUCE holds its own parameter-listener lock for the duration of such callbacks, so that cross-thread wait cycle is invalid regardless of the plugin's control-state serialization.
