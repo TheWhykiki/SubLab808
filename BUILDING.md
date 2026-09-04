@@ -12,7 +12,7 @@
 
 ```sh
 cmake -S . -B build -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target SubLab808Tests SubLab808_VST3 SubLab808HostTests -j 4
+cmake --build build --target SubLab808Tests SubLab808_VST3 SubLab808HostTests SubLab808PresetTests -j 4
 ctest --test-dir build --output-on-failure
 ```
 

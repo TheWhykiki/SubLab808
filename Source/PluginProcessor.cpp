@@ -1,68 +1,40 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "FactoryBank.h"
 #include <limits>
 
-namespace {
-// Preset values are named, so a column cannot be silently swapped; each field maps to its
-// parameter through presetFields below (also used to validate ranges in the smoke tests).
-struct PresetValues
-{
-    float decay, release, punch, pitchDecay, glide, tune, body, click, drive, tone, velocity, output;
-};
-struct FactoryPreset { const char* name; PresetValues values; bool oneShot; };
-constexpr std::array<FactoryPreset, 8> factoryPresets {{
-    { "Deep Foundation", { .decay = 1.40f, .release = 0.18f, .punch = 12.0f, .pitchDecay = 0.070f, .glide = 0.030f, .tune = 0.0f, .body = 10.0f, .click = 5.0f, .drive = 2.0f, .tone = 1800.0f, .velocity = 72.0f, .output = -3.0f }, true },
-    { "Modern Knock",    { .decay = 0.72f, .release = 0.09f, .punch = 24.0f, .pitchDecay = 0.035f, .glide = 0.015f, .tune = 0.0f, .body = 25.0f, .click = 22.0f, .drive = 7.0f, .tone = 5200.0f, .velocity = 90.0f, .output = -3.0f }, true },
-    { "Long Slide",      { .decay = 2.80f, .release = 0.32f, .punch = 10.0f, .pitchDecay = 0.090f, .glide = 0.180f, .tune = 0.0f, .body = 16.0f, .click = 4.0f, .drive = 4.0f, .tone = 2600.0f, .velocity = 65.0f, .output = -4.0f }, false },
-    { "Dirty Trunk",     { .decay = 1.10f, .release = 0.12f, .punch = 18.0f, .pitchDecay = 0.055f, .glide = 0.045f, .tune = 0.0f, .body = 42.0f, .click = 12.0f, .drive = 16.0f, .tone = 3200.0f, .velocity = 85.0f, .output = -5.0f }, true },
-    { "Short Punch",     { .decay = 0.28f, .release = 0.05f, .punch = 32.0f, .pitchDecay = 0.022f, .glide = 0.000f, .tune = 0.0f, .body = 30.0f, .click = 38.0f, .drive = 9.0f, .tone = 7800.0f, .velocity = 100.0f, .output = -2.0f }, true },
-    { "Soft Pillow",     { .decay = 1.75f, .release = 0.40f, .punch = 7.0f, .pitchDecay = 0.110f, .glide = 0.060f, .tune = 0.0f, .body = 5.0f, .click = 0.0f, .drive = 1.0f, .tone = 1250.0f, .velocity = 55.0f, .output = -2.5f }, false },
-    { "Upper Bass",      { .decay = 0.90f, .release = 0.10f, .punch = 15.0f, .pitchDecay = 0.045f, .glide = 0.025f, .tune = 12.0f, .body = 36.0f, .click = 18.0f, .drive = 8.0f, .tone = 6400.0f, .velocity = 82.0f, .output = -4.0f }, true },
-    { "Sub Destroyer",   { .decay = 1.55f, .release = 0.16f, .punch = 28.0f, .pitchDecay = 0.030f, .glide = 0.040f, .tune = -12.0f, .body = 55.0f, .click = 15.0f, .drive = 22.0f, .tone = 4100.0f, .velocity = 95.0f, .output = -7.0f }, true }
-}};
-struct PresetField { const char* id; float PresetValues::* member; };
-constexpr std::array<PresetField, 12> presetFields {{
-    { "decay", &PresetValues::decay }, { "release", &PresetValues::release }, { "punch", &PresetValues::punch },
-    { "pitchdecay", &PresetValues::pitchDecay }, { "glide", &PresetValues::glide }, { "tune", &PresetValues::tune },
-    { "body", &PresetValues::body }, { "click", &PresetValues::click }, { "drive", &PresetValues::drive },
-    { "tone", &PresetValues::tone }, { "velocity", &PresetValues::velocity }, { "output", &PresetValues::output }
-}};
-}
-
-SubLab808Processor::SubLab808Processor()
+SubLab808Processor::SubLab808Processor(juce::File presetStorage)
     : AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true)),
-      parameters(*this, nullptr, "PARAMETERS", makeLayout())
+      parameters(*this, nullptr, "PARAMETERS", makeLayout()),
+      presets(*this, parameters, "SubLab808", factoryBank(), std::move(presetStorage))
 {
     clearHeldKeys();
     ControlOperation initialProgram;
     initialProgram.programIndex = 0;
     initialProgram.notifyHost = false;
     submitControlOperation(std::move(initialProgram));
-    for (const auto& field : presetFields) parameters.addParameterListener(field.id, this);
-    parameters.addParameterListener("oneshot", this);
+    for (const auto& [id, value] : factoryBank().front().values) { juce::ignoreUnused(value); parameters.addParameterListener(id, this); }
 }
 
 SubLab808Processor::~SubLab808Processor()
 {
-    for (const auto& field : presetFields) parameters.removeParameterListener(field.id, this);
-    parameters.removeParameterListener("oneshot", this);
+    for (const auto& [id, value] : factoryBank().front().values) { juce::ignoreUnused(value); parameters.removeParameterListener(id, this); }
 }
 
-int SubLab808Processor::getNumPrograms() { return (int) factoryPresets.size(); }
+int SubLab808Processor::getNumPrograms() { return (int) factoryBank().size(); }
 
 float SubLab808Processor::getFactoryPresetValue(int index, const juce::String& parameterId) const
 {
-    if (! juce::isPositiveAndBelow(index, (int) factoryPresets.size())) return 0.0f;
-    if (parameterId == "oneshot") return factoryPresets[(size_t) index].oneShot ? 1.0f : 0.0f;
-    for (const auto& field : presetFields)
-        if (parameterId == field.id) return factoryPresets[(size_t) index].values.*field.member;
-    return 0.0f;
+    if (! juce::isPositiveAndBelow(index, (int) factoryBank().size())) return 0.0f;
+    const auto& values = factoryBank()[static_cast<size_t>(index)].values;
+    const auto it = values.find(parameterId);
+    return it == values.end() ? 0.0f : it->second;
 }
 
 const juce::String SubLab808Processor::getProgramName(int index)
 {
     if (! juce::isPositiveAndBelow(index, getNumPrograms())) return {};
-    return factoryPresets[(size_t) index].name;
+    return factoryBank()[(size_t) index].name;
 }
 
 void SubLab808Processor::setCurrentProgram(int index)
@@ -145,26 +117,26 @@ bool SubLab808Processor::applyProgramNow(int index)
 {
     if (! juce::isPositiveAndBelow(index, getNumPrograms())) return false;
 
+    presets.clearSelection();
     if (currentProgram.load() == index && parametersMatchProgram(index)) {
         presetModified.store(false);
         return false;
     }
 
     struct ParameterUpdate { juce::RangedAudioParameter* parameter; float normalisedValue; };
-    std::array<ParameterUpdate, presetFields.size() + 1> updates {};
+    std::array<ParameterUpdate, 13> updates {};
     size_t updateCount = 0;
 
     internalParameterChangeDepth.fetch_add(1);
-    const auto& preset = factoryPresets[(size_t) index];
+    const auto& preset = factoryBank()[(size_t) index];
     const auto stage = [&] (juce::RangedAudioParameter* parameter, float normalisedValue) {
         if (parameter == nullptr) return;
         parameter->setValue(normalisedValue);
         updates[updateCount++] = { parameter, parameter->getValue() };
     };
-    for (const auto& field : presetFields)
-        if (auto* parameter = parameters.getParameter(field.id))
-            stage(parameter, parameter->convertTo0to1(preset.values.*field.member));
-    stage(parameters.getParameter("oneshot"), preset.oneShot ? 1.0f : 0.0f);
+    for (const auto& [id, value] : preset.values)
+        if (auto* parameter = parameters.getParameter(id))
+            stage(parameter, parameter->convertTo0to1(value));
 
     for (size_t i = 0; i < updateCount; ++i)
         updates[i].parameter->sendValueChangedMessageToListeners(updates[i].normalisedValue);
@@ -576,6 +548,7 @@ juce::MemoryBlock SubLab808Processor::createStateSnapshot()
 {
     juce::MemoryBlock result;
     auto state = parameters.copyState();
+    presets.appendSelection(state);
     const auto size = getEditorSize();
     state.setProperty("factoryProgram", currentProgram.load(), nullptr);
     state.setProperty("presetModified", presetModified.load(), nullptr);
@@ -616,13 +589,12 @@ void SubLab808Processor::endStateTransaction()
 bool SubLab808Processor::parametersMatchProgram(int index)
 {
     if (! juce::isPositiveAndBelow(index, getNumPrograms())) return false;
-    const auto& preset = factoryPresets[(size_t) index];
-    for (const auto& field : presetFields) {
-        const auto* value = parameters.getRawParameterValue(field.id);
-        if (value == nullptr || std::abs(value->load() - preset.values.*field.member) > 0.0005f) return false;
+    const auto& preset = factoryBank()[(size_t) index];
+    for (const auto& [id, value] : preset.values) {
+        const auto* parameter = parameters.getParameter(id);
+        if (parameter == nullptr || std::abs(parameter->getValue() - parameter->convertTo0to1(value)) > 0.00002f) return false;
     }
-    const auto* oneShot = parameters.getRawParameterValue("oneshot");
-    return oneShot != nullptr && (oneShot->load() >= 0.5f) == preset.oneShot;
+    return true;
 }
 
 bool SubLab808Processor::applyStateNow(const juce::ValueTree& state)
@@ -640,6 +612,7 @@ bool SubLab808Processor::applyStateNow(const juce::ValueTree& state)
 
     internalParameterChangeDepth.fetch_add(1);
     parameters.replaceState(state);
+    presets.restoreSelection(state);
     currentProgram.store(restoredProgram);
     setEditorSize(restoredWidth, restoredHeight);
     const auto matchesFactoryProgram = parametersMatchProgram(restoredProgram);

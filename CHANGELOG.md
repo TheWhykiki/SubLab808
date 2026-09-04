@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.0 (unreleased)
+
+- Expand the factory bank from 8 to 64 distinct, fully specified bass recipes; preserve all legacy program indices and values.
+- Add a searchable preset browser, categories, favourites and previous/next navigation.
+- Add persistent user presets with Save/Save As, rename, delete, validated import/export and conflict-safe atomic writes.
+- Preserve user preset identity, baseline and unsaved edits in DAW state; protect edited sounds during browser navigation.
+- Add persistence, invalid-file, UI and complete-bank audio tests to CI.
+
 ## Unreleased
 
 - Corrected the maximum host-reported tail to 47 s, matching the exponential 4 s decay time constant.
