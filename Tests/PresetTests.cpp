@@ -401,6 +401,28 @@ int main(int argc, char** argv)
         search->setText("UI Saved Sound", false); search->onTextChange(); require(list != nullptr && list->getListBoxModel() != nullptr && list->getListBoxModel()->getNumRows() == 1, "Browser search filters user preset");
         require(search != nullptr, "Browser search still open");
         search->setText("no such preset 917239", false); search->onTextChange(); require(list != nullptr && list->getListBoxModel() != nullptr && list->getListBoxModel()->getNumRows() == 0, "Browser empty search state");
+        auto* clearFilters = findButton(*browser, "Reset preset filters");
+        require(clearFilters != nullptr && clearFilters->isEnabled(), "Clear filters available after empty search");
+        clearFilters->onClick();
+        require(search->getText().isEmpty() && list->getListBoxModel()->getNumRows() >= 64 && ! clearFilters->isEnabled(), "Clear restores complete bank");
+        juce::ComboBox* source = nullptr;
+        juce::ComboBox* category = nullptr;
+        juce::Label* count = nullptr;
+        for (auto* child : browser->getChildren())
+        {
+            if (child->getTitle() == "Preset source") source = dynamic_cast<juce::ComboBox*>(child);
+            if (child->getTitle() == "Preset category") category = dynamic_cast<juce::ComboBox*>(child);
+            if (child->getTitle() == "Preset results") count = dynamic_cast<juce::Label*>(child);
+        }
+        require(source != nullptr && category != nullptr && count != nullptr, "browser filters and result count visible");
+        source->setSelectedId(4, juce::dontSendNotification); source->onChange();
+        require(list->getListBoxModel()->getNumRows() == 1 && count->getText().startsWith("1 of "), "favourites filter and count agree");
+        writePNG(*callout, artifacts.getChildFile("preset-favourites.png"));
+        category->setSelectedId(2, juce::dontSendNotification); category->onChange();
+        search->setText("missing", false); search->onTextChange();
+        clearFilters->onClick();
+        require(source->getSelectedId() == 1 && category->getSelectedId() == 1 && list->getListBoxModel()->getNumRows() >= 64, "Clear resets all three filters together");
+        writePNG(*callout, artifacts.getChildFile("preset-browser.png"));
         callout->dismiss(); pump();
         std::printf("PASS: editor sizes, Save As/Save UI, unsaved Cancel/Discard, browser and search.\n");
         return 0;

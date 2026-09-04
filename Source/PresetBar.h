@@ -1,6 +1,7 @@
 #pragma once
 #include <juce_gui_extra/juce_gui_extra.h>
 #include "PresetLibrary.h"
+#include <set>
 
 namespace wk
 {
@@ -51,6 +52,8 @@ private:
             setSize(560, 385);
             search.setTextToShowWhenEmpty("Search presets or descriptions", juce::Colour(0xff8090a0));
             search.setTitle("Search presets");
+            reset.setButtonText("Clear"); reset.setTitle("Reset preset filters");
+            reset.setTooltip("Show all presets and clear the search and category filters.");
             source.addItem("All presets", 1); source.addItem("Factory", 2);
             source.addItem("User", 3); source.addItem("Favourites", 4); source.setSelectedId(owner.sourceFilter, juce::dontSendNotification);
             source.setTitle("Preset source"); category.setTitle("Preset category");
@@ -67,12 +70,21 @@ private:
             list.setColour(juce::ListBox::outlineColourId, juce::Colour(0xff334451));
             description.setColour(juce::Label::textColourId, juce::Colour(0xffb3c2d0));
             description.setJustificationType(juce::Justification::topLeft);
+            count.setTitle("Preset results"); count.setColour(juce::Label::textColourId, juce::Colour(0xff96abba));
+            for (const auto& item : owner.entries)
+                if (owner.presets.isFavourite(item.id)) favourites.insert(item.id);
             loadButton.setButtonText("Load preset"); loadButton.setTitle("Load selected preset");
-            addAndMakeVisible(search); addAndMakeVisible(source); addAndMakeVisible(category);
+            addAndMakeVisible(search); addAndMakeVisible(reset); addAndMakeVisible(source); addAndMakeVisible(category); addAndMakeVisible(count);
             addAndMakeVisible(list); addAndMakeVisible(description); addAndMakeVisible(loadButton);
             search.onTextChange = [this] { filter(); }; source.onChange = [this] { filter(); };
             category.onChange = [this] { filter(); };
             loadButton.onClick = [this] { loadSelected(); };
+            reset.onClick = [this] {
+                search.setText({}, false);
+                source.setSelectedId(1, juce::dontSendNotification);
+                category.setSelectedId(1, juce::dontSendNotification);
+                filter();
+            };
             filter();
         }
         ~Browser() override { list.setModel(nullptr); }
@@ -80,10 +92,13 @@ private:
         void resized() override
         {
             auto area = getLocalBounds().reduced(10);
-            search.setBounds(area.removeFromTop(29)); area.removeFromTop(6);
+            auto searchRow = area.removeFromTop(29);
+            reset.setBounds(searchRow.removeFromRight(58)); searchRow.removeFromRight(6);
+            search.setBounds(searchRow); area.removeFromTop(6);
             auto filters = area.removeFromTop(28); source.setBounds(filters.removeFromLeft(170));
             filters.removeFromLeft(8); category.setBounds(filters);
             area.removeFromTop(7);
+            count.setBounds(area.removeFromTop(20));
             auto footer = area.removeFromBottom(62);
             loadButton.setBounds(footer.removeFromRight(108).withSizeKeepingCentre(106, 30));
             description.setBounds(footer.reduced(0, 3));
@@ -97,7 +112,13 @@ private:
             const auto& item = visible[static_cast<size_t>(row)];
             if (selectedRow) g.fillAll(juce::Colour(0xff294456));
             g.setColour(juce::Colour(0xffedf2f6)); g.setFont(juce::FontOptions(14.0f));
-            g.drawText(item.name, 9, 0, width - 190, height, juce::Justification::centredLeft);
+            if (favourites.count(item.id) != 0)
+            {
+                g.setColour(juce::Colour(0xffffce74));
+                g.drawText(juce::String::fromUTF8("★"), 7, 0, 19, height, juce::Justification::centredLeft);
+                g.setColour(juce::Colour(0xffedf2f6));
+            }
+            g.drawText(item.name, 29, 0, width - 215, height, juce::Justification::centredLeft);
             g.setColour(juce::Colour(0xff96abba)); g.setFont(juce::FontOptions(11.0f));
             g.drawText((item.factoryIndex >= 0 ? "Factory / " : "User / ") + item.category,
                        width - 185, 0, 176, height, juce::Justification::centredRight);
@@ -116,6 +137,9 @@ private:
             bar->sourceFilter = source.getSelectedId(); bar->searchFilter = search.getText();
             bar->categoryFilter = category.getSelectedId() == 1 ? juce::String() : category.getText();
             visible = bar->filteredEntries(); list.updateContent();
+            count.setText(juce::String(static_cast<int>(visible.size())) + " of "
+                + juce::String(static_cast<int>(bar->entries.size())) + " presets", juce::dontSendNotification);
+            reset.setEnabled(bar->sourceFilter != 1 || bar->searchFilter.isNotEmpty() || bar->categoryFilter.isNotEmpty());
             const auto id = bar->presets.current().id;
             int row = visible.empty() ? -1 : 0;
             for (size_t index = 0; index < visible.size(); ++index)
@@ -135,8 +159,9 @@ private:
         juce::TextEditor search;
         juce::ComboBox source, category;
         juce::ListBox list;
-        juce::Label description;
-        juce::TextButton loadButton;
+        juce::Label description, count;
+        juce::TextButton loadButton, reset;
+        std::set<juce::String> favourites;
         std::vector<Preset> visible;
     };
 

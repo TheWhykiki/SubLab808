@@ -31,3 +31,10 @@ The interactive part requires a desktop display. Tests use a temporary library a
 - Error alerts use an explicit asynchronous callback, avoiding nested modal loops when JUCE permits modal dispatch.
 - Regression UI checks wait for the requested alert across queue turns.
 - The complete local preset suites pass for both products; DSP and host checks remain green. No DSP, parameter or build configuration changed in this follow-up.
+
+## Follow-up: browser orientation
+
+- Favourite stars and filtered/total result counts are visible in the preset list.
+- Clear resets search, source and category together, including recovery from an empty result set.
+- Both full preset suites, including 384 combined audio renders and the added browser checks, pass. Browser and favourites snapshots were inspected.
+- Both VST3 targets rebuild successfully; strict signature checks pass (SubLab808 arm64, ReverseLab arm64/x86_64). The rebuilt SubLab808 bundle also passes its host-load test.

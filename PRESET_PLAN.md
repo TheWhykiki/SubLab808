@@ -16,6 +16,7 @@ Jedes Rezept ist explizit ausgearbeitet. Presets unterscheiden sich in Klangpara
 
 - Die Preset-Leiste zeigt Factory/User, Namen und ein Sternchen bei ungespeicherten Änderungen.
 - Der Browser bietet Suche, Factory/User/Favourites sowie Kategorien und Anwendungshinweise.
+- Favoriten sind in den Ergebniszeilen durch Sterne sichtbar. Die Trefferzahl zeigt gefundene und insgesamt vorhandene Presets. Clear setzt Suche, Quelle und Kategorie gemeinsam zurück.
 - Vor/Zurück folgt den zuletzt gewählten Browser-Filtern.
 - Save überschreibt das geladene eigene Preset. Bei Factory öffnet es Save As.
 - Save As speichert den aktuellen Klang unter einem neuen Namen und einer Kategorie.
