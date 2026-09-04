@@ -32,7 +32,9 @@ Copy the bundle to `~/Library/Audio/Plug-Ins/VST3/`, then restart Cubase or resc
 
 ## Tests
 
-`SubLab808Smoke` verifies audio generation, every factory preset, parameter/state restoration, Gate and One Shot modes, channel-isolated MIDI and Pitch Bend, tail behavior, output bounds, editor construction, size restoration, and in-memory UI rendering. `SubLab808BundleLoad` scans and instantiates the built VST3 through JUCE's VST3 host implementation, then renders MIDI-driven audio through the bundle through its reported maximum tail.
+`SubLab808Smoke` verifies audio generation, every factory preset, parameter/state restoration, Gate and One Shot modes, channel-isolated MIDI and Pitch Bend, tail behavior, output bounds, editor construction, size restoration, and in-memory UI rendering. `SubLab808BundleLoad` scans and instantiates the built VST3 through JUCE's VST3 host implementation, then renders MIDI-driven audio through the bundle through its reported maximum tail. It also saves 13 non-default parameters (including Click), destroys the reference instance, restores a fresh VST3 instance, and compares 96,000 stereo frames sample-exactly. Validator negative controls reject a missing restore, a one-ULP audio change and non-finite values.
+
+`SubLab808Presets` tests the factory bank, file safety and real preset UI. Its 37 editor-lifecycle/host-callback cases use temporary libraries and a desktop display; use an isolated desktop session when running GUI tests. For a focused diagnostic run, set `WHYKIKI_PRESET_TEST_LIFECYCLE_ONLY=1` (all 37 cases) or `WHYKIKI_PRESET_TEST_REENTRANCY_ONLY=1` (8 synchronous host-callback cases) on the `SubLab808PresetTests` executable. Normal CTest runs include these cases and the complete preset suite.
 
 ## Control-thread contract
 

@@ -24,6 +24,7 @@ Jedes Rezept ist explizit ausgearbeitet. Presets unterscheiden sich in Klangpara
 - Factory-Presets können weder überschrieben, umbenannt noch gelöscht werden.
 - Delete fragt nach und entfernt nur die gespeicherte Datei; der aktuelle Klang bleibt im Projekt.
 - Offene Save-As-, Export- und Wechsel-Dialoge erkennen geänderte DAW-Klänge. Eine veraltete Aktion wird mit Erklärung abgebrochen; der aktuelle Klang bleibt erhalten.
+- Versteckt, entfernt oder zerstört der Host den Editor, werden dessen eigene Dialoge geschlossen und bereits vorgemerkte Antworten ungültig. Andere Plugin-Instanzen bleiben unberührt. Schließt der Host den Editor synchron während einer bestätigten Preset-Aktion, darf diese fertig werden, aber keine veraltete UI- oder Folgeaktion mehr ausführen.
 - Lange Preset-Namen erhalten bei Save As einen gültigen Vorschlag innerhalb der 80-Zeichen-Grenze.
 
 ## Speicherung und Kompatibilität
@@ -58,6 +59,7 @@ Audio-Callbacks führen keine Preset-Dateizugriffe aus.
 5. Beschädigte/fremde Dateien, fehlende Parameter, Namenskonflikte, veraltete Instanzen und Schreibfehler werden geprüft.
 6. Jedes Preset wird in drei Szenarien gerendert; Samples müssen endlich, hörbar und innerhalb der Test-Pegelgrenze sein.
 7. Die Oberfläche wird in minimaler, normaler und maximaler Größe gerendert und visuell geprüft.
+8. Editor-Lebensdauer, wartende Dialogantworten und Instanz-Isolation werden mit echten JUCE-Fenstern geprüft; synchrones Schließen durch einen Host-Listener wird separat getestet. Unveränderte Live-Werte und korrekt gespeicherte Werte werden jeweils gegen ihre eigene Darstellung geprüft, nicht durch pauschale Float-Toleranzen gleichgesetzt.
 
 Automatische Audio-Tests prüfen technische Plausibilität und unterscheiden identische Ausgaben.
 Sie ersetzen keine musikalische Hörabnahme im Arrangement. Die Bank bleibt nach persönlichem Feedback nachjustierbar.

@@ -1,13 +1,14 @@
 #pragma once
 #include <juce_gui_extra/juce_gui_extra.h>
 #include "PresetLibrary.h"
+#include <cstdint>
 
 namespace wk
 {
 class PresetBar final : public juce::Component, private juce::Timer
 {
 public:
-    explicit PresetBar(PresetLibrary& library) : presets(library)
+    explicit PresetBar(PresetLibrary& libraryToUse) : presets(libraryToUse), ownerWatcher(*this)
     {
         setName("Preset library");
         for (auto* button : { &previous, &next, &browse, &favourite, &save, &saveAs, &manage })
@@ -22,13 +23,29 @@ public:
         previous.onClick = [this] { step(-1); }; next.onClick = [this] { step(1); };
         browse.onClick = [this] { showBrowser(); };
         favourite.onClick = [this] {
+            if (! canOpenUi()) return;
+            const juce::Component::SafePointer<PresetBar> safe(this);
+            const auto generation = uiGeneration;
             const auto id = presets.current().id;
-            report(presets.setFavourite(id, ! presets.isFavourite(id))); timerCallback();
+            const auto enabled = ! presets.isFavourite(id);
+            applyAndReport(safe, generation, [id, enabled](PresetLibrary& library) { return library.setFavourite(id, enabled); });
         };
-        save.onClick = [this] { if (presets.current().factoryIndex >= 0) nameDialog(false); else report(presets.save()); };
+        save.onClick = [this] {
+            if (! canOpenUi()) return;
+            if (presets.current().factoryIndex >= 0) { nameDialog(false); return; }
+            applyAndReport(this, uiGeneration, [](PresetLibrary& library) { return library.save(); });
+        };
         saveAs.onClick = [this] { nameDialog(false); };
         manage.onClick = [this] { showManagement(); };
         refreshEntries(); timerCallback(); startTimerHz(5);
+    }
+    ~PresetBar() override
+    {
+        // SafePointer<this> is not cleared until Component's base destructor.
+        // Invalidate callbacks before closing any window or destroying members.
+        destroying = true;
+        stopTimer();
+        cancelOwnedUi();
     }
     void resized() override
     {
@@ -40,13 +57,105 @@ public:
         save.setBounds(row.removeFromRight(54).reduced(2));
         favourite.setBounds(row.removeFromRight(37).reduced(2));
         browse.setBounds(row.reduced(3, 1));
+        if (managementParent != nullptr)
+            if (auto* editor = findParentComponentOfClass<juce::AudioProcessorEditor>())
+                managementParent->setBounds(editor->getLocalBounds());
     }
 
 private:
+    // Observe ancestors too: a host can hide or detach the editor while leaving
+    // this child visible/alive. Component::visibilityChanged alone misses that.
+    class OwnerWatcher final : public juce::ComponentMovementWatcher
+    {
+    public:
+        explicit OwnerWatcher(PresetBar& bar) : ComponentMovementWatcher(&bar), owner(bar) {}
+        void componentMovedOrResized(bool, bool) override {}
+        void componentPeerChanged() override { owner.cancelOwnedUi(); }
+        void componentVisibilityChanged() override { if (! owner.isShowing()) owner.cancelOwnedUi(); }
+    private:
+        PresetBar& owner;
+    };
+
+    struct MessageScope
+    {
+        juce::ScopedMessageBox box;
+        bool completed = false;
+    };
+
+    bool canOpenUi() const { return ! destroying && ! cancellingUi && isShowing(); }
+    bool acceptsCallback(std::uint64_t generation) const { return generation == uiGeneration && canOpenUi(); }
+
+    template <typename Action>
+    static bool applyAndReport(juce::Component::SafePointer<PresetBar> owner, std::uint64_t generation, Action action)
+    {
+        if (owner == nullptr || ! owner->acceptsCallback(generation)) return false;
+        // The processor owns the library. A mutation can synchronously notify
+        // the host, which may destroy/hide the editor before the call returns.
+        // Keep the action/inputs on this stack, not in an editor-owned callback,
+        // and never evaluate report(mutation()) on a previously checked owner.
+        const auto result = action(owner->presets);
+        if (owner == nullptr || ! owner->acceptsCallback(generation)) return false;
+        owner->report(result);
+        return owner != nullptr && owner->acceptsCallback(generation) && result.wasOk();
+    }
+
+    static void cancelModal(juce::Component::SafePointer<juce::Component> component)
+    {
+        if (component == nullptr) return;
+        component->exitModalState(0);
+        if (component == nullptr) return;
+        component->setVisible(false);
+        if (component != nullptr) component->setLookAndFeel(nullptr);
+        // JUCE owns these modal windows and deletes them asynchronously. Never
+        // pump a nested message loop, or delete CallOutBox's callback-owned data.
+    }
+
+    void cancelOwnedUi()
+    {
+        if (cancellingUi) return;
+        const juce::ScopedValueSetter<bool> cancelling(cancellingUi, true);
+        ++uiGeneration;
+        // Move handles out before closing: cancellation must remain safe if a
+        // platform callback runs synchronously while a native window is closed.
+        auto modals = std::move(ownedModals);
+        ownedModals.clear();
+        auto messages = std::move(messageScopes);
+        messageScopes.clear();
+        managementParent.reset(); // Cancels only the menu parented here.
+        chooser.reset();          // FileChooser clears its pending callback.
+        for (auto& message : messages) message->box.close();
+        for (auto modal : modals) cancelModal(modal);
+    }
+
+    void pruneUiHandles()
+    {
+        std::erase_if(ownedModals, [](const auto& modal) { return modal == nullptr; });
+        std::erase_if(messageScopes, [](const auto& scope) { return scope->completed; });
+    }
+
+    void showMessage(const juce::MessageBoxOptions& options, std::function<void(int)> callback)
+    {
+        if (! canOpenUi()) return;
+        pruneUiHandles();
+        const auto scope = std::make_shared<MessageScope>();
+        messageScopes.push_back(scope);
+        const std::weak_ptr<MessageScope> weakScope(scope);
+        const juce::Component::SafePointer<PresetBar> safe(this);
+        const auto generation = uiGeneration;
+        scope->box = juce::AlertWindow::showScopedAsync(options,
+            [safe, generation, weakScope, callback = std::move(callback)](int result) {
+                // Keep the completed scope alive through a callback that may
+                // open another message and prune the previous vector entry.
+                const auto completed = weakScope.lock();
+                if (completed != nullptr) completed->completed = true;
+                if (safe != nullptr && safe->acceptsCallback(generation)) callback(result);
+            });
+    }
+
     class Browser final : public juce::Component, private juce::ListBoxModel
     {
     public:
-        explicit Browser(PresetBar& owner) : bar(&owner)
+        explicit Browser(PresetBar& owner) : bar(&owner), generation(owner.uiGeneration)
         {
             setSize(560, 385);
             search.setTextToShowWhenEmpty("Search presets or descriptions", juce::Colour(0xff8090a0));
@@ -112,7 +221,7 @@ private:
         void returnKeyPressed(int) override { loadSelected(); }
         void filter()
         {
-            if (bar == nullptr) return;
+            if (bar == nullptr || ! bar->acceptsCallback(generation)) return;
             bar->sourceFilter = source.getSelectedId(); bar->searchFilter = search.getText();
             bar->categoryFilter = category.getSelectedId() == 1 ? juce::String() : category.getText();
             visible = bar->filteredEntries(); list.updateContent();
@@ -125,13 +234,14 @@ private:
         void loadSelected()
         {
             const auto row = list.getSelectedRow();
-            if (bar == nullptr || ! juce::isPositiveAndBelow(row, getNumRows())) return;
+            if (bar == nullptr || ! bar->acceptsCallback(generation) || ! juce::isPositiveAndBelow(row, getNumRows())) return;
             const auto selected = visible[static_cast<size_t>(row)];
             auto owner = bar;
             if (auto* callout = findParentComponentOfClass<juce::CallOutBox>()) callout->dismiss();
             owner->requestLoad(selected);
         }
         juce::Component::SafePointer<PresetBar> bar;
+        const std::uint64_t generation;
         juce::TextEditor search;
         juce::ComboBox source, category;
         juce::ListBox list;
@@ -161,11 +271,21 @@ private:
     }
     void showBrowser()
     {
+        if (! canOpenUi()) return;
+        auto* editor = findParentComponentOfClass<juce::AudioProcessorEditor>();
+        if (editor == nullptr) return;
         refreshEntries();
-        juce::CallOutBox::launchAsynchronously(std::make_unique<Browser>(*this), browse.getScreenBounds(), nullptr);
+        pruneUiHandles();
+        const juce::Component::SafePointer<PresetBar> safe(this);
+        const auto generation = uiGeneration;
+        auto& callout = juce::CallOutBox::launchAsynchronously(std::make_unique<Browser>(*this),
+            editor->getLocalArea(&browse, browse.getLocalBounds()), editor);
+        if (safe != nullptr && safe->acceptsCallback(generation)) safe->ownedModals.emplace_back(&callout);
+        else cancelModal(&callout);
     }
     void step(int direction)
     {
+        if (! canOpenUi()) return;
         refreshEntries(); const auto visible = filteredEntries();
         if (visible.empty()) return;
         const auto id = presets.current().id;
@@ -176,21 +296,33 @@ private:
     }
     void requestLoad(Preset preset)
     {
+        if (! canOpenUi()) return;
         const juce::Component::SafePointer<PresetBar> safe(this);
-        if (! presets.isModified()) { report(presets.load(preset)); return; }
+        const auto generation = uiGeneration;
+        if (! presets.isModified())
+        {
+            applyAndReport(safe, generation, [preset](PresetLibrary& library) { return library.load(preset); });
+            return;
+        }
         const auto originalSound = presets.currentSound();
-        juce::AlertWindow::showAsync(juce::MessageBoxOptions().withIconType(juce::MessageBoxIconType::QuestionIcon)
+        showMessage(juce::MessageBoxOptions().withIconType(juce::MessageBoxIconType::QuestionIcon)
             .withTitle("Unsaved preset changes").withMessage("Save your current sound before loading " + preset.name + "?")
             .withButton("Save As...").withButton("Discard changes").withButton("Cancel").withAssociatedComponent(this),
-            [safe, preset, originalSound](int result) {
-                if (safe == nullptr || (result != 1 && result != 2)) return;
+            [safe, generation, preset, originalSound](int result) {
+                if (safe == nullptr || ! safe->acceptsCallback(generation) || (result != 1 && result != 2)) return;
                 if (! safe->checkSound(originalSound)) return;
-                if (result == 1) safe->nameDialog(false, [safe, preset] { if (safe != nullptr) safe->report(safe->presets.load(preset)); });
-                else if (result == 2) safe->report(safe->presets.load(preset));
+                if (result == 1) safe->nameDialog(false, [safe, generation, preset] {
+                    applyAndReport(safe, generation, [preset](PresetLibrary& library) { return library.load(preset); });
+                });
+                else if (result == 2)
+                    applyAndReport(safe, generation, [preset](PresetLibrary& library) { return library.load(preset); });
             });
     }
     void nameDialog(bool rename, std::function<void()> afterSave = {})
     {
+        if (! canOpenUi()) return;
+        pruneUiHandles();
+        const auto generation = uiGeneration;
         const auto current = presets.currentSound();
         auto* dialog = new juce::AlertWindow(rename ? "Rename preset" : "Save preset as",
             rename ? "Rename the saved user preset." : "Store all current sound settings as your own preset.", juce::MessageBoxIconType::NoIcon, this);
@@ -199,25 +331,44 @@ private:
         dialog->addButton(rename ? "Rename" : "Save", 1, juce::KeyPress(juce::KeyPress::returnKey));
         dialog->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
         const juce::Component::SafePointer<PresetBar> safe(this);
-        dialog->enterModalState(true, juce::ModalCallbackFunction::create([safe, dialog, rename, afterSave, current](int result) {
-            if (safe == nullptr || result != 1) return;
+        const juce::Component::SafePointer<juce::AlertWindow> dialogLifetime(dialog);
+        ownedModals.emplace_back(dialog);
+        dialog->enterModalState(true, juce::ModalCallbackFunction::create([safe, generation, dialogLifetime, rename, afterSave, current](int result) {
+            if (safe == nullptr || ! safe->acceptsCallback(generation) || dialogLifetime == nullptr || result != 1) return;
             if (! rename && ! safe->checkSound(current)) return;
-            const auto status = rename ? safe->presets.renameCurrent(dialog->getTextEditorContents("name"), current.id)
-                : safe->presets.saveAs(dialog->getTextEditorContents("name"), dialog->getTextEditorContents("category"));
-            safe->report(status);
-            if (status.wasOk() && afterSave) afterSave();
+            const auto name = dialogLifetime->getTextEditorContents("name");
+            const auto category = rename ? juce::String() : dialogLifetime->getTextEditorContents("category");
+            if (applyAndReport(safe, generation, [rename, name, category, id = current.id](PresetLibrary& library) {
+                    return rename ? library.renameCurrent(name, id) : library.saveAs(name, category);
+                }) && afterSave) afterSave();
         }), true);
+        if (safe == nullptr || ! safe->acceptsCallback(generation)) cancelModal(dialogLifetime.getComponent());
     }
     void showManagement()
     {
+        if (! canOpenUi()) return;
+        auto* editor = findParentComponentOfClass<juce::AudioProcessorEditor>();
+        if (editor == nullptr) return;
+        // A private, editor-sized parent gives this menu an explicit lifetime.
+        // Destroying it cancels only our menu, including on hide/peer changes.
+        managementParent = std::make_unique<juce::Component>();
+        managementParent->setName("Preset management menu owner");
+        managementParent->setBounds(editor->getLocalBounds());
+        managementParent->setInterceptsMouseClicks(false, true);
+        editor->addAndMakeVisible(*managementParent);
+        const juce::Component::SafePointer<juce::Component> menuOwner(managementParent.get());
+        const auto generation = uiGeneration;
         const auto current = presets.current();
         juce::PopupMenu menu;
         menu.addItem(1, "Rename...", current.factoryIndex < 0);
         menu.addItem(2, "Delete...", current.factoryIndex < 0);
         menu.addSeparator(); menu.addItem(3, "Import preset..."); menu.addItem(4, "Export current sound...");
         const juce::Component::SafePointer<PresetBar> safe(this);
-        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&manage), [safe, current](int result) {
-            if (safe == nullptr) return;
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&manage)
+            .withParentComponent(menuOwner.getComponent()).withDeletionCheck(*this), [safe, generation, menuOwner, current](int result) {
+            if (safe == nullptr || ! safe->acceptsCallback(generation) || menuOwner == nullptr
+                || safe->managementParent.get() != menuOwner.getComponent()) return;
+            safe->managementParent.reset();
             if ((result == 1 || result == 2) && safe->presets.current().id != current.id)
             {
                 safe->report(juce::Result::fail("The selected preset changed while the menu was open. Please choose the action again."));
@@ -225,15 +376,21 @@ private:
             }
             if (result == 1) safe->nameDialog(true);
             if (result == 2)
-                juce::AlertWindow::showAsync(juce::MessageBoxOptions().withIconType(juce::MessageBoxIconType::QuestionIcon)
+                safe->showMessage(juce::MessageBoxOptions().withIconType(juce::MessageBoxIconType::QuestionIcon)
                     .withTitle("Delete user preset?").withMessage("Delete " + current.name + " from the library? The current sound remains in this project.")
                     .withButton("Delete").withButton("Cancel").withAssociatedComponent(safe.getComponent()),
-                    [safe, current](int choice) { if (safe != nullptr && choice == 1 && safe->presets.current().id == current.id) safe->report(safe->presets.deleteCurrent()); });
+                    [safe, generation, current](int choice) {
+                        if (safe != nullptr && safe->acceptsCallback(generation) && choice == 1
+                            && safe->presets.current().id == current.id)
+                            applyAndReport(safe, generation, [](PresetLibrary& library) { return library.deleteCurrent(); });
+                    });
             if (result == 3 || result == 4) safe->chooseFile(result == 3);
         });
     }
     void chooseFile(bool importing)
     {
+        if (! canOpenUi()) return;
+        const auto generation = uiGeneration;
         const auto originalSound = presets.currentSound();
         chooser = std::make_unique<juce::FileChooser>(importing ? "Import preset" : "Export current sound",
             juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
@@ -241,14 +398,18 @@ private:
         const juce::Component::SafePointer<PresetBar> safe(this);
         const auto flags = importing ? juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles
             : juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles | juce::FileBrowserComponent::warnAboutOverwriting;
-        chooser->launchAsync(flags, [safe, importing, originalSound](const juce::FileChooser& completed) {
-            if (safe == nullptr || completed.getResult() == juce::File()) return;
+        chooser->launchAsync(flags, [safe, generation, importing, originalSound](const juce::FileChooser& completed) {
+            if (safe == nullptr || ! safe->acceptsCallback(generation) || safe->chooser.get() != &completed
+                || completed.getResult() == juce::File()) return;
+            const auto file = completed.getResult();
             if (importing)
             {
-                Preset imported; const auto status = safe->presets.importPreset(completed.getResult(), imported);
-                safe->report(status); if (status.wasOk()) safe->requestLoad(imported);
+                Preset imported;
+                if (applyAndReport(safe, generation, [file, &imported](PresetLibrary& library) { return library.importPreset(file, imported); }))
+                    safe->requestLoad(imported);
             }
-            else if (safe->checkSound(originalSound)) safe->report(safe->presets.exportCurrent(completed.getResult()));
+            else if (safe->checkSound(originalSound))
+                applyAndReport(safe, generation, [file](PresetLibrary& library) { return library.exportCurrent(file); });
         });
     }
     bool checkSound(const Preset& expected)
@@ -259,7 +420,8 @@ private:
     }
     void report(const juce::Result& result)
     {
-        if (result.failed()) juce::AlertWindow::showAsync(juce::MessageBoxOptions()
+        if (destroying || cancellingUi) return;
+        if (result.failed()) showMessage(juce::MessageBoxOptions()
             .withIconType(juce::MessageBoxIconType::WarningIcon).withTitle("Preset library")
             .withMessage(result.getErrorMessage()).withButton("OK").withAssociatedComponent(this),
             [](int) {}); // A null callback can enter a nested modal loop in JUCE.
@@ -267,6 +429,7 @@ private:
     }
     void timerCallback() override
     {
+        pruneUiHandles();
         const auto preset = presets.current();
         browse.setButtonText((preset.factoryIndex >= 0 ? "Factory / " : "User / ") + preset.name + (presets.isModified() ? " *" : "") + juce::String::fromUTF8("  ▾"));
         browse.setTooltip(preset.category + ": " + preset.description + "\n* indicates unsaved changes.");
@@ -278,6 +441,12 @@ private:
     std::vector<Preset> entries;
     int sourceFilter = 1;
     juce::String searchFilter, categoryFilter;
+    std::uint64_t uiGeneration = 0;
+    bool destroying = false, cancellingUi = false;
+    std::vector<juce::Component::SafePointer<juce::Component>> ownedModals;
+    std::vector<std::shared_ptr<MessageScope>> messageScopes;
+    std::unique_ptr<juce::Component> managementParent;
     std::unique_ptr<juce::FileChooser> chooser;
+    OwnerWatcher ownerWatcher;
 };
 } // namespace wk
