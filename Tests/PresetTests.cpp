@@ -140,6 +140,46 @@ void pump()
         juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
     require(*serviced, "UI queue barrier completed");
 }
+template <typename ComponentType>
+void waitForDeletion(juce::Component::SafePointer<ComponentType> component, const char* description)
+{
+    require(juce::MessageManager::getInstance()->isThisTheMessageThread(), "modal teardown waits on message thread");
+    const auto started = juce::Time::getMillisecondCounterHiRes();
+    constexpr double timeoutMs = 2000.0;
+    while (component != nullptr)
+    {
+        if (juce::Time::getMillisecondCounterHiRes() - started >= timeoutMs)
+        {
+            std::fprintf(stderr, "TEARDOWN_TIMEOUT: %s still alive after %.0f ms (modal=%d visible=%d activeModals=%d)\n",
+                         description, juce::Time::getMillisecondCounterHiRes() - started,
+                         component->isCurrentlyModal() ? 1 : 0, component->isVisible() ? 1 : 0,
+                         juce::Component::getNumCurrentlyModalComponents());
+            throw std::runtime_error(juce::String("Modal component was not destroyed: ").toStdString() + description);
+        }
+        require(juce::MessageManager::getInstance()->runDispatchLoopUntil(10),
+                "message dispatch stopped before modal component destruction");
+    }
+    std::printf("UI teardown: %s destroyed\n", description);
+}
+void closeAlertAndWait(juce::AlertWindow* dialog, int result, const char* description)
+{
+    require(dialog != nullptr, "alert exists before explicit close");
+    juce::Component::SafePointer<juce::AlertWindow> lifetime(dialog);
+    dialog->exitModalState(result);
+    waitForDeletion(lifetime, description);
+    pump(); // Preserve dispatch of follow-up alerts/callbacks checked by the caller.
+}
+void dismissCalloutAndWait(juce::CallOutBox* callout)
+{
+    require(callout != nullptr, "callout exists before explicit dismissal");
+    juce::Component::SafePointer<juce::CallOutBox> lifetime(callout);
+    callout->dismiss();
+    // dismiss() posts a command; ending the modal state queues another update.
+    // A single queue barrier does not establish destruction of this component.
+    waitForDeletion(lifetime, "preset browser callout");
+    require(juce::Component::getNumCurrentlyModalComponents() == 0,
+            "no active modal components remain before editor/JUCE cleanup");
+}
 void writePNG(juce::Component& component, const juce::File& file)
 {
     const auto image = component.createComponentSnapshot(component.getLocalBounds());
@@ -405,7 +445,7 @@ int main(int argc, char** argv)
         dialog->getTextEditor("category")->setText("UI Tests");
         writePNG(*dialog, artifacts.getChildFile("save-dialog.png"));
         std::printf("UI: confirming Save As\n");
-        dialog->exitModalState(1); pump();
+        closeAlertAndWait(dialog, 1, "Save As confirmation");
         require(p.presets.current().name == "UI Saved Sound", "Save As dialog callback writes preset");
         set(p, "output", -13.2f);
         auto* saveButton = findButton(*editor, "Save preset"); require(saveButton != nullptr, "Save button exists");
@@ -417,13 +457,13 @@ int main(int argc, char** argv)
         nextButton->onClick(); pump();
         dialog = dynamic_cast<juce::AlertWindow*>(juce::Component::getCurrentlyModalComponent());
         require(dialog != nullptr, "dirty navigation prompts before replacing sound");
-        dialog->exitModalState(0); pump(); sameValues(p, beforeCancel);
+        closeAlertAndWait(dialog, 0, "unsaved changes Cancel"); sameValues(p, beforeCancel);
         require(p.presets.isModified(), "cancel preserves dirty sound");
         std::printf("UI: dirty navigation\n");
         nextButton->onClick(); pump();
         dialog = dynamic_cast<juce::AlertWindow*>(juce::Component::getCurrentlyModalComponent());
         require(dialog != nullptr, "dirty navigation prompts again");
-        dialog->exitModalState(2); pump(); require(! p.presets.isModified(), "discard then load works");
+        closeAlertAndWait(dialog, 2, "unsaved changes Discard"); require(! p.presets.isModified(), "discard then load works");
         std::printf("UI: protecting asynchronous dialogs from DAW changes\n");
         set(p, "output", -14.6f);
         nextButton->onClick(); pump();
@@ -431,10 +471,10 @@ int main(int argc, char** argv)
         require(dialog != nullptr, "dirty dialog opens for stale action test");
         p.setCurrentProgram(5); set(p, "output", -12.4f);
         const auto hostSound = p.presets.currentSound();
-        dialog->exitModalState(2); pump();
+        closeAlertAndWait(dialog, 2, "stale Discard confirmation");
         require(p.presets.isCurrentSound(hostSound), "stale Discard cannot replace new DAW sound");
         dialog = waitForAlert("Preset library");
-        dialog->exitModalState(0); pump();
+        closeAlertAndWait(dialog, 0, "stale Discard warning");
         const auto usersBeforeStaleSave = p.presets.userPresets().size();
         saveAsButton->onClick();
         dialog = dynamic_cast<juce::AlertWindow*>(juce::Component::getCurrentlyModalComponent());
@@ -442,10 +482,10 @@ int main(int argc, char** argv)
         dialog->getTextEditor("name")->setText("Should not save");
         set(p, "output", -11.1f);
         const auto automatedSound = p.presets.currentSound();
-        dialog->exitModalState(1); pump();
+        closeAlertAndWait(dialog, 1, "stale Save As confirmation");
         require(p.presets.userPresets().size() == usersBeforeStaleSave && p.presets.isCurrentSound(automatedSound), "stale Save As preserves library and automated sound");
         dialog = waitForAlert("Preset library");
-        dialog->exitModalState(0); pump();
+        closeAlertAndWait(dialog, 0, "stale Save As warning");
         p.setCurrentProgram(3);
         auto* browseButton = findButton(*editor, "Browse presets"); require(browseButton != nullptr, "Browser button exists");
         std::printf("UI: browser\n");
@@ -467,7 +507,7 @@ int main(int argc, char** argv)
         search->setText("UI Saved Sound", false); search->onTextChange(); require(list != nullptr && list->getListBoxModel() != nullptr && list->getListBoxModel()->getNumRows() == 1, "Browser search filters user preset");
         require(search != nullptr, "Browser search still open");
         search->setText("no such preset 917239", false); search->onTextChange(); require(list != nullptr && list->getListBoxModel() != nullptr && list->getListBoxModel()->getNumRows() == 0, "Browser empty search state");
-        callout->dismiss(); pump();
+        dismissCalloutAndWait(callout);
         std::printf("PASS: editor sizes, Save As/Save UI, unsaved Cancel/Discard, browser and search.\n");
         return 0;
     }
