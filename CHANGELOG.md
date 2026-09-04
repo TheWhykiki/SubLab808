@@ -7,6 +7,8 @@
 - Add persistent user presets with Save/Save As, rename, delete, validated import/export and conflict-safe atomic writes.
 - Preserve user preset identity, baseline and unsaved edits in DAW state; protect edited sounds during browser navigation.
 - Add persistence, invalid-file, UI and complete-bank audio tests to CI.
+- Save As and Export store the sound frozen when their dialog opened, so host automation during the dialog no longer cancels the action or alters the stored file.
+- Size the program-change parameter-update buffer from the factory bank, removing a latent overflow if the preset schema grows.
 
 ## Unreleased
 

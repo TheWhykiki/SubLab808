@@ -27,7 +27,7 @@ The interactive part requires a desktop display. Tests use a temporary library a
 
 - Managed exports (including directory symlinks) are rejected without changing stored bytes. Ordinary exports, including UTF-8 file paths, remain supported.
 - Load, Save and Rename reject mismatched file identities; Import can recover the file under a fresh identity.
-- Pending Discard and Save As actions preserve a sound changed by the DAW while the dialog was open. Export uses the same sound guard.
+- Pending Discard actions preserve a sound changed by the DAW while the dialog was open. Save As and Export store the sound frozen when their dialog opened: automation during the dialog neither cancels the action nor leaks into the stored file. Rename remains guarded by the preset identity.
 - Error alerts use an explicit asynchronous callback, avoiding nested modal loops when JUCE permits modal dispatch.
 - Regression UI checks wait for the requested alert across queue turns.
 - The complete local preset suites pass for both products; DSP and host checks remain green. No DSP, parameter or build configuration changed in this follow-up.
@@ -38,3 +38,10 @@ The interactive part requires a desktop display. Tests use a temporary library a
 - Clear resets search, source and category together, including recovery from an empty result set.
 - Both full preset suites, including 384 combined audio renders and the added browser checks, pass. Browser and favourites snapshots were inspected.
 - Both VST3 targets rebuild successfully; strict signature checks pass (SubLab808 arm64, ReverseLab arm64/x86_64). The rebuilt SubLab808 bundle also passes its host-load test.
+
+## Follow-up: frozen-snapshot Save As/Export and bounded program updates
+
+- Save As and Export now write the sound frozen when their dialog opened instead of cancelling on any concurrent host change; the live (automated) sound stays untouched and is marked as edited relative to the new baseline. The stale-dialog UI test asserts the stored file keeps dialog-time values.
+- The dirty-navigation Discard/Save guard and the Rename identity guard are unchanged.
+- applyProgramNow sizes its parameter-update buffer from the data-driven factory bank instead of a fixed capacity, removing a latent overflow if FactoryPresets.json gains a parameter. Program changes run on the control path, never inside processBlock.
+- Local suites have not been re-run in this environment; run SubLab808Tests, SubLab808HostTests and SubLab808PresetTests (desktop display required) before release.

@@ -226,9 +226,11 @@ private:
         const juce::Component::SafePointer<PresetBar> safe(this);
         dialog->enterModalState(true, juce::ModalCallbackFunction::create([safe, dialog, rename, afterSave, current](int result) {
             if (safe == nullptr || result != 1) return;
-            if (! rename && ! safe->checkSound(current)) return;
+            // Save the sound frozen when the dialog opened: the user named what they
+            // saw, so host automation during the dialog neither cancels the save nor
+            // changes the stored values. Rename stays guarded by the preset identity.
             const auto status = rename ? safe->presets.renameCurrent(dialog->getTextEditorContents("name"), current.id)
-                : safe->presets.saveAs(dialog->getTextEditorContents("name"), dialog->getTextEditorContents("category"));
+                : safe->presets.saveAs(current, dialog->getTextEditorContents("name"), dialog->getTextEditorContents("category"));
             safe->report(status);
             if (status.wasOk() && afterSave) afterSave();
         }), true);
@@ -273,7 +275,7 @@ private:
                 Preset imported; const auto status = safe->presets.importPreset(completed.getResult(), imported);
                 safe->report(status); if (status.wasOk()) safe->requestLoad(imported);
             }
-            else if (safe->checkSound(originalSound)) safe->report(safe->presets.exportCurrent(completed.getResult()));
+            else safe->report(safe->presets.exportPreset(originalSound, completed.getResult()));
         });
     }
     bool checkSound(const Preset& expected)

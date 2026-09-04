@@ -373,13 +373,23 @@ int main(int argc, char** argv)
         saveAsButton->onClick();
         dialog = dynamic_cast<juce::AlertWindow*>(juce::Component::getCurrentlyModalComponent());
         require(dialog != nullptr, "Save As opens for stale action test");
-        dialog->getTextEditor("name")->setText("Should not save");
+        const auto frozenOutput = p.parameters.getRawParameterValue("output")->load();
+        dialog->getTextEditor("name")->setText("Frozen Snapshot");
         set(p, "output", -11.1f);
-        const auto automatedSound = p.presets.currentSound();
+        const auto automatedValues = values(p);
         dialog->exitModalState(1); pump();
-        require(p.presets.userPresets().size() == usersBeforeStaleSave && p.presets.isCurrentSound(automatedSound), "stale Save As preserves library and automated sound");
-        dialog = waitForAlert("Preset library");
-        dialog->exitModalState(0); pump();
+        // Save As stores the sound frozen when the dialog opened; automation during
+        // the dialog neither cancels the save nor leaks into the stored file.
+        const auto usersAfterFrozenSave = p.presets.userPresets();
+        require(usersAfterFrozenSave.size() == usersBeforeStaleSave + 1, "Save As under automation stores the frozen snapshot");
+        bool frozenStored = false;
+        for (const auto& user : usersAfterFrozenSave)
+            if (user.name == "Frozen Snapshot")
+                frozenStored = std::abs(user.values.at("output") - frozenOutput) < 0.0001f
+                    && std::abs(user.values.at("output") - (-11.1f)) > 0.5f;
+        require(frozenStored, "stored preset keeps dialog-time values, not automated ones");
+        sameValues(p, automatedValues);
+        require(p.presets.isModified(), "automated sound stays live and marked as edited");
         p.setCurrentProgram(3);
         auto* browseButton = findButton(*editor, "Browse presets"); require(browseButton != nullptr, "Browser button exists");
         std::printf("UI: browser\n");

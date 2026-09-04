@@ -129,11 +129,18 @@ public:
 
     juce::Result saveAs(const juce::String& name, const juce::String& category)
     {
+        return saveAs(capture(), name, category);
+    }
+    // Dialog callers pass the sound frozen when the dialog opened: the user names
+    // the sound they saw, so later host automation must not cancel the save nor
+    // leak into the stored file.
+    juce::Result saveAs(const Preset& sound, const juce::String& name, const juce::String& category)
+    {
         if (auto result = validateName(name); result.failed()) return result;
         if (! fileLock.enter(2000)) return busy();
         const juce::ScopeGuard unlock { [this] { fileLock.exit(); } };
         if (nameExists(name.trim())) return juce::Result::fail("A user preset with this name already exists. Choose another name.");
-        auto preset = capture();
+        auto preset = sound;
         preset.id = juce::Uuid().toString(); preset.name = name.trim();
         preset.category = category.trim().substring(0, 48); preset.factoryIndex = -1;
         if (preset.category.isEmpty()) preset.category = "User";
@@ -244,7 +251,10 @@ public:
         imported = std::move(preset);
         return juce::Result::ok();
     }
-    juce::Result exportCurrent(const juce::File& file) const
+    juce::Result exportCurrent(const juce::File& file) const { return exportPreset(capture(), file); }
+    // As with saveAs above, file-chooser callers pass the sound frozen when the
+    // chooser opened so a concurrent host change cannot cancel or alter the export.
+    juce::Result exportPreset(Preset sound, const juce::File& file) const
     {
         // Export must not bypass Save's conflict checks or replace another UUID's
         // managed file, making that preset disappear from the library.
@@ -253,10 +263,9 @@ public:
         if (auto result = resolvePath(directory, resolvedDirectory); result.failed()) return result;
         if (resolvedFile == resolvedDirectory || resolvedFile.isAChildOf(resolvedDirectory))
             return juce::Result::fail("Choose an export location outside the preset library. Use Save or Save As to store a library preset.");
-        auto preset = capture();
-        if (preset.factoryIndex >= 0) preset.id = juce::Uuid().toString();
-        preset.factoryIndex = -1;
-        return writeFile(file, preset);
+        if (sound.factoryIndex >= 0) sound.id = juce::Uuid().toString();
+        sound.factoryIndex = -1;
+        return writeFile(file, sound);
     }
 
     bool isFavourite(const juce::String& id) const { return safeIdentity(id) && favouritePath(id).existsAsFile(); }
