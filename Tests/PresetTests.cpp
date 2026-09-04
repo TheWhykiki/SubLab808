@@ -67,7 +67,16 @@ struct TestWindow final : juce::DocumentWindow
     ~TestWindow() override { clearContentComponent(); }
     void closeButtonPressed() override { setVisible(false); }
 };
-void pump() { juce::MessageManager::getInstance()->runDispatchLoopUntil(60); }
+void pump()
+{
+    // Wait for the queued callbacks, not an arbitrary wall-clock delay. Busy CI
+    // machines may need more than 60 ms to dispatch a modal completion callback.
+    auto serviced = std::make_shared<bool>(false);
+    require(juce::MessageManager::callAsync([serviced] { *serviced = true; }), "post UI queue barrier");
+    for (int attempt = 0; attempt < 200 && ! *serviced; ++attempt)
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+    require(*serviced, "UI queue barrier completed");
+}
 void writePNG(juce::Component& component, const juce::File& file)
 {
     const auto image = component.createComponentSnapshot(component.getLocalBounds());
@@ -83,7 +92,8 @@ int main(int argc, char** argv)
     const auto root = juce::File::getSpecialLocation(juce::File::tempDirectory).getNonexistentChildFile("whykiki-preset-tests", "", false);
     root.createDirectory();
     const juce::ScopeGuard cleanup { [&] { root.deleteRecursively(); } };
-    const auto artifacts = argc > 1 ? juce::File(argv[1]) : root.getChildFile("Artifacts");
+    const auto outputPath = juce::SystemStats::getEnvironmentVariable("WHYKIKI_PRESET_TEST_OUTPUT_DIR", {});
+    const auto artifacts = argc > 1 ? juce::File(argv[1]) : outputPath.isNotEmpty() ? juce::File(outputPath) : root.getChildFile("Artifacts");
     artifacts.createDirectory();
     try
     {
@@ -182,6 +192,16 @@ int main(int argc, char** argv)
         require(p.presets.deleteCurrent().failed() && p.presets.renameCurrent("No").failed() && p.presets.save().failed(), "factory protected");
         ok(p.presets.exportCurrent(root.getChildFile("Factory" + p.presets.extension())));
         ok(p.presets.setFavourite(saved.id, false)); require(! p.presets.isFavourite(saved.id), "favourite removal persists");
+        {
+            Processor renameGuard(root.getChildFile("RenameGuardLibrary"));
+            ok(renameGuard.presets.saveAs("Alpha", "User"));
+            const auto alphaId = renameGuard.presets.current().id;
+            ok(renameGuard.presets.saveAs("Beta", "User"));
+            require(renameGuard.presets.renameCurrent("Wrong target", alphaId).failed(), "stale rename dialog cannot rename another preset");
+            require(renameGuard.presets.current().name == "Beta", "stale rename preserves current identity");
+            const auto savedNames = renameGuard.presets.userPresets();
+            require(savedNames.size() == 2 && savedNames[0].name == "Alpha" && savedNames[1].name == "Beta", "stale rename preserves both files");
+        }
         std::printf("PASS: 64 recipes; save/load/rename/delete/import/export/favourites; project recall; invalid files; conflicts; write errors.\n");
 
         // Render every actual recipe at several tempi/pitches. Check silence, non-finite

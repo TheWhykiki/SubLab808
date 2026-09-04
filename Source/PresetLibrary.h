@@ -182,10 +182,12 @@ public:
         return juce::Result::ok();
     }
 
-    juce::Result renameCurrent(const juce::String& name)
+    juce::Result renameCurrent(const juce::String& name, const juce::String& expectedId = {})
     {
         if (auto result = validateName(name); result.failed()) return result;
         const auto active = current();
+        if (expectedId.isNotEmpty() && active.id != expectedId)
+            return juce::Result::fail("The selected preset changed while the dialog was open. Rename was cancelled.");
         if (active.factoryIndex >= 0) return juce::Result::fail("Factory presets cannot be renamed.");
         if (! fileLock.enter(2000)) return busy();
         const juce::ScopeGuard unlock { [this] { fileLock.exit(); } };
@@ -194,8 +196,13 @@ public:
         if (auto result = readFile(pathFor(active.id), disk); result.failed()) return result;
         disk.name = name.trim();
         if (auto result = writeFile(pathFor(disk.id), disk); result.failed()) return result;
-        auto renamed = active; renamed.name = disk.name; // Preserve the in-memory dirty baseline.
-        select(renamed);
+        {
+            const juce::ScopedLock lock(selectionLock);
+            // A host state change during disk I/O must not relabel a different sound.
+            // Only the name changes; retain the current in-memory dirty baseline.
+            if (selected.id == active.id) selected.name = disk.name;
+        }
+        changed();
         return juce::Result::ok();
     }
 

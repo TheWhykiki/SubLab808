@@ -8,6 +8,8 @@ Local Release verification on 2026-09-04:
 - 192 rendered scenarios (64 presets × 3 MIDI pitches/velocities), 48 kHz; all finite, audible, peak ≤ 1.001.
 - Observed peak range: 0.401785–0.738917. 64 different combined audio fingerprints.
 - User save/load, overwrite, rename, delete, import/export and favourites passed.
+- A stale Rename dialog cannot rename a different preset after a host-state change.
+- UI tests wait for queued callbacks using a message barrier, rather than relying on a fixed delay.
 - Invalid/foreign/future-version files, duplicate names including umlauts, missing values, invalid numbers, write failures and stale-instance saves rejected without changing the sound/library.
 - DAW recall restores all values, user name and unsaved edits even without the external preset file.
 - A real desktop test window exercises Save As, Save, dirty-navigation Cancel/Discard, browser and search.
