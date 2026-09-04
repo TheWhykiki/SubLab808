@@ -178,28 +178,31 @@ private:
     {
         const juce::Component::SafePointer<PresetBar> safe(this);
         if (! presets.isModified()) { report(presets.load(preset)); return; }
+        const auto originalSound = presets.currentSound();
         juce::AlertWindow::showAsync(juce::MessageBoxOptions().withIconType(juce::MessageBoxIconType::QuestionIcon)
             .withTitle("Unsaved preset changes").withMessage("Save your current sound before loading " + preset.name + "?")
             .withButton("Save As...").withButton("Discard changes").withButton("Cancel").withAssociatedComponent(this),
-            [safe, preset](int result) {
-                if (safe == nullptr) return;
+            [safe, preset, originalSound](int result) {
+                if (safe == nullptr || (result != 1 && result != 2)) return;
+                if (! safe->checkSound(originalSound)) return;
                 if (result == 1) safe->nameDialog(false, [safe, preset] { if (safe != nullptr) safe->report(safe->presets.load(preset)); });
                 else if (result == 2) safe->report(safe->presets.load(preset));
             });
     }
     void nameDialog(bool rename, std::function<void()> afterSave = {})
     {
-        const auto current = presets.current();
+        const auto current = presets.currentSound();
         auto* dialog = new juce::AlertWindow(rename ? "Rename preset" : "Save preset as",
             rename ? "Rename the saved user preset." : "Store all current sound settings as your own preset.", juce::MessageBoxIconType::NoIcon, this);
-        dialog->addTextEditor("name", rename ? current.name : current.name + " Copy", "Name");
+        dialog->addTextEditor("name", rename ? current.name : current.name.substring(0, 75) + " Copy", "Name");
         if (! rename) dialog->addTextEditor("category", current.category, "Category");
         dialog->addButton(rename ? "Rename" : "Save", 1, juce::KeyPress(juce::KeyPress::returnKey));
         dialog->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
         const juce::Component::SafePointer<PresetBar> safe(this);
-        dialog->enterModalState(true, juce::ModalCallbackFunction::create([safe, dialog, rename, afterSave, originalId = current.id](int result) {
+        dialog->enterModalState(true, juce::ModalCallbackFunction::create([safe, dialog, rename, afterSave, current](int result) {
             if (safe == nullptr || result != 1) return;
-            const auto status = rename ? safe->presets.renameCurrent(dialog->getTextEditorContents("name"), originalId)
+            if (! rename && ! safe->checkSound(current)) return;
+            const auto status = rename ? safe->presets.renameCurrent(dialog->getTextEditorContents("name"), current.id)
                 : safe->presets.saveAs(dialog->getTextEditorContents("name"), dialog->getTextEditorContents("category"));
             safe->report(status);
             if (status.wasOk() && afterSave) afterSave();
@@ -215,6 +218,11 @@ private:
         const juce::Component::SafePointer<PresetBar> safe(this);
         menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&manage), [safe, current](int result) {
             if (safe == nullptr) return;
+            if ((result == 1 || result == 2) && safe->presets.current().id != current.id)
+            {
+                safe->report(juce::Result::fail("The selected preset changed while the menu was open. Please choose the action again."));
+                return;
+            }
             if (result == 1) safe->nameDialog(true);
             if (result == 2)
                 juce::AlertWindow::showAsync(juce::MessageBoxOptions().withIconType(juce::MessageBoxIconType::QuestionIcon)
@@ -226,26 +234,35 @@ private:
     }
     void chooseFile(bool importing)
     {
+        const auto originalSound = presets.currentSound();
         chooser = std::make_unique<juce::FileChooser>(importing ? "Import preset" : "Export current sound",
             juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
                 .getChildFile(juce::File::createLegalFileName(presets.current().name) + presets.extension()), "*" + presets.extension());
         const juce::Component::SafePointer<PresetBar> safe(this);
         const auto flags = importing ? juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles
             : juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles | juce::FileBrowserComponent::warnAboutOverwriting;
-        chooser->launchAsync(flags, [safe, importing](const juce::FileChooser& completed) {
+        chooser->launchAsync(flags, [safe, importing, originalSound](const juce::FileChooser& completed) {
             if (safe == nullptr || completed.getResult() == juce::File()) return;
             if (importing)
             {
                 Preset imported; const auto status = safe->presets.importPreset(completed.getResult(), imported);
                 safe->report(status); if (status.wasOk()) safe->requestLoad(imported);
             }
-            else safe->report(safe->presets.exportCurrent(completed.getResult()));
+            else if (safe->checkSound(originalSound)) safe->report(safe->presets.exportCurrent(completed.getResult()));
         });
+    }
+    bool checkSound(const Preset& expected)
+    {
+        if (presets.isCurrentSound(expected)) return true;
+        report(juce::Result::fail("The sound changed while the dialog was open. The action was cancelled to preserve the current sound. Please try again."));
+        return false;
     }
     void report(const juce::Result& result)
     {
-        if (result.failed()) juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon,
-            "Preset library", result.getErrorMessage(), "OK", this);
+        if (result.failed()) juce::AlertWindow::showAsync(juce::MessageBoxOptions()
+            .withIconType(juce::MessageBoxIconType::WarningIcon).withTitle("Preset library")
+            .withMessage(result.getErrorMessage()).withButton("OK").withAssociatedComponent(this),
+            [](int) {}); // A null callback can enter a nested modal loop in JUCE.
         refreshEntries(); timerCallback();
     }
     void timerCallback() override

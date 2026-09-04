@@ -84,6 +84,18 @@ void writePNG(juce::Component& component, const juce::File& file)
     stream.setPosition(0); stream.truncate();
     require(stream.openedOk() && png.writeImageToStream(image, stream), "write UI preview");
 }
+juce::AlertWindow* waitForAlert(const juce::String& title)
+{
+    // A warning scheduled from a modal completion is delivered on a later queue
+    // turn than that completion. Wait for that alert, not the first queue barrier.
+    for (int attempt = 0; attempt < 100; ++attempt)
+    {
+        if (auto* alert = dynamic_cast<juce::AlertWindow*>(juce::Component::getCurrentlyModalComponent());
+            alert != nullptr && alert->getName() == title) return alert;
+        pump();
+    }
+    throw std::runtime_error("Expected asynchronous alert did not open");
+}
 }
 int main(int argc, char** argv)
 {
@@ -161,7 +173,7 @@ int main(int argc, char** argv)
         Processor portable(root.getChildFile("OtherLibrary")); portable.setStateInformation(project.getData(), static_cast<int>(project.getSize()));
         sameValues(portable, edited);
         require(portable.presets.isModified(), "project baseline remains independent of library files");
-        const auto exported = root.getChildFile("Export" + p.presets.extension());
+        const auto exported = root.getChildFile(juce::String::fromUTF8("Export Grüße") + p.presets.extension());
         ok(p.presets.exportCurrent(exported)); require(p.presets.isModified(), "export does not clear unsaved state");
         wk::Preset imported; ok(p.presets.importPreset(exported, imported));
         require(imported.id != saved.id && imported.name == "Renamed Sound (2)", "import uses new identity and resolves duplicate name");
@@ -201,6 +213,40 @@ int main(int argc, char** argv)
             require(renameGuard.presets.current().name == "Beta", "stale rename preserves current identity");
             const auto savedNames = renameGuard.presets.userPresets();
             require(savedNames.size() == 2 && savedNames[0].name == "Alpha" && savedNames[1].name == "Beta", "stale rename preserves both files");
+        }
+        {
+            Processor guarded(root.getChildFile("GuardedLibrary"));
+            ok(guarded.presets.saveAs("Original", "User"));
+            const auto originalPreset = guarded.presets.current();
+            const auto storedFile = guarded.presets.storageDirectory().getChildFile(originalPreset.id + guarded.presets.extension());
+            const auto storedBytes = storedFile.loadFileAsString();
+            set(guarded, "output", -7.5f);
+            require(guarded.presets.exportCurrent(storedFile).failed(), "export cannot bypass managed Save");
+            require(storedFile.loadFileAsString() == storedBytes, "rejected export preserves stored file");
+#if JUCE_MAC || JUCE_LINUX
+            const auto aliasDirectory = root.getChildFile("LibraryAlias");
+            require(guarded.presets.storageDirectory().createSymbolicLink(aliasDirectory, false), "create library symlink fixture");
+            require(guarded.presets.exportCurrent(aliasDirectory.getChildFile(storedFile.getFileName())).failed(), "directory symlink cannot bypass managed Save");
+            require(storedFile.loadFileAsString() == storedBytes, "rejected symlink export preserves stored bytes");
+#endif
+            guarded.setCurrentProgram(2);
+            require(guarded.presets.exportCurrent(storedFile).failed(), "factory export cannot replace a user preset");
+            require(storedFile.loadFileAsString() == storedBytes, "factory export preserves user identity and values");
+            ok(guarded.presets.load(originalPreset));
+            auto mismatched = juce::JSON::parse(storedBytes);
+            mismatched.getDynamicObject()->setProperty("id", juce::Uuid().toString());
+            require(storedFile.replaceWithText(juce::JSON::toString(mismatched)), "write mismatched identity fixture");
+            const auto safeSound = guarded.presets.currentSound();
+            const auto mismatchedBytes = storedFile.loadFileAsString();
+            require(guarded.presets.load(originalPreset).failed(), "load rejects mismatched stored identity");
+            require(guarded.presets.save().failed(), "save rejects mismatched stored identity");
+            require(guarded.presets.renameCurrent("Wrong").failed(), "rename rejects mismatched stored identity");
+            require(guarded.presets.isCurrentSound(safeSound), "invalid library entry preserves current sound");
+            require(storedFile.loadFileAsString() == mismatchedBytes, "invalid library entry preserved for recovery");
+            wk::Preset recovered; ok(guarded.presets.importPreset(storedFile, recovered));
+            require(recovered.id != originalPreset.id, "mismatched entry recoverable by import");
+            set(guarded, "output", -6.4f);
+            require(! guarded.presets.isCurrentSound(safeSound), "sound guard detects parameter changes within same preset");
         }
         std::printf("PASS: 64 recipes; save/load/rename/delete/import/export/favourites; project recall; invalid files; conflicts; write errors.\n");
 
@@ -312,6 +358,29 @@ int main(int argc, char** argv)
         dialog = dynamic_cast<juce::AlertWindow*>(juce::Component::getCurrentlyModalComponent());
         require(dialog != nullptr, "dirty navigation prompts again");
         dialog->exitModalState(2); pump(); require(! p.presets.isModified(), "discard then load works");
+        std::printf("UI: protecting asynchronous dialogs from DAW changes\n");
+        set(p, "output", -14.6f);
+        nextButton->onClick(); pump();
+        dialog = dynamic_cast<juce::AlertWindow*>(juce::Component::getCurrentlyModalComponent());
+        require(dialog != nullptr, "dirty dialog opens for stale action test");
+        p.setCurrentProgram(5); set(p, "output", -12.4f);
+        const auto hostSound = p.presets.currentSound();
+        dialog->exitModalState(2); pump();
+        require(p.presets.isCurrentSound(hostSound), "stale Discard cannot replace new DAW sound");
+        dialog = waitForAlert("Preset library");
+        dialog->exitModalState(0); pump();
+        const auto usersBeforeStaleSave = p.presets.userPresets().size();
+        saveAsButton->onClick();
+        dialog = dynamic_cast<juce::AlertWindow*>(juce::Component::getCurrentlyModalComponent());
+        require(dialog != nullptr, "Save As opens for stale action test");
+        dialog->getTextEditor("name")->setText("Should not save");
+        set(p, "output", -11.1f);
+        const auto automatedSound = p.presets.currentSound();
+        dialog->exitModalState(1); pump();
+        require(p.presets.userPresets().size() == usersBeforeStaleSave && p.presets.isCurrentSound(automatedSound), "stale Save As preserves library and automated sound");
+        dialog = waitForAlert("Preset library");
+        dialog->exitModalState(0); pump();
+        p.setCurrentProgram(3);
         auto* browseButton = findButton(*editor, "Browse presets"); require(browseButton != nullptr, "Browser button exists");
         std::printf("UI: browser\n");
         browseButton->onClick(); pump();

@@ -23,6 +23,8 @@ Jedes Rezept ist explizit ausgearbeitet. Presets unterscheiden sich in Klangpara
 - Beim Laden über den Browser mit ungespeicherten Änderungen: Save As, Discard changes oder Cancel.
 - Factory-Presets können weder überschrieben, umbenannt noch gelöscht werden.
 - Delete fragt nach und entfernt nur die gespeicherte Datei; der aktuelle Klang bleibt im Projekt.
+- Offene Save-As-, Export- und Wechsel-Dialoge erkennen geänderte DAW-Klänge. Eine veraltete Aktion wird mit Erklärung abgebrochen; der aktuelle Klang bleibt erhalten.
+- Lange Preset-Namen erhalten bei Save As einen gültigen Vorschlag innerhalb der 80-Zeichen-Grenze.
 
 ## Speicherung und Kompatibilität
 
@@ -36,6 +38,8 @@ Dateien werden über eine temporäre Datei ersetzt. Gleichzeitige Schreibvorgän
 ein veraltetes Preset in einer zweiten Instanz darf neu gespeicherte Klangänderungen nicht unbemerkt überschreiben.
 Import validiert Produkt, Version, Namen, Vollständigkeit, Zahlentyp und Parametergrenzen, bevor etwas gespeichert wird.
 Import legt eine neue ID an und löst Namenskonflikte mit einem Suffix.
+Laden, Speichern und Umbenennen prüfen zusätzlich, ob die Datei-ID zum Bibliothekseintrag passt.
+Exportziele innerhalb des verwalteten Preset-Ordners werden auch über Verzeichnis-Symlinks erkannt und abgelehnt; Bibliothekseinträge werden über Save/Save As gespeichert. So bleiben Konfliktprüfung und Identitäten wirksam.
 Fehler zeigen eine verständliche Meldung und dürfen keine bestehenden Presets beschädigen.
 
 Der DAW-State enthält weiterhin alle aktuellen Parameter und Fenstermaße. Für eigene Presets enthält er zusätzlich
