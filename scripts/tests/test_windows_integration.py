@@ -136,6 +136,7 @@ class WindowsIntegrationContractTests(unittest.TestCase):
             "GetModuleFileNameW",
             'bundle.extension() != L".vst3"',
             'L"Contents" / L"Helpers"',
+            "std::wstring(product.toWideCharPointer())",
             "CreateProcessW(finalHelper.c_str(), nullptr",
             "WinVerifyTrust",
             "WTD_REVOKE_NONE",
@@ -169,6 +170,7 @@ class WindowsIntegrationContractTests(unittest.TestCase):
         self.assertNotIn("WTD_CACHE_ONLY_URL_RETRIEVAL", self.updater)
         self.assertNotIn("ShellExecute", self.launcher)
         self.assertNotIn("system(", self.launcher)
+        self.assertNotIn("toStdWString", self.launcher)
         self.assertIn("JUCE_WINDOWS", self.launcher_header)
         self.assertIn("Automatic updates require a signed Windows release build", self.launcher_header)
 

@@ -2299,7 +2299,7 @@ int runWindowsUpdaterSelfTests()
                     "WhykikiAudio.UpdaterBuildContract.0123456789ABCDEF0123456789ABCDEF")
                     && ! isBuildContractPipeName("\\\\.\\pipe\\attacker"),
                 "Build-contract pipe-name validation failed");
-        require(parseBuildContractProcessId("1") == 1
+        require(parseBuildContractProcessId("1") == DWORD { 1 }
                     && ! parseBuildContractProcessId("0")
                     && ! parseBuildContractProcessId("01"),
                 "Build-contract process-ID validation failed");

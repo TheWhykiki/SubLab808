@@ -199,7 +199,7 @@ juce::Result launchNativeUpdater(const juce::String& product, const juce::String
     std::filesystem::path bundle;
     if (const auto result = loadedBundle(bundle); result.failed()) return result;
     const auto helper = bundle / L"Contents" / L"Helpers"
-                      / (product.toStdWString() + std::wstring(L"Updater.exe"));
+                      / (std::wstring(product.toWideCharPointer()) + L"Updater.exe");
 
     // Deny writes/deletion while trust is checked and CreateProcess opens the
     // exact final path. The helper independently repeats its own signature pin.
