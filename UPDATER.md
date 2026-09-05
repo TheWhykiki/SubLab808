@@ -65,7 +65,7 @@ Other users' sessions may not be fully visible to the unprivileged process check
   development build newer than that release. Only newer releases are offered.
 - Stable tags: `vMAJOR.MINOR.PATCH` or `MAJOR.MINOR.PATCH`; numeric comparison;
   no prereleases, draft releases or downgrade of either standard installation.
-- Exactly one asset named `SubLab808-MAJOR.MINOR.PATCH-macOS-arm64.pkg`,
+- Exactly one asset named `SubLab808-MAJOR.MINOR.PATCH-macOS-universal.pkg`,
   in the matching release and repository. Maximum download size: 128 MiB.
 - GitHub must provide the asset's `sha256:` digest. The complete downloaded bytes
   must match both the advertised size and digest before any installation.
@@ -78,8 +78,9 @@ Other users' sessions may not be fully visible to the unprivileged process check
   exact release version, install-location `/`, non-relocatable, no installer
   scripts and no payload outside `Library/Audio/Plug-Ins/VST3/SubLab808.vst3`.
   Packaging sets strict bundle identity, version checking and complete replacement.
-- Plugin identity/version, expected Mach-O architectures and the complete code
-  signature are checked. Architecture inspection does not require end-user Xcode.
+- Plugin identity/version, exactly the `arm64` and `x86_64` Mach-O slices, their
+  macOS 11.0 deployment targets and the complete code signature are checked.
+  Architecture inspection does not require end-user Xcode.
 - Trust rests on the fixed GitHub repository over TLS, its asset digest and macOS
   package trust. There is currently no separate pinned Developer Team ID or
   independently signed update feed. Compromise of the release account remains a
@@ -88,29 +89,41 @@ Other users' sessions may not be fully visible to the unprivileged process check
 Only installations in `/Library/Audio/Plug-Ins/VST3` and
 `~/Library/Audio/Plug-Ins/VST3` are supported. Arbitrary symlinked installation paths
 are rejected. Existing custom locations need a normal installer migration.
-Only macOS is supported; non-macOS test builds disable the update button.
+This document and helper cover only macOS. Windows uses the separate native
+[updater contract](WINDOWS_UPDATER.md) and [MSI contract](WINDOWS_INSTALLER.md).
+Unsupported platforms disable the update button.
 
 ## Build and publish preparation
 
 CMake builds and embeds `Contents/Helpers/SubLab808Updater.app` before the final
-VST3 signing pass. Helper source changes also relink, re-embed and re-sign the
-VST3. Local builds use ad-hoc signing; this does not establish distribution trust.
+VST3 signing pass, signs that nested helper first, then signs the VST3 root
+without recursive `--deep` signing. Recursive strict verification follows.
+Helper source changes also relink, re-embed and re-sign the VST3. Local builds
+use ad-hoc signing; this does not establish distribution trust.
 The current source version is 1.4.0; bump `project(... VERSION ...)` for a new
 public release, build the bootstrap release containing the helper, then publish
 future strictly newer releases for in-plugin updates.
 
 Run `bash scripts/package-release.sh` on macOS with CMake, Python and Xcode tools.
 It builds a fresh source snapshot, checks generated presets, runs CTest, checks
-both the plugin and embedded helper, and validates ZIP/PKG extraction through a
-VST3 test host. It writes a new candidate directory below `dist/` with checksums
+both universal plugin/updater slices, and validates ZIP/PKG extraction through a
+VST3 test host. The package is named
+`SubLab808-MAJOR.MINOR.PATCH-macOS-universal.pkg`; the companion bundle archive
+is `SubLab808-MAJOR.MINOR.PATCH-macOS-universal-VST3.zip`. It writes a new
+candidate directory below `dist/` with checksums
 and source/test evidence; existing candidates are never overwritten. SubLab's
 pinned JUCE dependency is fetched by CMake; ReverseLab needs its JUCE submodule.
 This command neither installs locally nor publishes to GitHub.
 
 For trusted distribution, provide the existing real certificate names via
 `SUBLAB808_APPLICATION_IDENTITY` and `SUBLAB808_INSTALLER_IDENTITY`, and an existing
-keychain notary profile via `SUBLAB808_NOTARY_PROFILE`. The nested helper is signed
-before the enclosing VST3. A successful notarization is stapled and validated.
+keychain notary profile via `SUBLAB808_NOTARY_PROFILE`. Set
+`SUBLAB808_NOTARY_KEYCHAIN` to the absolute, existing regular-file path of the
+same keychain; the pipeline passes it explicitly to both `notarytool submit` and
+`notarytool log` and rejects profile-only/default-keychain fallback. The nested helper is signed
+before the enclosing VST3. A successful submission must yield a valid job UUID
+and a matching full Accepted/zero-status Apple log without error issues; both
+tickets and final Gatekeeper assessments are validated and retained as evidence.
 No credential or identity is bundled in the updater. Without these settings the
 pipeline produces a local test candidate which the updater will refuse to install.
 Upload the verified `.pkg` to the corresponding stable GitHub release; check its
@@ -127,7 +140,7 @@ a normal installation once. No installed plugin is changed by building/testing.
 (including the actual AppKit controller and HTTPClient; only the executable entry
 point is excluded) and runs three suites:
 
-- 23 policy tests: versions, product/URL/digest/Mach-O validation, package metadata,
+- 23 policy tests: versions, product/URL/digest/universal-Mach-O validation, package metadata,
   real unsigned-package rejection, symlinks, backup preservation and interrupted
   archive recovery, including a new user copy appearing after the original rename.
 - 16 controller/lifecycle tests: window closure, explicit defer, fresh-controller
@@ -148,9 +161,9 @@ Before the first public updater release, perform a full signed/notarized N-to-N+
 installation on a test Mac: user-only, system-only and duplicate installations;
 DAW still open and reopened; canceled download/Installer; offline/rate-limited API;
 invalid trust/hash; user copy changed during install; success, backup and rescan.
-Verify both supported CPU architectures where applicable. Those privileged and
-live-release scenarios require real release artifacts and are not established by
-local ad-hoc builds or mock packaging tests.
+Verify the universal package natively on both supported CPU architectures. Those
+privileged and live-release scenarios require real release artifacts and are not
+established by local ad-hoc builds or mock packaging tests.
 
 Release references: [GitHub Releases API](https://docs.github.com/en/rest/releases/releases),
 [Apple notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow).

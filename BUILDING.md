@@ -11,7 +11,7 @@
 
 ```sh
 cmake -S . -B build -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target SubLab808Tests SubLab808_VST3 SubLab808HostTests SubLab808PresetTests -j 4
+cmake --build build --target SubLab808Tests SubLab808_VST3 SubLab808HostTests SubLab808PresetTests SubLab808WindowsUpdaterPolicyTests -j 4
 ctest --test-dir build --output-on-failure
 ```
 
@@ -36,11 +36,11 @@ Windows uses separate build trees for the two supported VST3 ABIs:
 
 ```powershell
 cmake -S . -B build-windows-x64 -A x64
-cmake --build build-windows-x64 --config Release --target SubLab808Tests SubLab808_VST3 SubLab808HostTests SubLab808PresetTests --parallel
+cmake --build build-windows-x64 --config Release --target SubLab808Tests SubLab808_VST3 SubLab808HostTests SubLab808PresetTests SubLab808WindowsUpdaterPolicyTests SubLab808WindowsUpdaterSelfTests --parallel
 ctest --test-dir build-windows-x64 -C Release --output-on-failure
 
 cmake -S . -B build-windows-arm64ec -A ARM64EC
-cmake --build build-windows-arm64ec --config Release --target SubLab808Tests SubLab808_VST3 SubLab808HostTests SubLab808PresetTests --parallel
+cmake --build build-windows-arm64ec --config Release --target SubLab808Tests SubLab808_VST3 SubLab808HostTests SubLab808PresetTests SubLab808WindowsUpdaterPolicyTests SubLab808WindowsUpdaterSelfTests --parallel
 ctest --test-dir build-windows-arm64ec -C Release --output-on-failure
 ```
 
@@ -58,12 +58,29 @@ separate interactive test. CI uses the explicit GitHub-hosted Windows 11 Arm +
 Visual Studio 2026 image for ARM64EC. These checks do not replace release
 acceptance in Cubase on physical Windows x64 and Arm systems.
 
+The default Windows build compiles the complete updater in a non-installing
+self-test mode, but does not embed it or enable the editor button. A production
+build must be configured with the real SHA-256 fingerprint of its Authenticode
+distribution certificate:
+
+```powershell
+cmake -S . -B build-windows-x64 -A x64 `
+  -DSUBLAB808_WINDOWS_UPDATER_SIGNER_SHA256=<64-hex-certificate-fingerprint>
+cmake --build build-windows-x64 --config Release --target SubLab808_VST3 --parallel
+```
+
+This embeds `Contents\Helpers\SubLab808Updater.exe`. The MSI pipeline signs the
+staged helper and every PE payload before signing the MSI; see
+[WINDOWS_UPDATER.md](WINDOWS_UPDATER.md) and
+[WINDOWS_INSTALLER.md](WINDOWS_INSTALLER.md). Never substitute a dummy pin in a
+distributed build.
+
 ## Local installation
 
-On macOS, copy the bundle to `~/Library/Audio/Plug-Ins/VST3/`. On Windows, copy
-the matching architecture's bundle to `C:\Program Files\Common Files\VST3\`
-with administrator permission. Then restart Cubase or rescan plug-ins in its
-Plug-in Manager.
+On macOS, copy the bundle to `~/Library/Audio/Plug-Ins/VST3/`. On Windows, use
+the matching reviewed MSI; a development bundle may instead be copied to
+`C:\Program Files\Common Files\VST3\` with administrator permission. Then restart
+Cubase or rescan plug-ins in its Plug-in Manager.
 
 ## Tests
 
@@ -71,13 +88,13 @@ Plug-in Manager.
 
 `SubLab808Presets` tests the factory bank, file safety and real preset UI. Its 39 editor-lifecycle/host-callback cases use temporary libraries and a desktop display; use an isolated desktop session when running GUI tests. These include ordinary Save-As-then-Load and a newer restore which must cancel the stale follow-up without undoing the saved file. On macOS, six additional Import/Export cases verify real native file panels: hide/detach/destroy closes the panel, clears its delegate and destroys its JUCE modal without changing fixture files or processor state; the replacement editor remains interactive. A non-native fallback is not accepted as native coverage.
 
-For a focused diagnostic run, set `WHYKIKI_PRESET_TEST_LIFECYCLE_ONLY=1` (39 UI cases), `WHYKIKI_PRESET_TEST_REENTRANCY_ONLY=1` (8 synchronous host-callback destruction cases plus 2 Save-then-Load cases), or `WHYKIKI_PRESET_TEST_NATIVE_ONLY=1` (6 macOS-only file-panel cases) on the `SubLab808PresetTests` executable. These modes also run the common dirty and save/restore guards. Normal CTest runs include the applicable cases and the complete preset suite. The native test bridge activates only its own test process; it is not linked into the VST3 and does not substitute for Cubase/REAPER acceptance of host-specific window-closing behavior.
+For a focused diagnostic run, set `WHYKIKI_PRESET_TEST_LIFECYCLE_ONLY=1` (39 UI cases), `WHYKIKI_PRESET_TEST_REENTRANCY_ONLY=1` (8 synchronous host-callback destruction cases plus 2 Save-then-Load cases), or `WHYKIKI_PRESET_TEST_NATIVE_ONLY=1` (macOS-only file-panel cases) on the `SubLab808PresetTests` executable. `WHYKIKI_PRESET_TEST_NATIVE_CASE=import-detach`, for example, selects one native case and requires native-only mode. CTest runs all six native cases in fresh, serial processes with independent 60-second deadlines so AppKit state cannot leak between cases. The native test bridge is not linked into the VST3 and does not substitute for Cubase/REAPER acceptance of host-specific window-closing behavior.
 
 `WHYKIKI_PRESET_TEST_DIRTY_ONLY=1` checks Factory/User dirty status against the actual ranged parameters while APVTS notifications deliberately lag, then verifies that real notifications bring the raw cache back into agreement. These cases also run in the full suite. Do not combine this focused mode with another: contradictory requests fail as a test-setup error.
 
 `WHYKIKI_PRESET_TEST_SAVE_RESTORE_ONLY=1` runs the dirty guards and 14 deterministic persistence/control-state groups without opening an editor. They cover a restore after a real file commit, same-ID and ABA changes, coherent capture, restore from the host notification, and bounded capture contention before any write. Scheduling hooks are compiled into the preset-test target only, not the plugin. Do not combine this focused mode with another.
 
-`SubLab808ListenerLock` runs the genuine held-JUCE-listener-lock regression independently with a 20-second CTest timeout; it is also exercised by the ordinary smoke binary. Smoke/bundle tests have 300-second limits and the full preset test 600 seconds. A timeout is a failed test, not a successful bounded operation.
+`SubLab808ListenerLock` runs the genuine held-JUCE-listener-lock regression independently with a 20-second CTest timeout; it is also exercised by the ordinary smoke binary. Smoke/bundle tests have 300-second limits, the non-native full preset test 600 seconds and each native panel case 60 seconds. A timeout is a failed test, not a successful bounded operation.
 
 ## Control-thread contract
 
@@ -106,3 +123,6 @@ cmake -S . -B build -DSUBLAB808_CODESIGN_IDENTITY="Developer ID Application: You
 ```
 
 Public distribution additionally requires notarization. Local ad-hoc signing is suitable only for testing on the current machine.
+The build embeds and signs `SubLab808Updater.app` before signing the enclosing
+VST3 root. Signing never uses recursive `--deep`; the completed bundle is instead
+verified recursively with `codesign --verify --deep --strict`.

@@ -8,6 +8,11 @@ project(SubLab808 VERSION 1.4.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(MSVC)
+    # The standalone VST3/MSI must also run on clean Windows installations that
+    # do not already have a matching Visual C++ Redistributable installed.
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 
 include(FetchContent)
 set(SUBLAB808_JUCE_PATH "" CACHE PATH "Optional path to a local JUCE checkout")
@@ -98,20 +103,22 @@ include(cmake/Updater.cmake)
 wk_add_updater(SubLab808)
 
 if(APPLE)
-    # JUCE generates moduleinfo.json after its initial ad-hoc signing step. Sign the completed
-    # bundle last so the downloadable artifact has a valid resource seal.
+    # The updater command above embeds the helper first. Sign nested code inside-out, then sign
+    # the completed VST3 root so moduleinfo.json and the helper are covered by its resource seal.
     find_program(SUBLAB808_CODESIGN_EXECUTABLE codesign REQUIRED)
-    set(SUBLAB808_CODESIGN_IDENTITY "-" CACHE STRING "Final VST3 signing identity; '-' selects ad-hoc signing")
-    # The current VST3 has no nested code objects. Sign the root bundle explicitly;
-    # recursive signing can hide a missing inside-out rule if helpers are added later.
+    set(SUBLAB808_CODESIGN_IDENTITY "-" CACHE STRING
+        "Final VST3/updater signing identity; '-' selects ad-hoc signing")
     set(SUBLAB808_CODESIGN_OPTIONS --force --sign "${SUBLAB808_CODESIGN_IDENTITY}")
     if(NOT SUBLAB808_CODESIGN_IDENTITY STREQUAL "-")
         list(APPEND SUBLAB808_CODESIGN_OPTIONS --options runtime --timestamp)
     endif()
     add_custom_command(TARGET SubLab808_VST3 POST_BUILD
-        COMMAND "${SUBLAB808_CODESIGN_EXECUTABLE}" ${SUBLAB808_CODESIGN_OPTIONS} "$<TARGET_BUNDLE_DIR:SubLab808_VST3>"
+        COMMAND "${SUBLAB808_CODESIGN_EXECUTABLE}" ${SUBLAB808_CODESIGN_OPTIONS}
+            "$<TARGET_BUNDLE_DIR:SubLab808_VST3>/Contents/Helpers/SubLab808Updater.app"
+        COMMAND "${SUBLAB808_CODESIGN_EXECUTABLE}" ${SUBLAB808_CODESIGN_OPTIONS}
+            "$<TARGET_BUNDLE_DIR:SubLab808_VST3>"
         COMMAND "${SUBLAB808_CODESIGN_EXECUTABLE}" --verify --deep --strict --verbose=2 "$<TARGET_BUNDLE_DIR:SubLab808_VST3>"
-        COMMENT "Signing completed SubLab808 VST3 bundle"
+        COMMENT "Signing SubLab808 updater and completed VST3 bundle inside-out"
         VERBATIM)
 endif()
 
@@ -166,8 +173,31 @@ if(APPLE)
     # Keep JUCE's existing CXX toolchain for .mm files so CMAKE_CXX_FLAGS
     # (including sanitizer instrumentation) still apply to every such source.
     target_sources(SubLab808PresetTests PRIVATE Tests/NativeFilePanel.mm)
+    # A fresh process per native panel transition prevents one AppKit modal
+    # session from poisoning a later case and gives each real panel a tight,
+    # independently reported deadline.
+    foreach(native_operation IN ITEMS import export)
+        foreach(native_action IN ITEMS ancestor-hide detach destroy)
+            set(native_case "${native_operation}-${native_action}")
+            string(REPLACE "-" "_" native_case_id "${native_case}")
+            set(native_test "SubLab808NativeChooser_${native_case_id}")
+            add_test(NAME "${native_test}" COMMAND "${CMAKE_COMMAND}" -E env
+                "WHYKIKI_PRESET_TEST_NATIVE_ONLY=1"
+                "WHYKIKI_PRESET_TEST_NATIVE_CASE=${native_case}"
+                "$<TARGET_FILE:SubLab808PresetTests>")
+            set_tests_properties("${native_test}" PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+        endforeach()
+    endforeach()
 endif()
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_test(NAME SubLab808ReleasePipeline COMMAND "${Python3_EXECUTABLE}" -B -m unittest discover
     -s "${CMAKE_CURRENT_SOURCE_DIR}/scripts/tests" -p "test_release_pipeline.py")
+add_test(NAME SubLab808WindowsUpdaterContract COMMAND "${Python3_EXECUTABLE}" -B -m unittest discover
+    -s "${CMAKE_CURRENT_SOURCE_DIR}/scripts/tests" -p "test_windows_updater.py")
+add_test(NAME SubLab808WindowsInstallerContract COMMAND "${Python3_EXECUTABLE}" -B -m unittest discover
+    -s "${CMAKE_CURRENT_SOURCE_DIR}/scripts/tests" -p "test_windows_installer_contract.py")
+add_test(NAME SubLab808WindowsIntegrationContract COMMAND "${Python3_EXECUTABLE}" -B -m unittest discover
+    -s "${CMAKE_CURRENT_SOURCE_DIR}/scripts/tests" -p "test_windows_integration.py")
+add_test(NAME SubLab808WindowsReleaseContract COMMAND "${Python3_EXECUTABLE}" -B -m unittest discover
+    -s "${CMAKE_CURRENT_SOURCE_DIR}/scripts/tests" -p "test_windows_release_contract.py")

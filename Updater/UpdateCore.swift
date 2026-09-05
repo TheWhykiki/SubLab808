@@ -42,10 +42,11 @@ enum Product: String, CaseIterable {
     case sublab = "SubLab808", reverse = "ReverseLab"
     var bundleID: String { "audio.whykiki." + (self == .sublab ? "sublab808" : "reverselab") }
     var packageID: String { bundleID + ".pkg" }
-    var architecture: String { self == .sublab ? "arm64" : "universal" }
+    var architecture: String { "universal" }
     func validateArchitectures(_ value: String) throws {
-        let expected: Set<String> = self == .sublab ? ["arm64"] : ["arm64", "x86_64"]
-        try require(Set(value.split(whereSeparator: \.isWhitespace).map(String.init)) == expected,
+        let expected: Set<String> = ["arm64", "x86_64"]
+        let architectures = value.split(whereSeparator: \.isWhitespace).map(String.init)
+        try require(architectures.count == expected.count && Set(architectures) == expected,
                     "Das Paket enthält nicht die erwarteten Prozessor-Architekturen")
     }
     func validateMachO(_ header: Data) throws {

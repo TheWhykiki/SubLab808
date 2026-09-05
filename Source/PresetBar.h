@@ -433,9 +433,9 @@ private:
             juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
                 .getChildFile(juce::File::createLegalFileName(currentName) + presets.extension()), "*" + presets.extension());
         const juce::Component::SafePointer<PresetBar> safe(this);
-        const auto flags = importing ? juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles
+        const auto browserFlags = importing ? juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles
             : juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles | juce::FileBrowserComponent::warnAboutOverwriting;
-        chooser->launchAsync(flags, [safe, generation, importing, exportToken](const juce::FileChooser& completed) {
+        chooser->launchAsync(browserFlags, [safe, generation, importing, exportToken](const juce::FileChooser& completed) {
             if (safe == nullptr || ! safe->acceptsCallback(generation) || safe->chooser.get() != &completed
                 || completed.getResult() == juce::File()) return;
             const auto file = completed.getResult();

@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" RequiredVersion="6.0.2">
+  <Package Name="$(DisplayName)"
+           Manufacturer="$(Manufacturer)"
+           Version="$(ProductVersion)"
+           Language="1033"
+           ProductCode="$(ProductCode)"
+           UpgradeCode="$(UpgradeCode)"
+           Scope="perMachine"
+           InstallerVersion="500"
+           Compressed="yes">
+    <SummaryInformation Description="$(DisplayName) per-machine VST3 installer"
+                        Manufacturer="$(Manufacturer)" />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+    <Property Id="MSIDEPLOYMENTCOMPLIANT" Value="1" />
+
+    <MajorUpgrade AllowDowngrades="no"
+                  AllowSameVersionUpgrades="no"
+                  MigrateFeatures="yes"
+                  IgnoreLanguage="no"
+                  IgnoreRemoveFailure="no"
+                  Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="A later version of [ProductName] is already installed." />
+
+    <Upgrade Id="$(OtherArchitectureUpgradeCode)">
+      <UpgradeVersion Minimum="0.0.0"
+                      IncludeMinimum="yes"
+                      OnlyDetect="yes"
+                      Property="OTHERARCHITECTUREDETECTED" />
+    </Upgrade>
+    <Launch Condition="Installed OR NOT OTHERARCHITECTUREDETECTED"
+            Message="The $(OtherArchitectureName) package is already installed. Uninstall it before changing Windows architectures." />
+
+    <StandardDirectory Id="CommonFiles6432Folder">
+      <Directory Id="VST3Folder" Name="VST3">
+        <Directory Id="INSTALLFOLDER" Name="$(ProductName).vst3" />
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="VST3Feature" Title="$(DisplayName)" Level="1">
+      <ComponentGroupRef Id="PluginPayload" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id="PluginPayload">
+      <Files Include="!(bindpath.Payload)\**" Directory="INSTALLFOLDER" />
+    </ComponentGroup>
+  </Fragment>
+</Wix>

@@ -83,7 +83,11 @@ void checkNativeFileChooserLifecycle(const juce::File& root, bool importing, Own
     stateBefore.unchanged(processor);
     filesBefore.unchanged(root);
 
+    std::printf("NATIVE_CHOOSER_OWNER_ACTION_BEGIN: %s / %s\n",
+                importing ? "Import" : "Export", actionName(action));
     owner.apply(action);
+    std::printf("NATIVE_CHOOSER_OWNER_ACTION_END: %s / %s\n",
+                importing ? "Import" : "Export", actionName(action));
     waitForDeletion(nativeModal.component, "native file-chooser modal");
     const auto started = juce::Time::getMillisecondCounterHiRes();
     while (panel->isVisible() || panel->hasDelegate())
@@ -106,17 +110,25 @@ void checkNativeFileChooserLifecycle(const juce::File& root, bool importing, Own
     std::printf("PASS: native %s / %s [%s]: real panel closed, delegate cleared, modal deleted, state/files unchanged, editor interactive.\n",
                 importing ? "Import" : "Export", actionName(action), nativeClass.c_str());
 }
-void checkNativeFileChooserLifecycles(const juce::File& root)
+void checkNativeFileChooserLifecycles(const juce::File& root, const juce::String& requestedCase = {})
 {
     require(juce::MessageManager::getInstance()->isThisTheMessageThread(), "native chooser tests run on the message thread");
     require(! juce::Desktop::getInstance().getDisplays().displays.isEmpty(),
             "native chooser tests require an active macOS desktop session");
     require(juce::FileChooser::isPlatformDialogAvailable(), "native chooser platform implementation is available");
     NativeFilePanel::prepareTestApplication();
+    int executed = 0;
     for (const bool importing : { true, false })
         for (const auto action : { OwnerAction::hideAncestor, OwnerAction::detach, OwnerAction::destroy })
+        {
+            const auto caseName = juce::String(importing ? "import-" : "export-") + actionName(action);
+            if (requestedCase.isNotEmpty() && requestedCase != caseName) continue;
             checkNativeFileChooserLifecycle(root.getChildFile(juce::String(importing ? "Import-" : "Export-") + actionName(action)),
                                             importing, action);
-    std::puts("PASS: 6 real native file-chooser lifecycle regressions.");
+            ++executed;
+        }
+    require(executed > 0, "WHYKIKI_PRESET_TEST_NATIVE_CASE names a supported native chooser case");
+    std::printf("PASS: %d real native file-chooser lifecycle regression%s.\n",
+                executed, executed == 1 ? "" : "s");
 }
 #endif

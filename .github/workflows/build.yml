@@ -37,7 +37,7 @@ jobs:
         # are not part of the documented build and were the only difference to passing local runs.
         run: cmake -S . -B build -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release
       - name: Build
-        run: cmake --build build --target SubLab808Tests SubLab808_VST3 SubLab808HostTests SubLab808PresetTests -j "$(sysctl -n hw.ncpu)"
+        run: cmake --build build --target SubLab808Tests SubLab808_VST3 SubLab808HostTests SubLab808PresetTests SubLab808WindowsUpdaterPolicyTests -j "$(sysctl -n hw.ncpu)"
       - name: Test
         run: ctest --test-dir build --output-on-failure
       - name: Verify universal slices and deployment target
@@ -55,7 +55,7 @@ jobs:
       - name: Package and validate downloadable bundle
         run: |
           bundle="build/SubLab808_artefacts/Release/VST3/SubLab808.vst3"
-          archive="build/SubLab808-VST3-macOS-${{ matrix.host_arch }}.zip"
+          archive="build/SubLab808-macOS-universal-${{ matrix.host_arch }}-VST3.zip"
           ditto -c -k --keepParent "$bundle" "$archive"
           mkdir -p build/artifact-roundtrip
           ditto -x -k "$archive" build/artifact-roundtrip
@@ -70,8 +70,8 @@ jobs:
           build/SubLab808HostTests_artefacts/Release/SubLab808HostTests "$restored"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: SubLab808-VST3-macOS-${{ matrix.host_arch }}-${{ github.sha }}
-          path: build/SubLab808-VST3-macOS-${{ matrix.host_arch }}.zip
+          name: SubLab808-macOS-universal-${{ matrix.host_arch }}-${{ github.sha }}
+          path: build/SubLab808-macOS-universal-${{ matrix.host_arch }}-VST3.zip
           if-no-files-found: error
 
   windows:
@@ -81,6 +81,7 @@ jobs:
       matrix:
         include:
           - label: x64
+            artifact_arch: x64
             runner: windows-2022
             runner_arch: X64
             host_arch: AMD64
@@ -88,7 +89,9 @@ jobs:
             cmake_platform: x64
             vst3_directory: x86_64-win
             pe_header: '8664 machine \(x64\)'
+            installer_arch: x64
           - label: ARM64EC
+            artifact_arch: arm64ec
             runner: windows-11-vs2026-arm
             runner_arch: ARM64
             host_arch: ARM64
@@ -96,6 +99,7 @@ jobs:
             cmake_platform: ARM64EC
             vst3_directory: arm64ec-win
             pe_header: '8664 machine \(x64\) \(ARM64X\)'
+            installer_arch: arm64ec
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -118,7 +122,7 @@ jobs:
       - name: Configure
         run: cmake -S . -B build -G "${{ matrix.cmake_generator }}" -A ${{ matrix.cmake_platform }}
       - name: Build
-        run: cmake --build build --config Release --target SubLab808Tests SubLab808_VST3 SubLab808HostTests SubLab808PresetTests --parallel
+        run: cmake --build build --config Release --target SubLab808Tests SubLab808_VST3 SubLab808HostTests SubLab808PresetTests SubLab808WindowsUpdaterPolicyTests SubLab808WindowsUpdaterSelfTests SubLab808WindowsUpdaterProductionShape SubLab808WindowsUpdaterLauncherShape --parallel
       - name: Test without desktop dialogs
         shell: pwsh
         run: |
@@ -187,7 +191,7 @@ jobs:
           $bundle = "build/SubLab808_artefacts/Release/VST3/SubLab808.vst3"
           $binary = Join-Path $bundle "Contents/${{ matrix.vst3_directory }}/SubLab808.vst3"
           $moduleInfo = Join-Path $bundle "Contents/Resources/moduleinfo.json"
-          $archive = "build/SubLab808-VST3-Windows-${{ matrix.label }}.zip"
+          $archive = "build/SubLab808-Windows-${{ matrix.artifact_arch }}-VST3-UNSIGNED-NOT-FOR-DISTRIBUTION.zip"
           $roundtrip = "build/artifact-roundtrip"
           Compress-Archive -LiteralPath $bundle -DestinationPath $archive
           Expand-Archive -LiteralPath $archive -DestinationPath $roundtrip
@@ -212,15 +216,37 @@ jobs:
               $restoredModuleText -notmatch '"Classes"\s*:') {
             throw "Unexpected roundtrip moduleinfo.json content: $restoredModuleInfo"
           }
-          $host = "build/SubLab808HostTests_artefacts/Release/SubLab808HostTests.exe"
-          & $host $restored
+          $hostTestBinary = "build/SubLab808HostTests_artefacts/Release/SubLab808HostTests.exe"
+          & $hostTestBinary $restored
           if ($LASTEXITCODE -ne 0) {
             throw "Host test rejected the extracted VST3 bundle"
           }
+      - name: Build and validate unsigned Windows MSI candidate
+        shell: pwsh
+        run: |
+          $versionEntry = @(Get-Content -LiteralPath "build/CMakeCache.txt" |
+            Where-Object { $_ -like "CMAKE_PROJECT_VERSION:STATIC=*" })
+          if ($versionEntry.Count -ne 1) { throw "Cannot resolve the exact CMake project version" }
+          $version = ($versionEntry[0] -split "=", 2)[1]
+          $bundle = (Resolve-Path -LiteralPath "build/SubLab808_artefacts/Release/VST3/SubLab808.vst3").Path
+          $hostTestBinary = (Resolve-Path -LiteralPath "build/SubLab808HostTests_artefacts/Release/SubLab808HostTests.exe").Path
+          pwsh -NoProfile -File scripts/build-windows-installer.ps1 `
+            -Architecture "${{ matrix.installer_arch }}" `
+            -BundlePath $bundle `
+            -Version $version `
+            -OutputDirectory "build/windows-installer" `
+            -HostTestPath $hostTestBinary `
+            -AllowUnsigned
+          if ($LASTEXITCODE -ne 0) { throw "Windows MSI validation failed" }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: SubLab808-VST3-Windows-${{ matrix.label }}-${{ github.sha }}
-          path: build/SubLab808-VST3-Windows-${{ matrix.label }}.zip
+          name: SubLab808-Windows-${{ matrix.artifact_arch }}-VST3-UNSIGNED-NOT-FOR-DISTRIBUTION
+          path: build/SubLab808-Windows-${{ matrix.artifact_arch }}-VST3-UNSIGNED-NOT-FOR-DISTRIBUTION.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: SubLab808-MSI-Windows-${{ matrix.label }}-UNSIGNED-NOT-FOR-DISTRIBUTION-${{ github.sha }}
+          path: build/windows-installer
           if-no-files-found: error
 
   sanitizers:
@@ -244,7 +270,7 @@ jobs:
           -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
           -DCMAKE_MODULE_LINKER_FLAGS="-fsanitize=address,undefined"
       - name: Build
-        run: cmake --build build-asan --target SubLab808Tests SubLab808_VST3 SubLab808HostTests SubLab808PresetTests -j "$(sysctl -n hw.ncpu)"
+        run: cmake --build build-asan --target SubLab808Tests SubLab808_VST3 SubLab808HostTests SubLab808PresetTests SubLab808WindowsUpdaterPolicyTests -j "$(sysctl -n hw.ncpu)"
       - name: Test
         env:
           ASAN_OPTIONS: detect_leaks=0

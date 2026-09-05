@@ -79,6 +79,28 @@ Siehe [Preset-Katalog](Presets/CATALOG.md) und [Umsetzungs- und Abnahmeplan](PRE
 
 ## Native Updates
 
-Die Schaltfläche **Updates...** prüft neue Versionen, lädt das passende Paket und
-führt durch die Installation mit dem macOS-Installer. Details, Release-Anforderungen
-und Testgrenzen stehen in [UPDATER.md](UPDATER.md).
+Die Schaltfläche **Updates...** verwendet je Plattform einen separaten nativen
+Updater; Netzwerk und Installation laufen nie im Plug-in oder Audiothread. Details
+zum macOS-Pfad stehen in [UPDATER.md](UPDATER.md). Der macOS-Updater akzeptiert
+ausschließlich Pakete namens `SubLab808-MAJOR.MINOR.PATCH-macOS-universal.pkg`,
+deren Plug-in und eingebetteter Helper jeweils exakt `arm64` und `x86_64`
+enthalten. `scripts/package-release.sh Release` erstellt dazu aus einem frischen,
+quellgebundenen Snapshot ein gleichnamiges PKG sowie
+`SubLab808-MAJOR.MINOR.PATCH-macOS-universal-VST3.zip`, prüft beide entpackten
+Payloads im VST3-Testhost und veröffentlicht keinen fehlgeschlagenen Kandidaten.
+
+Ohne echte Developer-ID-Identitäten und Notary-Profil bleibt der macOS-Kandidat lokal:
+Er ist ad-hoc signiert, der Installer unsigniert, und weder Notarisierung noch
+Gatekeeper-Freigabe werden behauptet.
+
+Windows besitzt getrennte x64- und ARM64EC-MSI-Pakete sowie einen nativen,
+signaturgepinnten Updater. Die Verträge stehen in
+[WINDOWS_INSTALLER.md](WINDOWS_INSTALLER.md) und
+[WINDOWS_UPDATER.md](WINDOWS_UPDATER.md); der abgesicherte manuelle
+Veröffentlichungsweg ist in [WINDOWS_RELEASE.md](WINDOWS_RELEASE.md) beschrieben.
+CI baut, extrahiert und lädt beide
+MSI-Nutzlasten nativ; seine Ausgaben tragen zwingend
+`UNSIGNED-NOT-FOR-DISTRIBUTION`. Ein veröffentlichbarer Updater wird erst mit dem
+echten SHA-256-Fingerprint des Distributionszertifikats aktiviert. Zertifikat,
+RFC-3161-Zeitstempel und eine reale Cubase-/REAPER-Abnahme auf Windows bleiben
+verpflichtende Release-Gates.

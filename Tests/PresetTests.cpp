@@ -1190,12 +1190,24 @@ int main(int argc, char** argv)
     {
         const auto dirtyOnly = juce::SystemStats::getEnvironmentVariable("WHYKIKI_PRESET_TEST_DIRTY_ONLY", {}) == "1";
         const auto saveRestoreOnly = juce::SystemStats::getEnvironmentVariable("WHYKIKI_PRESET_TEST_SAVE_RESTORE_ONLY", {}) == "1";
+        const auto nativeOnly = juce::SystemStats::getEnvironmentVariable("WHYKIKI_PRESET_TEST_NATIVE_ONLY", {}) == "1";
+        const auto nativeCase = juce::SystemStats::getEnvironmentVariable("WHYKIKI_PRESET_TEST_NATIVE_CASE", {});
         require(! (dirtyOnly && saveRestoreOnly), "DIRTY_ONLY and SAVE_RESTORE_ONLY cannot be combined");
+        require(nativeCase.isEmpty() || nativeOnly, "NATIVE_CASE requires NATIVE_ONLY");
         if (dirtyOnly || saveRestoreOnly)
             for (const auto* mode : { "WHYKIKI_PRESET_TEST_NATIVE_ONLY", "WHYKIKI_PRESET_TEST_REENTRANCY_ONLY",
                                       "WHYKIKI_PRESET_TEST_LIFECYCLE_ONLY" })
                 require(juce::SystemStats::getEnvironmentVariable(mode, {}) != "1",
                         "DIRTY_ONLY or SAVE_RESTORE_ONLY cannot be combined with another focused test mode");
+        if (nativeOnly)
+        {
+#if JUCE_MAC
+            checkNativeFileChooserLifecycles(root.getChildFile("NativeChoosers"), nativeCase);
+            return 0;
+#else
+            throw std::runtime_error("Native file-chooser tests require macOS; a non-native fallback is not accepted.");
+#endif
+        }
         checkAuthoritativeDirtyState(root.getChildFile("AuthoritativeDirty"));
         if (dirtyOnly) return 0;
         checkPresetSaveRestore(root.getChildFile("SaveRestore"));
@@ -1204,22 +1216,10 @@ int main(int argc, char** argv)
         checkSelectionStateHardening(root.getChildFile("SelectionState"));
 #endif
         if (saveRestoreOnly) return 0;
-        if (juce::SystemStats::getEnvironmentVariable("WHYKIKI_PRESET_TEST_NATIVE_ONLY", {}) == "1")
-        {
-#if JUCE_MAC
-            checkNativeFileChooserLifecycles(root.getChildFile("NativeChoosers"));
-            return 0;
-#else
-            throw std::runtime_error("Native file-chooser tests require macOS; a non-native fallback is not accepted.");
-#endif
-        }
         checkPresetReentrancy(root.getChildFile("Reentrancy"));
         if (juce::SystemStats::getEnvironmentVariable("WHYKIKI_PRESET_TEST_REENTRANCY_ONLY", {}) == "1") return 0;
         checkPresetDialogLifecycles(root.getChildFile("Lifecycles"));
         if (juce::SystemStats::getEnvironmentVariable("WHYKIKI_PRESET_TEST_LIFECYCLE_ONLY", {}) == "1") return 0;
-#if JUCE_MAC
-        checkNativeFileChooserLifecycles(root.getChildFile("NativeChoosers"));
-#endif
 #if PRESET_TEST_SUBLAB
         checkClickPresetContract(root.getChildFile("ClickContract"));
 #endif

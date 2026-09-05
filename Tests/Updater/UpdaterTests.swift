@@ -35,6 +35,9 @@ import CryptoKit
         }
         try test("both products select only their package") {
             for product in Product.allCases {
+                try require(product.packageName(try Version("1.2.0"))
+                            == "\(product.rawValue)-1.2.0-macOS-universal.pkg",
+                            "Updater asset name is not the universal release contract")
                 let candidate = try UpdateCandidate.select(release(product), product: product, current: current)
                 try require(candidate?.version == Version("1.2.0"), "Update not selected")
             }
@@ -61,20 +64,22 @@ import CryptoKit
             try rejected { _ = try UpdateCandidate.select(release(.sublab), product: .reverse, current: current) }
         }
         try test("product architecture requirements") {
-            try Product.sublab.validateArchitectures("arm64\n")
+            try Product.sublab.validateArchitectures("x86_64 arm64\n")
             try Product.reverse.validateArchitectures("x86_64 arm64\n")
-            try rejected { try Product.sublab.validateArchitectures("x86_64") }
-            try rejected { try Product.reverse.validateArchitectures("arm64") }
+            for product in Product.allCases {
+                try rejected { try product.validateArchitectures("x86_64") }
+                try rejected { try product.validateArchitectures("arm64") }
+                try rejected { try product.validateArchitectures("arm64 x86_64 i386") }
+                try rejected { try product.validateArchitectures("arm64 x86_64 arm64") }
+            }
         }
         try test("Mach-O architecture inspection without developer tools") {
             let arm = Data([0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0, 0, 1])
-            try Product.sublab.validateMachO(arm)
-            try rejected { try Product.reverse.validateMachO(arm) }
+            for product in Product.allCases { try rejected { try product.validateMachO(arm) } }
             var fat = Data([0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 2, 1, 0, 0, 12])
             fat.append(Data(repeating: 0, count: 16))
             fat.append(contentsOf: [1, 0, 0, 7])
-            try Product.reverse.validateMachO(fat)
-            try rejected { try Product.sublab.validateMachO(fat) }
+            for product in Product.allCases { try product.validateMachO(fat) }
             try rejected { try Product.reverse.validateMachO(fat.dropLast()) }
             try rejected { try Product.sublab.validateMachO(Data([0, 1, 2])) }
         }

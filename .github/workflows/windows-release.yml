@@ -1,0 +1,755 @@
+name: Signed cross-platform release
+run-name: Signed release ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing immutable release tag (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
+      confirm_release:
+        description: Build, sign, notarize and publish macOS plus both Windows architectures
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: SubLab808-windows-release
+  cancel-in-progress: false
+
+jobs:
+  build-windows:
+    name: Build and sign Windows ${{ matrix.artifact_arch }}
+    if: >-
+      inputs.confirm_release == true &&
+      github.repository == 'TheWhykiki/SubLab808' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact_arch: x64
+            runner: windows-2022
+            runner_arch: X64
+            processor_arch: AMD64
+            generator: Visual Studio 17 2022
+            platform: x64
+            build_dir: build-windows-release-x64
+            vst3_directory: x86_64-win
+            sign_tool_arch: x64
+          - artifact_arch: arm64ec
+            runner: windows-11-vs2026-arm
+            runner_arch: ARM64
+            processor_arch: ARM64
+            generator: Visual Studio 18 2026
+            platform: ARM64EC
+            build_dir: build-windows-release-arm64ec
+            vst3_directory: arm64ec-win
+            sign_tool_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      PRODUCT: SubLab808
+      SIGNER_SHA256: ${{ vars.WINDOWS_CODE_SIGNING_CERT_SHA256 }}
+      TIMESTAMP_URL: ${{ vars.WINDOWS_RFC3161_TIMESTAMP_URL }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify immutable tag, runner and public release configuration
+        shell: pwsh
+        run: |
+          $tag = '${{ inputs.tag }}'
+          if ($tag -cnotmatch '^v(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,4})$') {
+            throw 'Release tag must be exactly vMAJOR.MINOR.PATCH within MSI version bounds.'
+          }
+          $versionParts = @($tag.Substring(1).Split('.') | ForEach-Object { [int]$_ })
+          if ($versionParts[0] -gt 255 -or $versionParts[1] -gt 255 -or $versionParts[2] -gt 65535) {
+            throw 'Release tag exceeds Windows Installer version bounds.'
+          }
+          $tagReference = "refs/tags/$tag"
+          & git show-ref --verify --quiet $tagReference
+          if ($LASTEXITCODE -ne 0) { throw "Tag does not exist locally: $tag" }
+          $headCommit = (& git rev-parse HEAD).Trim()
+          $tagCommit = (& git rev-parse "$tagReference^{commit}").Trim()
+          if ($LASTEXITCODE -ne 0 -or $headCommit -cne $tagCommit) {
+            throw 'Checkout does not exactly match the requested tag commit.'
+          }
+          $defaultBranch = '${{ github.event.repository.default_branch }}'
+          & git fetch --no-tags origin "+refs/heads/${defaultBranch}:refs/remotes/origin/${defaultBranch}"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the current origin default branch.' }
+          & git merge-base --is-ancestor $tagCommit "refs/remotes/origin/$defaultBranch"
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Release tag is not an ancestor of the current origin default branch.'
+          }
+          $remoteLines = @(& git ls-remote --exit-code origin $tagReference "$tagReference^{}")
+          if ($LASTEXITCODE -ne 0) { throw 'The requested tag does not exist on origin.' }
+          $directCommit = $null
+          $peeledCommit = $null
+          foreach ($line in $remoteLines) {
+            $parts = @($line -split '\s+', 2)
+            if ($parts.Count -ne 2) { continue }
+            if ($parts[1] -ceq $tagReference) { $directCommit = $parts[0] }
+            if ($parts[1] -ceq "$tagReference^{}") { $peeledCommit = $parts[0] }
+          }
+          $remoteCommit = if ($peeledCommit) { $peeledCommit } else { $directCommit }
+          if (-not $remoteCommit -or $remoteCommit -cne $tagCommit) {
+            throw 'Origin tag and checked-out tag do not resolve to the same commit.'
+          }
+          if ('${{ runner.arch }}' -cne '${{ matrix.runner_arch }}' -or
+              $env:PROCESSOR_ARCHITECTURE -cne '${{ matrix.processor_arch }}') {
+            throw 'Release build is not running on the required native Windows architecture.'
+          }
+          $pin = ([string]$env:SIGNER_SHA256).Replace(' ', '').ToUpperInvariant()
+          if ($pin -cnotmatch '^[0-9A-F]{64}$') {
+            throw 'WINDOWS_CODE_SIGNING_CERT_SHA256 must be exactly 64 hexadecimal characters.'
+          }
+          $timestamp = $null
+          if (-not [uri]::TryCreate($env:TIMESTAMP_URL, [System.UriKind]::Absolute, [ref]$timestamp) -or
+              $timestamp.Scheme -cne 'https') {
+            throw 'WINDOWS_RFC3161_TIMESTAMP_URL must be an absolute HTTPS URL.'
+          }
+          "WK_RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WK_RELEASE_VERSION=$($tag.Substring(1))" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WK_TAG_COMMIT=$tagCommit" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WK_SIGNER_SHA256=$pin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Configure production updater pin
+        shell: pwsh
+        run: |
+          cmake -S . -B '${{ matrix.build_dir }}' `
+            -G '${{ matrix.generator }}' -A '${{ matrix.platform }}' `
+            "-DSUBLAB808_WINDOWS_UPDATER_SIGNER_SHA256:STRING=$env:WK_SIGNER_SHA256"
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed.' }
+          $versionRows = @(Get-Content -LiteralPath '${{ matrix.build_dir }}/CMakeCache.txt' |
+            Where-Object { $_ -like 'CMAKE_PROJECT_VERSION:STATIC=*' })
+          if ($versionRows.Count -ne 1 -or ($versionRows[0] -split '=', 2)[1] -cne $env:WK_RELEASE_VERSION) {
+            throw 'Tag version does not exactly match CMAKE_PROJECT_VERSION.'
+          }
+
+      - name: Build production VST3, updater and native tests
+        shell: pwsh
+        run: |
+          cmake --build '${{ matrix.build_dir }}' --config Release --parallel 2 --target `
+            SubLab808Tests SubLab808_VST3 SubLab808WindowsUpdater `
+            SubLab808HostTests SubLab808PresetTests `
+            SubLab808WindowsUpdaterPolicyTests SubLab808WindowsUpdaterSelfTests
+          if ($LASTEXITCODE -ne 0) { throw 'Production build failed.' }
+          $bundle = '${{ matrix.build_dir }}/SubLab808_artefacts/Release/VST3/SubLab808.vst3'
+          $helper = Join-Path $bundle 'Contents/Helpers/SubLab808Updater.exe'
+          $binary = Join-Path $bundle 'Contents/${{ matrix.vst3_directory }}/SubLab808.vst3'
+          foreach ($path in @($helper, $binary)) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing production payload: $path" }
+          }
+          $architectureDirectories = @(Get-ChildItem -LiteralPath (Join-Path $bundle 'Contents') -Directory |
+            Where-Object Name -Like '*-win' | ForEach-Object Name)
+          if ($architectureDirectories.Count -ne 1 -or
+              $architectureDirectories[0] -cne '${{ matrix.vst3_directory }}') {
+            throw "Unexpected VST3 architecture directories: $($architectureDirectories -join ', ')"
+          }
+
+      - name: Run native non-dialog and preset persistence tests
+        shell: pwsh
+        run: |
+          ctest --test-dir '${{ matrix.build_dir }}' -C Release --output-on-failure --no-tests=error `
+            -E '^SubLab808Presets$'
+          if ($LASTEXITCODE -ne 0) { throw 'Non-dialog release tests failed.' }
+          $env:WHYKIKI_PRESET_TEST_SAVE_RESTORE_ONLY = '1'
+          ctest --test-dir '${{ matrix.build_dir }}' -C Release --output-on-failure --no-tests=error `
+            -R '^SubLab808Presets$'
+          if ($LASTEXITCODE -ne 0) { throw 'Preset persistence release tests failed.' }
+
+      - name: Import ephemeral signing certificate and verify leaf pin
+        shell: pwsh
+        env:
+          PFX_BASE64: ${{ secrets.WINDOWS_CODE_SIGNING_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.WINDOWS_CODE_SIGNING_PFX_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:PFX_BASE64) -or
+              [string]::IsNullOrWhiteSpace($env:PFX_PASSWORD)) {
+            throw 'Both Windows code-signing PFX secrets are required.'
+          }
+          $nonce = [guid]::NewGuid().ToString('N')
+          $storeName = "WhykikiRelease-$nonce"
+          $pfxPath = Join-Path $env:RUNNER_TEMP "SubLab808-$nonce-signing.pfx"
+          "WK_CERT_STORE_NAME=$storeName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WK_PFX_PATH=$pfxPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+            $storeName,
+            [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+          try {
+            $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+            if ($store.Certificates.Count -ne 0) { throw 'Ephemeral certificate store is not empty.' }
+          } finally {
+            $store.Dispose()
+          }
+          $bytes = [Convert]::FromBase64String($env:PFX_BASE64)
+          try {
+            [System.IO.File]::WriteAllBytes($pfxPath, $bytes)
+          } finally {
+            [Array]::Clear($bytes, 0, $bytes.Length)
+          }
+          $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+          $acl = [System.Security.AccessControl.FileSecurity]::new()
+          $acl.SetAccessRuleProtection($true, $false)
+          $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+            $identity,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            [System.Security.AccessControl.AccessControlType]::Allow))
+          Set-Acl -LiteralPath $pfxPath -AclObject $acl
+          $password = ConvertTo-SecureString $env:PFX_PASSWORD -AsPlainText -Force
+          $imported = @(Import-PfxCertificate -FilePath $pfxPath `
+            -CertStoreLocation "Cert:\CurrentUser\$storeName" -Password $password)
+          $privateLeaves = @($imported | Where-Object { $_.HasPrivateKey })
+          if ($privateLeaves.Count -ne 1) { throw 'PFX must contain exactly one private-key leaf certificate.' }
+          $leaf = $privateLeaves[0]
+          $now = [DateTime]::UtcNow
+          if ($leaf.NotBefore.ToUniversalTime() -gt $now -or $leaf.NotAfter.ToUniversalTime() -lt $now) {
+            throw 'Code-signing certificate is outside its validity period.'
+          }
+          $eku = @($leaf.Extensions |
+            Where-Object { $_ -is [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] } |
+            ForEach-Object EnhancedKeyUsages | ForEach-Object Value)
+          if ($eku -cnotcontains '1.3.6.1.5.5.7.3.3') { throw 'Certificate is not valid for code signing.' }
+          $actualPin = $leaf.GetCertHashString(
+            [System.Security.Cryptography.HashAlgorithmName]::SHA256).ToUpperInvariant()
+          if ($actualPin -cne $env:WK_SIGNER_SHA256) {
+            throw 'Imported certificate leaf does not match the configured public SHA-256 pin.'
+          }
+          "WK_CERT_THUMBPRINT=$($leaf.Thumbprint.Replace(' ', '').ToUpperInvariant())" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Remove-Item Env:PFX_BASE64, Env:PFX_PASSWORD -ErrorAction SilentlyContinue
+
+      - name: Sign payload, build MSI and validate candidate
+        shell: pwsh
+        run: |
+          $sdkBin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/bin'
+          $signTool = Get-ChildItem -LiteralPath $sdkBin -Directory |
+            Where-Object { $_.Name -match '^10\.0\.[0-9]+\.[0-9]+$' } |
+            Sort-Object { [version]$_.Name } -Descending |
+            ForEach-Object { Join-Path $_.FullName '${{ matrix.sign_tool_arch }}/signtool.exe' } |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+            Select-Object -First 1
+          if (-not $signTool) { throw 'A native Windows SDK signtool.exe was not found.' }
+          $bundle = (Resolve-Path -LiteralPath '${{ matrix.build_dir }}/SubLab808_artefacts/Release/VST3/SubLab808.vst3').Path
+          $updater = (Resolve-Path -LiteralPath (Join-Path $bundle 'Contents/Helpers/SubLab808Updater.exe')).Path
+          $hostTest = (Resolve-Path -LiteralPath '${{ matrix.build_dir }}/SubLab808HostTests_artefacts/Release/SubLab808HostTests.exe').Path
+          $output = '${{ matrix.build_dir }}/windows-installer'
+          & pwsh -NoProfile -File scripts/build-windows-installer.ps1 `
+            -Architecture '${{ matrix.artifact_arch }}' `
+            -BundlePath $bundle `
+            -Version $env:WK_RELEASE_VERSION `
+            -SourceCommit $env:WK_TAG_COMMIT `
+            -OutputDirectory $output `
+            -UpdaterPath $updater `
+            -ExpectedSignerSha256 $env:WK_SIGNER_SHA256 `
+            -HostTestPath $hostTest `
+            -SignToolPath $signTool `
+            -CertificateThumbprint $env:WK_CERT_THUMBPRINT `
+            -CertificateStoreName $env:WK_CERT_STORE_NAME `
+            -TimestampUrl $env:TIMESTAMP_URL
+          if ($LASTEXITCODE -ne 0) { throw 'Signed MSI pipeline failed.' }
+          $base = "SubLab808-$env:WK_RELEASE_VERSION-Windows-${{ matrix.artifact_arch }}"
+          $candidate = Join-Path $output $base
+          $assets = 'release-assets-${{ matrix.artifact_arch }}'
+          New-Item -ItemType Directory -Path $assets -ErrorAction Stop | Out-Null
+          Copy-Item -LiteralPath (Join-Path $candidate "$base.msi") -Destination $assets
+          Copy-Item -LiteralPath (Join-Path $candidate "$base.evidence.json") -Destination $assets
+          python scripts/validate-windows-release-assets.py `
+            --directory $assets --product SubLab808 --version $env:WK_RELEASE_VERSION `
+            --source-commit $env:WK_TAG_COMMIT `
+            --expected-signer-sha256 $env:WK_SIGNER_SHA256 `
+            --architecture '${{ matrix.artifact_arch }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Signed release asset validation failed.' }
+
+      - name: Upload signed release candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: SubLab808-Windows-${{ matrix.artifact_arch }}-SIGNED-RELEASE-CANDIDATE-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-assets-${{ matrix.artifact_arch }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove PFX and ephemeral certificate store
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not [string]::IsNullOrWhiteSpace($env:WK_PFX_PATH) -and
+              (Test-Path -LiteralPath $env:WK_PFX_PATH -PathType Leaf)) {
+            Remove-Item -LiteralPath $env:WK_PFX_PATH -Force
+          }
+          if ($env:WK_CERT_STORE_NAME -match '^WhykikiRelease-[0-9a-f]{32}$') {
+            $store = $null
+            try {
+              $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+                $env:WK_CERT_STORE_NAME,
+                [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+              $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+              foreach ($certificate in @($store.Certificates)) { $store.Remove($certificate) }
+            } finally {
+              if ($null -ne $store) { $store.Dispose() }
+              Remove-Item -LiteralPath "Cert:\CurrentUser\$env:WK_CERT_STORE_NAME" -Recurse -Force `
+                -ErrorAction SilentlyContinue
+            }
+            if (Test-Path -LiteralPath "Cert:\CurrentUser\$env:WK_CERT_STORE_NAME") {
+              throw 'Ephemeral certificate store cleanup failed.'
+            }
+          }
+
+  build-macos:
+    name: Build, sign and notarize macOS universal
+    if: >-
+      inputs.confirm_release == true &&
+      github.repository == 'TheWhykiki/SubLab808' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: macos-15
+    permissions:
+      contents: read
+    env:
+      PRODUCT: SubLab808
+      APPLICATION_IDENTITY: ${{ vars.MACOS_DEVELOPER_ID_APPLICATION_IDENTITY }}
+      INSTALLER_IDENTITY: ${{ vars.MACOS_DEVELOPER_ID_INSTALLER_IDENTITY }}
+      APPLICATION_SIGNER_SHA256: ${{ vars.MACOS_DEVELOPER_ID_APPLICATION_CERT_SHA256 }}
+      INSTALLER_SIGNER_SHA256: ${{ vars.MACOS_DEVELOPER_ID_INSTALLER_CERT_SHA256 }}
+      NOTARY_KEY_ID: ${{ vars.MACOS_NOTARY_KEY_ID }}
+      NOTARY_ISSUER_ID: ${{ vars.MACOS_NOTARY_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify immutable macOS release source and public identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag='${{ inputs.tag }}'
+          [[ "$tag" =~ ^v(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,4})$ ]]
+          version="${tag#v}"
+          python3 -c 'import sys; p=tuple(map(int,sys.argv[1].split("."))); assert p[0] <= 255 and p[1] <= 255 and p[2] <= 65535' "$version"
+          tag_reference="refs/tags/$tag"
+          git show-ref --verify --quiet "$tag_reference"
+          tag_commit="$(git rev-parse "$tag_reference^{commit}")"
+          test "$(git rev-parse HEAD)" = "$tag_commit"
+          default_branch='${{ github.event.repository.default_branch }}'
+          git fetch --no-tags origin "+refs/heads/$default_branch:refs/remotes/origin/$default_branch"
+          git merge-base --is-ancestor "$tag_commit" "refs/remotes/origin/$default_branch"
+          remote_lines="$(git ls-remote --exit-code origin "$tag_reference" "$tag_reference^{}")"
+          remote_commit="$(printf '%s\n' "$remote_lines" | awk -v peeled="$tag_reference^{}" '$2 == peeled { print $1 }')"
+          if [[ -z "$remote_commit" ]]; then
+            remote_commit="$(printf '%s\n' "$remote_lines" | awk -v direct="$tag_reference" '$2 == direct { print $1 }')"
+          fi
+          test "$remote_commit" = "$tag_commit"
+          app_pin="$(printf '%s' "$APPLICATION_SIGNER_SHA256" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+          installer_pin="$(printf '%s' "$INSTALLER_SIGNER_SHA256" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+          [[ "$app_pin" =~ ^[0-9A-F]{64}$ ]]
+          [[ "$installer_pin" =~ ^[0-9A-F]{64}$ ]]
+          [[ "$APPLICATION_IDENTITY" == 'Developer ID Application: '* && "$APPLICATION_IDENTITY" != *$'\n'* ]]
+          [[ "$INSTALLER_IDENTITY" == 'Developer ID Installer: '* && "$INSTALLER_IDENTITY" != *$'\n'* ]]
+          [[ "$NOTARY_KEY_ID" =~ ^[A-Z0-9]{10}$ ]]
+          [[ "$NOTARY_ISSUER_ID" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]
+          printf 'WK_RELEASE_TAG=%s\nWK_RELEASE_VERSION=%s\nWK_TAG_COMMIT=%s\nWK_MAC_APP_PIN=%s\nWK_MAC_INSTALLER_PIN=%s\n' \
+            "$tag" "$version" "$tag_commit" "$app_pin" "$installer_pin" >> "$GITHUB_ENV"
+
+      - name: Run signed and notarized macOS release pipeline
+        timeout-minutes: 90
+        shell: bash
+        env:
+          APPLICATION_P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          APPLICATION_P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          INSTALLER_P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_INSTALLER_P12_BASE64 }}
+          INSTALLER_P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_INSTALLER_P12_PASSWORD }}
+          NOTARY_PRIVATE_KEY_P8_BASE64: ${{ secrets.MACOS_NOTARY_PRIVATE_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          credential_dir=''
+          temporary_keychain=''
+          original_default=''
+          original_keychains=()
+          cleanup_credentials() {
+            status=$?
+            trap - EXIT
+            set +e
+            cleanup_failed=false
+            if [[ -n "$original_default" ]]; then
+              security default-keychain -d user -s "$original_default" || cleanup_failed=true
+            fi
+            if (( ${#original_keychains[@]} > 0 )); then
+              security list-keychains -d user -s "${original_keychains[@]}" || cleanup_failed=true
+            fi
+            if [[ -n "$temporary_keychain" ]]; then
+              security delete-keychain "$temporary_keychain" || cleanup_failed=true
+            fi
+            case "$credential_dir" in
+              "$RUNNER_TEMP"/whykiki-release.*)
+                rm -rf -- "$credential_dir" || cleanup_failed=true
+                [[ ! -e "$credential_dir" ]] || cleanup_failed=true
+                ;;
+              ?*) cleanup_failed=true ;;
+            esac
+            if [[ "$status" -eq 0 && "$cleanup_failed" == true ]]; then status=1; fi
+            exit "$status"
+          }
+          trap cleanup_credentials EXIT
+          for variable in APPLICATION_P12_BASE64 APPLICATION_P12_PASSWORD \
+                          INSTALLER_P12_BASE64 INSTALLER_P12_PASSWORD \
+                          NOTARY_PRIVATE_KEY_P8_BASE64; do
+            [[ -n "${!variable:-}" ]]
+          done
+          credential_dir="$(mktemp -d "$RUNNER_TEMP/whykiki-release.XXXXXX")"
+          chmod 700 "$credential_dir"
+          temporary_keychain="$credential_dir/release.keychain-db"
+          app_p12="$credential_dir/application.p12"
+          installer_p12="$credential_dir/installer.p12"
+          notary_key="$credential_dir/AuthKey_$NOTARY_KEY_ID.p8"
+          printf '%s' "$APPLICATION_P12_BASE64" | /usr/bin/base64 -D > "$app_p12"
+          printf '%s' "$INSTALLER_P12_BASE64" | /usr/bin/base64 -D > "$installer_p12"
+          printf '%s' "$NOTARY_PRIVATE_KEY_P8_BASE64" | /usr/bin/base64 -D > "$notary_key"
+          chmod 600 "$app_p12" "$installer_p12" "$notary_key"
+          original_default="$(security default-keychain -d user | sed -E 's/^[[:space:]]*"//; s/"$//')"
+          while IFS= read -r item; do
+            [[ -n "$item" ]] && original_keychains+=("$item")
+          done < <(security list-keychains -d user | sed -E 's/^[[:space:]]*"//; s/"$//')
+          keychain_password="$(openssl rand -hex 32)"
+          security create-keychain -p "$keychain_password" "$temporary_keychain"
+          security set-keychain-settings -lut 7200 "$temporary_keychain"
+          security unlock-keychain -p "$keychain_password" "$temporary_keychain"
+          security list-keychains -d user -s "$temporary_keychain" "${original_keychains[@]}"
+          security default-keychain -d user -s "$temporary_keychain"
+          security import "$app_p12" -k "$temporary_keychain" -P "$APPLICATION_P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+          security import "$installer_p12" -k "$temporary_keychain" -P "$INSTALLER_P12_PASSWORD" \
+            -T /usr/bin/pkgbuild -T /usr/bin/productbuild -T /usr/bin/security >/dev/null
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$keychain_password" "$temporary_keychain" >/dev/null
+          verify_identity() {
+            identity="$1"
+            expected_pin="$2"
+            label="$3"
+            identity_count="$(security find-identity -v "$temporary_keychain" | grep -F -c "\"$identity\"" || true)"
+            test "$identity_count" = 1
+            certificate="$credential_dir/$label.pem"
+            security find-certificate -c "$identity" -p "$temporary_keychain" > "$certificate"
+            test "$(grep -c -- '-----BEGIN CERTIFICATE-----' "$certificate")" = 1
+            actual_pin="$(openssl x509 -in "$certificate" -noout -fingerprint -sha256 | \
+              awk -F= '{print $2}' | tr -d ':' | tr '[:lower:]' '[:upper:]')"
+            test "$actual_pin" = "$expected_pin"
+          }
+          verify_identity "$APPLICATION_IDENTITY" "$WK_MAC_APP_PIN" application
+          verify_identity "$INSTALLER_IDENTITY" "$WK_MAC_INSTALLER_PIN" installer
+          notary_profile="WhykikiRelease-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          xcrun notarytool store-credentials "$notary_profile" --key "$notary_key" \
+            --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" \
+            --keychain "$temporary_keychain" --validate >/dev/null
+          rm -f -- "$app_p12" "$installer_p12" "$notary_key"
+          for credential_file in "$app_p12" "$installer_p12" "$notary_key"; do
+            [[ ! -e "$credential_file" ]]
+          done
+          unset APPLICATION_P12_BASE64 APPLICATION_P12_PASSWORD \
+            INSTALLER_P12_BASE64 INSTALLER_P12_PASSWORD NOTARY_PRIVATE_KEY_P8_BASE64
+          export SUBLAB808_APPLICATION_IDENTITY="$APPLICATION_IDENTITY"
+          export SUBLAB808_INSTALLER_IDENTITY="$INSTALLER_IDENTITY"
+          export SUBLAB808_NOTARY_PROFILE="$notary_profile"
+          export SUBLAB808_NOTARY_KEYCHAIN="$temporary_keychain"
+          export SUBLAB808_BUILD_JOBS=3
+          ./scripts/package-release.sh Release "$WK_RELEASE_VERSION"
+          shopt -s nullglob
+          candidates=(dist/"SubLab808-$WK_RELEASE_VERSION-"*)
+          shopt -u nullglob
+          [[ ${#candidates[@]} -eq 1 && -d "${candidates[0]}" ]]
+          python3 -B scripts/macos-release-assets.py prepare \
+            --candidate "${candidates[0]}" --output release-assets-macos \
+            --product SubLab808 --version "$WK_RELEASE_VERSION" --commit "$WK_TAG_COMMIT" \
+            --application-signer-sha256 "$WK_MAC_APP_PIN" \
+            --installer-signer-sha256 "$WK_MAC_INSTALLER_PIN"
+          package="release-assets-macos/SubLab808-$WK_RELEASE_VERSION-macOS-universal.pkg"
+          archive="release-assets-macos/SubLab808-$WK_RELEASE_VERSION-macOS-universal-VST3.zip"
+          pkg_signature="$(LC_ALL=C pkgutil --check-signature "$package" 2>&1)"
+          grep -F "$INSTALLER_IDENTITY" <<< "$pkg_signature" >/dev/null
+          grep -F 'Signed with a trusted timestamp' <<< "$pkg_signature" >/dev/null
+          package_installer_pin="$(printf '%s\n' "$pkg_signature" | awk '
+            /^[[:space:]]*1[.][[:space:]]/ { leaf = 1; next }
+            leaf && /SHA256 Fingerprint:/ { fingerprint = 1; sub(/^.*SHA256 Fingerprint:/, "") }
+            fingerprint {
+              line = $0
+              gsub(/[^0-9A-Fa-f]/, "", line)
+              value = value toupper(line)
+              if (length(value) >= 64) { print substr(value, 1, 64); exit }
+            }')"
+          test "$package_installer_pin" = "$WK_MAC_INSTALLER_PIN"
+          xcrun stapler validate "$package"
+          spctl --assess --type install --verbose=4 "$package"
+          roundtrip="$credential_dir/zip-roundtrip"
+          mkdir "$roundtrip"
+          ditto -x -k "$archive" "$roundtrip"
+          bundle="$roundtrip/SubLab808.vst3"
+          codesign --verify --deep --strict "$bundle"
+          codesign_details="$(codesign -dv --verbose=4 "$bundle" 2>&1)"
+          grep -F "Authority=$APPLICATION_IDENTITY" <<< "$codesign_details" >/dev/null
+          grep -F 'Runtime Version=' <<< "$codesign_details" >/dev/null
+          grep -F 'Timestamp=' <<< "$codesign_details" >/dev/null
+          certificate_prefix="$credential_dir/artifact-signing-certificate-"
+          codesign -d --extract-certificates "$certificate_prefix" "$bundle"
+          test -f "${certificate_prefix}0"
+          artifact_app_pin="$(openssl x509 -inform DER -in "${certificate_prefix}0" \
+            -noout -fingerprint -sha256 | awk -F= '{print $2}' | tr -d ':' | tr '[:lower:]' '[:upper:]')"
+          test "$artifact_app_pin" = "$WK_MAC_APP_PIN"
+          xcrun stapler validate "$bundle"
+          spctl --assess --type execute --verbose=4 "$bundle"
+          architectures="$(lipo -archs "$bundle/Contents/MacOS/SubLab808" | tr ' ' '\n' | LC_ALL=C sort | xargs)"
+          test "$architectures" = 'arm64 x86_64'
+
+      - name: Upload signed and notarized macOS candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: SubLab808-macOS-universal-SIGNED-NOTARIZED-RELEASE-CANDIDATE-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-assets-macos
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-release:
+    name: Publish complete cross-platform release
+    needs: [build-windows, build-macos]
+    if: >-
+      inputs.confirm_release == true &&
+      github.repository == 'TheWhykiki/SubLab808' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: macos-15
+    permissions:
+      contents: write
+    env:
+      PRODUCT: SubLab808
+      SIGNER_SHA256: ${{ vars.WINDOWS_CODE_SIGNING_CERT_SHA256 }}
+      APPLICATION_IDENTITY: ${{ vars.MACOS_DEVELOPER_ID_APPLICATION_IDENTITY }}
+      INSTALLER_IDENTITY: ${{ vars.MACOS_DEVELOPER_ID_INSTALLER_IDENTITY }}
+      APPLICATION_SIGNER_SHA256: ${{ vars.MACOS_DEVELOPER_ID_APPLICATION_CERT_SHA256 }}
+      INSTALLER_SIGNER_SHA256: ${{ vars.MACOS_DEVELOPER_ID_INSTALLER_CERT_SHA256 }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download both signed Windows candidates
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: SubLab808-Windows-*-SIGNED-RELEASE-CANDIDATE-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-assets/windows
+          merge-multiple: true
+
+      - name: Download signed and notarized macOS candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: SubLab808-macOS-universal-SIGNED-NOTARIZED-RELEASE-CANDIDATE-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-assets/macos
+
+      - name: Revalidate source, evidence, signatures, notarization and all hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag='${{ inputs.tag }}'
+          [[ "$tag" =~ ^v(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,4})$ ]]
+          version="${tag#v}"
+          tag_commit="$(git rev-parse "refs/tags/$tag^{commit}")"
+          test "$(git rev-parse HEAD)" = "$tag_commit"
+          default_branch='${{ github.event.repository.default_branch }}'
+          git fetch --no-tags origin "+refs/heads/$default_branch:refs/remotes/origin/$default_branch"
+          git merge-base --is-ancestor "$tag_commit" "refs/remotes/origin/$default_branch"
+          remote_lines="$(git ls-remote --exit-code origin "refs/tags/$tag" "refs/tags/$tag^{}")"
+          remote_commit="$(printf '%s\n' "$remote_lines" | awk -v peeled="refs/tags/$tag^{}" '$2 == peeled { print $1 }')"
+          if [[ -z "$remote_commit" ]]; then
+            remote_commit="$(printf '%s\n' "$remote_lines" | awk -v direct="refs/tags/$tag" '$2 == direct { print $1 }')"
+          fi
+          test "$remote_commit" = "$tag_commit"
+          pin="$(printf '%s' "$SIGNER_SHA256" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+          app_pin="$(printf '%s' "$APPLICATION_SIGNER_SHA256" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+          installer_pin="$(printf '%s' "$INSTALLER_SIGNER_SHA256" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+          [[ "$pin" =~ ^[0-9A-F]{64}$ ]]
+          [[ "$app_pin" =~ ^[0-9A-F]{64}$ ]]
+          [[ "$installer_pin" =~ ^[0-9A-F]{64}$ ]]
+          python3 scripts/validate-windows-release-assets.py \
+            --directory release-assets/windows --product SubLab808 --version "$version" \
+            --source-commit "$tag_commit" \
+            --expected-signer-sha256 "$pin" \
+            --architecture x64 --architecture arm64ec
+          python3 -B scripts/macos-release-assets.py validate \
+            --directory release-assets/macos --product SubLab808 --version "$version" \
+            --commit "$tag_commit" --application-signer-sha256 "$app_pin" \
+            --installer-signer-sha256 "$installer_pin"
+          package="release-assets/macos/SubLab808-$version-macOS-universal.pkg"
+          archive="release-assets/macos/SubLab808-$version-macOS-universal-VST3.zip"
+          pkg_signature="$(LC_ALL=C pkgutil --check-signature "$package" 2>&1)"
+          grep -F "$INSTALLER_IDENTITY" <<< "$pkg_signature" >/dev/null
+          grep -F 'Signed with a trusted timestamp' <<< "$pkg_signature" >/dev/null
+          package_installer_pin="$(printf '%s\n' "$pkg_signature" | awk '
+            /^[[:space:]]*1[.][[:space:]]/ { leaf = 1; next }
+            leaf && /SHA256 Fingerprint:/ { fingerprint = 1; sub(/^.*SHA256 Fingerprint:/, "") }
+            fingerprint {
+              line = $0
+              gsub(/[^0-9A-Fa-f]/, "", line)
+              value = value toupper(line)
+              if (length(value) >= 64) { print substr(value, 1, 64); exit }
+            }')"
+          test "$package_installer_pin" = "$installer_pin"
+          xcrun stapler validate "$package"
+          spctl --assess --type install --verbose=4 "$package"
+          roundtrip=''
+          cleanup_roundtrip() {
+            status=$?
+            trap - EXIT
+            case "$roundtrip" in
+              "$RUNNER_TEMP"/whykiki-publish.*) rm -rf -- "$roundtrip" ;;
+            esac
+            exit "$status"
+          }
+          trap cleanup_roundtrip EXIT
+          roundtrip="$(mktemp -d "$RUNNER_TEMP/whykiki-publish.XXXXXX")"
+          ditto -x -k "$archive" "$roundtrip"
+          bundle="$roundtrip/SubLab808.vst3"
+          codesign --verify --deep --strict "$bundle"
+          codesign_details="$(codesign -dv --verbose=4 "$bundle" 2>&1)"
+          grep -F "Authority=$APPLICATION_IDENTITY" <<< "$codesign_details" >/dev/null
+          grep -F 'Runtime Version=' <<< "$codesign_details" >/dev/null
+          grep -F 'Timestamp=' <<< "$codesign_details" >/dev/null
+          certificate_prefix="$roundtrip/artifact-signing-certificate-"
+          codesign -d --extract-certificates "$certificate_prefix" "$bundle"
+          test -f "${certificate_prefix}0"
+          artifact_app_pin="$(openssl x509 -inform DER -in "${certificate_prefix}0" \
+            -noout -fingerprint -sha256 | awk -F= '{print $2}' | tr -d ':' | tr '[:lower:]' '[:upper:]')"
+          test "$artifact_app_pin" = "$app_pin"
+          xcrun stapler validate "$bundle"
+          spctl --assess --type execute --verbose=4 "$bundle"
+          architectures="$(lipo -archs "$bundle/Contents/MacOS/SubLab808" | tr ' ' '\n' | LC_ALL=C sort | xargs)"
+          test "$architectures" = 'arm64 x86_64'
+          checksum="SubLab808-$version-SHA256SUMS.txt"
+          checksum_assets=(
+            "release-assets/windows/SubLab808-$version-Windows-x64.msi"
+            "release-assets/windows/SubLab808-$version-Windows-x64.evidence.json"
+            "release-assets/windows/SubLab808-$version-Windows-arm64ec.msi"
+            "release-assets/windows/SubLab808-$version-Windows-arm64ec.evidence.json"
+            "release-assets/macos/SubLab808-$version-macOS-universal.pkg"
+            "release-assets/macos/SubLab808-$version-macOS-universal-VST3.zip"
+            "release-assets/macos/SubLab808-$version-macOS-universal.evidence.json"
+          )
+          : > "release-assets/$checksum"
+          for asset in "${checksum_assets[@]}"; do
+            printf '%s  %s\n' "$(shasum -a 256 "$asset" | awk '{print $1}')" "${asset##*/}" \
+              >> "release-assets/$checksum"
+          done
+
+      - name: Atomically publish every platform from a verified draft
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag='${{ inputs.tag }}'
+          version="${tag#v}"
+          tag_commit="$(git rev-parse "refs/tags/$tag^{commit}")"
+          published=false
+          created_release_id=''
+          verify_origin_tag() {
+            remote_lines="$(git ls-remote --exit-code origin "refs/tags/$tag" "refs/tags/$tag^{}")"
+            remote_commit="$(printf '%s\n' "$remote_lines" | awk -v peeled="refs/tags/$tag^{}" '$2 == peeled { print $1 }')"
+            if [[ -z "$remote_commit" ]]; then
+              remote_commit="$(printf '%s\n' "$remote_lines" | awk -v direct="refs/tags/$tag" '$2 == direct { print $1 }')"
+            fi
+            test "$remote_commit" = "$tag_commit"
+          }
+          read_latest_state() {
+            owner="${GITHUB_REPOSITORY%%/*}"
+            repository="${GITHUB_REPOSITORY#*/}"
+            gh api graphql -F owner="$owner" -F repository="$repository" \
+              -f query='query($owner: String!, $repository: String!) {
+                repository(owner: $owner, name: $repository) {
+                  latestRelease { databaseId tagName }
+                }
+              }' \
+              --jq '.data.repository |
+                if type != "object" then error("latest-release query failed")
+                elif .latestRelease == null then ""
+                else [.latestRelease.databaseId, .latestRelease.tagName] | @tsv
+                end'
+          }
+          cleanup_draft() {
+            status=$?
+            trap - EXIT
+            if [[ "$published" != true && -n "$created_release_id" ]]; then
+              set +e
+              draft_state="$(gh api "repos/$GITHUB_REPOSITORY/releases/$created_release_id" \
+                --jq '.draft' 2>/dev/null)"
+              if [[ "$draft_state" == true ]]; then
+                gh api --method DELETE \
+                  "repos/$GITHUB_REPOSITORY/releases/$created_release_id" >/dev/null
+              fi
+            fi
+            exit "$status"
+          }
+          trap cleanup_draft EXIT
+          verify_origin_tag
+          existing="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$tag\") | .id")"
+          test -z "$existing"
+          latest_state="$(read_latest_state)"
+          baseline_latest_id=''
+          latest_tag=''
+          if [[ -n "$latest_state" ]]; then
+            IFS=$'\t' read -r baseline_latest_id latest_tag <<< "$latest_state"
+            [[ "$baseline_latest_id" =~ ^[0-9]+$ ]]
+          fi
+          if [[ -n "$latest_tag" ]]; then
+            [[ "$latest_tag" =~ ^v(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,4})$ ]]
+            python3 -c 'import sys; assert tuple(map(int, sys.argv[2].split("."))) > tuple(map(int, sys.argv[1].split(".")))' \
+              "${latest_tag#v}" "$version"
+          fi
+          assets=(
+            "release-assets/windows/SubLab808-$version-Windows-x64.msi"
+            "release-assets/windows/SubLab808-$version-Windows-x64.evidence.json"
+            "release-assets/windows/SubLab808-$version-Windows-arm64ec.msi"
+            "release-assets/windows/SubLab808-$version-Windows-arm64ec.evidence.json"
+            "release-assets/macos/SubLab808-$version-macOS-universal.pkg"
+            "release-assets/macos/SubLab808-$version-macOS-universal-VST3.zip"
+            "release-assets/macos/SubLab808-$version-macOS-universal.evidence.json"
+            "release-assets/SubLab808-$version-SHA256SUMS.txt"
+          )
+          created_release_id="$(gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
+            -f tag_name="$tag" -f target_commitish="$tag_commit" \
+            -f name="SubLab808 $version" \
+            -f body='Signed Windows x64 and native ARM64EC installers plus the signed, notarized universal macOS VST3 package and archive. See the attached evidence and SHA-256 manifest.' \
+            -F draft=true -F prerelease=false --jq '.id')"
+          [[ "$created_release_id" =~ ^[0-9]+$ ]]
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/$created_release_id" --jq '.draft')" = true
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/$created_release_id" --jq '.prerelease')" = false
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/$created_release_id" --jq '.tag_name')" = "$tag"
+          gh release upload "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY"
+          expected_names="$(printf '%s\n' "${assets[@]##*/}" | LC_ALL=C sort)"
+          actual_names="$(gh api "repos/$GITHUB_REPOSITORY/releases/$created_release_id" --jq '.assets[].name' | LC_ALL=C sort)"
+          test "$actual_names" = "$expected_names"
+          for asset in "${assets[@]}"; do
+            name="${asset##*/}"
+            local_digest="sha256:$(shasum -a 256 "$asset" | awk '{print $1}')"
+            remote_digest="$(gh api "repos/$GITHUB_REPOSITORY/releases/$created_release_id" \
+              --jq ".assets[] | select(.name == \"$name\") | .digest")"
+            test "$remote_digest" = "$local_digest"
+          done
+          verify_origin_tag
+          current_latest_state="$(read_latest_state)"
+          test "$current_latest_state" = "$latest_state"
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$created_release_id" \
+            -F draft=false -F prerelease=false -f make_latest=true >/dev/null
+          published=true
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/$created_release_id" --jq '.draft')" = false
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/$created_release_id" --jq '.prerelease')" = false
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/$created_release_id" --jq '.tag_name')" = "$tag"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.id')" = "$created_release_id"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')" = "$tag"

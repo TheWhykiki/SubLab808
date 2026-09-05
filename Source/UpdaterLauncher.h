@@ -4,10 +4,12 @@
  #define WK_UPDATER_ENABLED 0
 #endif
 
-#if JUCE_MAC && WK_UPDATER_ENABLED
+#if (JUCE_MAC || JUCE_WINDOWS) && WK_UPDATER_ENABLED
 namespace wk {
-__attribute__((visibility("hidden"))) juce::Result launchNativeUpdater(const juce::String& product,
-                                                                      const juce::String& version);
+#if JUCE_MAC
+__attribute__((visibility("hidden")))
+#endif
+juce::Result launchNativeUpdater(const juce::String& product, const juce::String& version);
 }
 #endif
 
@@ -16,8 +18,8 @@ inline void configureUpdaterButton(juce::TextButton& button, juce::String produc
 {
     button.setButtonText("Updates...");
     button.setTitle(product + " updates");
-    button.setTooltip("Check, download and install a newer stable version with the macOS updater");
-   #if JUCE_MAC && WK_UPDATER_ENABLED
+    button.setTooltip("Check, verify and install a newer stable version");
+   #if (JUCE_MAC || JUCE_WINDOWS) && WK_UPDATER_ENABLED
     button.onClick = [product = std::move(product), version = std::move(version)]
     {
         const auto result = launchNativeUpdater(product, version);
@@ -28,7 +30,13 @@ inline void configureUpdaterButton(juce::TextButton& button, juce::String produc
    #else
     juce::ignoreUnused(product, version);
     button.setEnabled(false);
+   #if JUCE_WINDOWS
+    button.setTooltip("Automatic updates require a signed Windows release build");
+   #elif JUCE_MAC
     button.setTooltip("Automatic updates are available in installed macOS VST3 builds");
+   #else
+    button.setTooltip("Automatic updates are unavailable on this platform");
+   #endif
    #endif
 }
 }
