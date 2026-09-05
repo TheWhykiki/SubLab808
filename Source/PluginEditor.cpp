@@ -1,4 +1,5 @@
 #include "PluginEditor.h"
+#include "UpdaterLauncher.h"
 
 SubLabLookAndFeel::SubLabLookAndFeel()
 {
@@ -35,7 +36,7 @@ void SubLabLookAndFeel::drawRotarySlider(juce::Graphics& g, int x, int y, int w,
 }
 
 SubLab808Editor::SubLab808Editor(SubLab808Processor& p)
-    : AudioProcessorEditor(&p), audioProcessor(p), dials { &decay, &release, &punch, &pitchDecay, &glide, &tune, &body, &click, &drive, &tone, &velocity, &output }
+    : AudioProcessorEditor(&p), audioProcessor(p), dials { &decay, &release, &punch, &pitchDecay, &glide, &tune, &body, &click, &drive, &tone, &velocity, &output }, presetBar(p.presets)
 {
     const auto initialSize = audioProcessor.getEditorSize();
     setLookAndFeel(&look);
@@ -54,24 +55,9 @@ SubLab808Editor::SubLab808Editor(SubLab808Processor& p)
     addDial(tone, "tone", "TONE", " Hz");
     addDial(velocity, "velocity", "VELOCITY", " %");
     addDial(output, "output", "OUTPUT", " dB");
-    presetLabel.setText("FACTORY PRESET", juce::dontSendNotification);
-    presetLabel.setJustificationType(juce::Justification::centredRight);
-    presetLabel.setColour(juce::Label::textColourId, juce::Colour(0xff7e8b96));
-    presetLabel.setFont(juce::FontOptions(10.0f, juce::Font::bold));
-    presetBox.setName("Factory Preset");
-    presetBox.setTitle("Factory Preset");
-    presetBox.setDescription("Selects one of the factory bass sounds");
-    presetBox.setTooltip("Factory preset; manual edits are shown as Custom");
-    presetBox.setTextWhenNothingSelected("Custom");
-    addAndMakeVisible(presetLabel);
-    for (int i = 0; i < audioProcessor.getNumPrograms(); ++i)
-        presetBox.addItem(audioProcessor.getProgramName(i), i + 1);
-    presetBox.setSelectedId(audioProcessor.getCurrentProgram() + 1, juce::dontSendNotification);
-    presetBox.setColour(juce::ComboBox::backgroundColourId, juce::Colour(0xff11161b));
-    presetBox.setColour(juce::ComboBox::outlineColourId, juce::Colour(0xff303942));
-    presetBox.setColour(juce::ComboBox::textColourId, juce::Colour(0xffe9edf1));
-    presetBox.onChange = [this] { audioProcessor.setCurrentProgram(presetBox.getSelectedId() - 1); };
-    addAndMakeVisible(presetBox);
+    addAndMakeVisible(presetBar);
+    wk::configureUpdaterButton(updates, "SubLab808", SUBLAB808_VERSION_STRING);
+    addAndMakeVisible(updates);
     oneShotButton.setColour(juce::ToggleButton::textColourId, juce::Colour(0xffaab4bd));
     oneShotButton.setColour(juce::ToggleButton::tickColourId, juce::Colour(0xffff4f2e));
     oneShotButton.setTitle("One Shot playback mode");
@@ -119,11 +105,11 @@ void SubLab808Editor::paint(juce::Graphics& g)
     g.setColour(juce::Colour(0xfff4f6f8)); g.drawText("SUBLAB", 34, 22, titleWidth + 4, 42, juce::Justification::centredLeft);
     g.setColour(juce::Colour(0xffff4f2e)); g.drawText("808", 34 + titleWidth + 6, 22, 80, 42, juce::Justification::centredLeft);
     g.setColour(juce::Colour(0xff7e8b96)); g.setFont(juce::FontOptions(11.0f));
-    g.drawText(juce::String("MONOPHONIC BASS SYNTHESIZER  /  APPLE SILICON  /  v") + SUBLAB808_VERSION_STRING, 36, 61, 420, 18, juce::Justification::centredLeft);
-    auto panel = juce::Rectangle<float>(24.0f, 98.0f, (float) getWidth() - 48.0f, (float) getHeight() - 128.0f);
+    g.drawText(juce::String("MONOPHONIC BASS SYNTHESIZER  /  NATIVE VST3  /  v") + SUBLAB808_VERSION_STRING, 36, 61, 420, 18, juce::Justification::centredLeft);
+    auto panel = juce::Rectangle<float>(24.0f, 132.0f, (float) getWidth() - 48.0f, (float) getHeight() - 162.0f);
     g.setColour(juce::Colour(0xff11161b)); g.fillRoundedRectangle(panel, 12.0f);
     g.setColour(juce::Colour(0xff273039)); g.drawRoundedRectangle(panel, 12.0f, 1.0f);
-    g.setColour(juce::Colour(0xff1f272e)); g.drawVerticalLine(getWidth() / 2, 118.0f, (float) getHeight() - 52.0f);
+    g.setColour(juce::Colour(0xff1f272e)); g.drawVerticalLine(getWidth() / 2, 149.0f, (float) getHeight() - 52.0f);
     auto meterBounds = juce::Rectangle<float>((float) getWidth() - 140.0f, 40.0f, 100.0f, 8.0f);
     g.setColour(juce::Colour(0xff252d35)); g.fillRoundedRectangle(meterBounds, 4.0f);
     g.setColour(meter > 0.88f ? juce::Colour(0xffffd166) : juce::Colour(0xffff4f2e));
@@ -134,11 +120,10 @@ void SubLab808Editor::paint(juce::Graphics& g)
 
 void SubLab808Editor::resized()
 {
-    const auto presetX = juce::jmax(280, getWidth() / 2 - 130);
-    presetLabel.setBounds(presetX, 35, 90, 25);
-    presetBox.setBounds(presetX + 96, 34, 180, 28);
-    oneShotButton.setBounds(presetX + 286, 34, 96, 28);
-    auto area = getLocalBounds().reduced(36).withTrimmedTop(82).withTrimmedBottom(12);
+    presetBar.setBounds(30, 88, getWidth() - 60, 36);
+    updates.setBounds(getWidth() - 120, getHeight() - 26, 90, 20);
+    oneShotButton.setBounds(getWidth() - 265, 31, 115, 28);
+    auto area = getLocalBounds().reduced(36).withTrimmedTop(113).withTrimmedBottom(12);
     auto rowHeight = area.getHeight() / 2;
     for (int row = 0; row < 2; ++row) {
         auto rowArea = area.removeFromTop(rowHeight);
@@ -158,7 +143,5 @@ void SubLab808Editor::timerCallback()
     const auto storedSize = audioProcessor.getEditorSize();
     if (getWidth() != storedSize.x || getHeight() != storedSize.y) setSize(storedSize.x, storedSize.y);
     meter = juce::jmax(audioProcessor.outputMeter.exchange(0.0f), meter * 0.88f);
-    presetBox.setSelectedId(audioProcessor.isPresetModified() ? 0 : audioProcessor.getCurrentProgram() + 1,
-                            juce::dontSendNotification);
     repaint(getWidth() - 150, 30, 120, 45);
 }

@@ -1,68 +1,64 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "FactoryBank.h"
+#include <cmath>
 #include <limits>
 
-namespace {
-// Preset values are named, so a column cannot be silently swapped; each field maps to its
-// parameter through presetFields below (also used to validate ranges in the smoke tests).
-struct PresetValues
+namespace
 {
-    float decay, release, punch, pitchDecay, glide, tune, body, click, drive, tone, velocity, output;
-};
-struct FactoryPreset { const char* name; PresetValues values; bool oneShot; };
-constexpr std::array<FactoryPreset, 8> factoryPresets {{
-    { "Deep Foundation", { .decay = 1.40f, .release = 0.18f, .punch = 12.0f, .pitchDecay = 0.070f, .glide = 0.030f, .tune = 0.0f, .body = 10.0f, .click = 5.0f, .drive = 2.0f, .tone = 1800.0f, .velocity = 72.0f, .output = -3.0f }, true },
-    { "Modern Knock",    { .decay = 0.72f, .release = 0.09f, .punch = 24.0f, .pitchDecay = 0.035f, .glide = 0.015f, .tune = 0.0f, .body = 25.0f, .click = 22.0f, .drive = 7.0f, .tone = 5200.0f, .velocity = 90.0f, .output = -3.0f }, true },
-    { "Long Slide",      { .decay = 2.80f, .release = 0.32f, .punch = 10.0f, .pitchDecay = 0.090f, .glide = 0.180f, .tune = 0.0f, .body = 16.0f, .click = 4.0f, .drive = 4.0f, .tone = 2600.0f, .velocity = 65.0f, .output = -4.0f }, false },
-    { "Dirty Trunk",     { .decay = 1.10f, .release = 0.12f, .punch = 18.0f, .pitchDecay = 0.055f, .glide = 0.045f, .tune = 0.0f, .body = 42.0f, .click = 12.0f, .drive = 16.0f, .tone = 3200.0f, .velocity = 85.0f, .output = -5.0f }, true },
-    { "Short Punch",     { .decay = 0.28f, .release = 0.05f, .punch = 32.0f, .pitchDecay = 0.022f, .glide = 0.000f, .tune = 0.0f, .body = 30.0f, .click = 38.0f, .drive = 9.0f, .tone = 7800.0f, .velocity = 100.0f, .output = -2.0f }, true },
-    { "Soft Pillow",     { .decay = 1.75f, .release = 0.40f, .punch = 7.0f, .pitchDecay = 0.110f, .glide = 0.060f, .tune = 0.0f, .body = 5.0f, .click = 0.0f, .drive = 1.0f, .tone = 1250.0f, .velocity = 55.0f, .output = -2.5f }, false },
-    { "Upper Bass",      { .decay = 0.90f, .release = 0.10f, .punch = 15.0f, .pitchDecay = 0.045f, .glide = 0.025f, .tune = 12.0f, .body = 36.0f, .click = 18.0f, .drive = 8.0f, .tone = 6400.0f, .velocity = 82.0f, .output = -4.0f }, true },
-    { "Sub Destroyer",   { .decay = 1.55f, .release = 0.16f, .punch = 28.0f, .pitchDecay = 0.030f, .glide = 0.040f, .tune = -12.0f, .body = 55.0f, .click = 15.0f, .drive = 22.0f, .tone = 4100.0f, .velocity = 95.0f, .output = -7.0f }, true }
-}};
-struct PresetField { const char* id; float PresetValues::* member; };
-constexpr std::array<PresetField, 12> presetFields {{
-    { "decay", &PresetValues::decay }, { "release", &PresetValues::release }, { "punch", &PresetValues::punch },
-    { "pitchdecay", &PresetValues::pitchDecay }, { "glide", &PresetValues::glide }, { "tune", &PresetValues::tune },
-    { "body", &PresetValues::body }, { "click", &PresetValues::click }, { "drive", &PresetValues::drive },
-    { "tone", &PresetValues::tone }, { "velocity", &PresetValues::velocity }, { "output", &PresetValues::output }
-}};
+bool parseFiniteStateValue(const juce::var& encoded, double& result)
+{
+    if (encoded.isDouble() || encoded.isInt() || encoded.isInt64())
+        result = static_cast<double>(encoded);
+    else if (encoded.isString())
+    {
+        const auto text = encoded.toString().trim();
+        if (text.isEmpty()) return false;
+        auto cursor = text.getCharPointer();
+        const auto parsed = juce::CharacterFunctions::readDoubleValue(cursor);
+        if (! cursor.isEmpty() || ! std::isfinite(parsed)) return false;
+        result = parsed;
+    }
+    else return false;
+    return std::isfinite(result) && std::isfinite(static_cast<float>(result));
+}
 }
 
-SubLab808Processor::SubLab808Processor()
+SubLab808Processor::SubLab808Processor(juce::File presetStorage)
     : AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true)),
-      parameters(*this, nullptr, "PARAMETERS", makeLayout())
+      parameters(*this, nullptr, "PARAMETERS", makeLayout()),
+      presets(*this, parameters, "SubLab808", factoryBank(), std::move(presetStorage))
 {
     clearHeldKeys();
+    for (size_t i = 0; i < parameterIds.size(); ++i)
+        rangedParameters[i] = parameters.getParameter(parameterIds[i]);
     ControlOperation initialProgram;
     initialProgram.programIndex = 0;
     initialProgram.notifyHost = false;
     submitControlOperation(std::move(initialProgram));
-    for (const auto& field : presetFields) parameters.addParameterListener(field.id, this);
-    parameters.addParameterListener("oneshot", this);
+    for (const auto& [id, value] : factoryBank().front().values) { juce::ignoreUnused(value); parameters.addParameterListener(id, this); }
 }
 
 SubLab808Processor::~SubLab808Processor()
 {
-    for (const auto& field : presetFields) parameters.removeParameterListener(field.id, this);
-    parameters.removeParameterListener("oneshot", this);
+    cancelPendingUpdate();
+    for (const auto& [id, value] : factoryBank().front().values) { juce::ignoreUnused(value); parameters.removeParameterListener(id, this); }
 }
 
-int SubLab808Processor::getNumPrograms() { return (int) factoryPresets.size(); }
+int SubLab808Processor::getNumPrograms() { return (int) factoryBank().size(); }
 
 float SubLab808Processor::getFactoryPresetValue(int index, const juce::String& parameterId) const
 {
-    if (! juce::isPositiveAndBelow(index, (int) factoryPresets.size())) return 0.0f;
-    if (parameterId == "oneshot") return factoryPresets[(size_t) index].oneShot ? 1.0f : 0.0f;
-    for (const auto& field : presetFields)
-        if (parameterId == field.id) return factoryPresets[(size_t) index].values.*field.member;
-    return 0.0f;
+    if (! juce::isPositiveAndBelow(index, (int) factoryBank().size())) return 0.0f;
+    const auto& values = factoryBank()[static_cast<size_t>(index)].values;
+    const auto it = values.find(parameterId);
+    return it == values.end() ? 0.0f : it->second;
 }
 
 const juce::String SubLab808Processor::getProgramName(int index)
 {
     if (! juce::isPositiveAndBelow(index, getNumPrograms())) return {};
-    return factoryPresets[(size_t) index].name;
+    return factoryBank()[(size_t) index].name;
 }
 
 void SubLab808Processor::setCurrentProgram(int index)
@@ -76,108 +72,163 @@ void SubLab808Processor::setCurrentProgram(int index)
 
 void SubLab808Processor::submitControlOperation(ControlOperation operation)
 {
-    const auto caller = juce::Thread::getCurrentThreadId();
-    std::unique_lock lock(controlMutex);
-
-    const auto enqueue = [this] (ControlOperation pending) {
-        // Preserve finite FIFO cascades such as A -> B -> A, while placing a hard
-        // ceiling on pathological listeners that request a new program forever.
-        if (controlOperationBudget == 0) return;
-        --controlOperationBudget;
-        pendingControlOperations.push_back(std::move(pending));
-    };
-
-    // Calls made recursively from our own listener callbacks are deferred until
-    // the outermost operation finishes. This prevents an old listener traversal
-    // from resuming after a newer preset has already been published.
-    if (controlOwner == caller) {
-        if (stateRestoreActive.load()) return;
-        enqueue(std::move(operation));
+    const auto restoring = operation.kind == ControlOperation::Kind::state;
+    if (! restoring && notificationOwner.load(std::memory_order_acquire) == juce::Thread::getCurrentThreadId())
+    {
+        // Only program echoes are suppressed during restore. A real nested STATE
+        // always commits synchronously, even while an older notification is held.
+        if (notifyingRestore.load(std::memory_order_acquire)) return;
+        const std::lock_guard lock(controlMutex);
+        operation.queuedProgram = true;
+        operation.restoreEpoch = restoreEpoch;
+        pendingProgramOperations.push_back(std::move(operation));
         return;
     }
-
-    // AudioProcessor setters are synchronous: an independent control thread waits
-    // for the current writer, then applies its operation before returning. Callers
-    // must not create a cross-thread wait cycle by joining such a setter from one
-    // of the processor's own synchronous callbacks.
-    while (controlOwner != nullptr)
-        controlCondition.wait(lock);
-
-    controlOwner = caller;
-    controlOperationBudget = maxControlOperationsPerDrain - 1;
-    lock.unlock();
-
-    for (;;) {
-        performControlOperation(operation);
-
-        lock.lock();
-        if (pendingControlOperations.empty()) {
-            controlOwner = nullptr;
-            controlOperationBudget = 0;
-            lock.unlock();
-            controlCondition.notify_all();
-            return;
-        }
-        operation = std::move(pendingControlOperations.front());
-        pendingControlOperations.pop_front();
-        lock.unlock();
-    }
+    commitControlOperation(std::move(operation));
+    drainStateNotifications();
+    applyRestoredEditorSize();
+    if (restoring) triggerAsyncUpdate(); // also deliver worker-thread size restores on the message thread
 }
 
-void SubLab808Processor::performControlOperation(const ControlOperation& operation)
+void SubLab808Processor::commitControlOperation(ControlOperation operation)
 {
-    bool programChanged = false;
+    const auto restoring = operation.kind == ControlOperation::Kind::state;
+    std::array<float, parameterIds.size()> updates {};
+    if (restoring)
     {
-        beginStateTransaction();
-        const juce::ScopeGuard finishTransaction { [this] { endStateTransaction(); } };
-        if (operation.kind == ControlOperation::Kind::program)
-            programChanged = applyProgramNow(operation.programIndex);
-        else
-            applyStateNow(operation.state);
+        operation.programIndex = juce::jlimit(0, getNumPrograms() - 1,
+                                               (int) operation.state.getProperty("factoryProgram", 0));
+        // Pinned APVTS creates absent PARAM children with defaults, and applies
+        // the same default to a present child without "value". Last duplicate wins.
+        for (size_t i = 0; i < parameterIds.size(); ++i) updates[i] = rangedParameters[i]->getDefaultValue();
+        for (const auto& child : operation.state)
+            for (size_t i = 0; i < parameterIds.size(); ++i)
+                if (child["id"].toString() == parameterIds[i])
+                {
+                    const auto* parameter = rangedParameters[i];
+                    updates[i] = child.hasProperty("value")
+                        ? parameter->convertTo0to1(static_cast<float>(child["value"]))
+                        : parameter->getDefaultValue();
+                    break;
+                }
     }
+    else
+    {
+        const auto& values = factoryBank()[static_cast<size_t>(operation.programIndex)].values;
+        for (size_t i = 0; i < parameterIds.size(); ++i)
+            updates[i] = rangedParameters[i]->convertTo0to1(values.at(parameterIds[i]));
+    }
+    const std::lock_guard lock(controlMutex);
+    if (operation.queuedProgram && operation.restoreEpoch != restoreEpoch) return;
+    if (! restoring && currentProgram.load() == operation.programIndex && parametersMatchProgram(operation.programIndex))
+    {
+        presetModified.store(false);
+        presets.clearSelection();
+        return; // Coalesce a host echo; distinct queued A -> B -> A requests still commit in order.
+    }
+    parameterTransactionSequence.fetch_add(1, std::memory_order_seq_cst);
+    const juce::ScopeGuard finishWrite { [this] { parameterTransactionSequence.fetch_add(1, std::memory_order_seq_cst); } };
+    // Standard AudioParameterFloat/Bool setters have no listener callbacks. Never
+    // call APVTS replaceState/copyState or notifying setters while holding this gate.
+    for (size_t i = 0; i < parameterIds.size(); ++i) rangedParameters[i]->setValue(updates[i]);
+    currentProgram.store(operation.programIndex);
+    if (restoring)
+    {
+        stateExtensions = std::move(operation.state);
+        const auto width = juce::jlimit(820, 1100, (int) stateExtensions.getProperty("editorWidth", 860));
+        const auto height = juce::jlimit(430, 680, (int) stateExtensions.getProperty("editorHeight", 520));
+        editorSize.store(packEditorSize(width, height) | editorRestorePendingMask);
+        presetModified.store((bool) stateExtensions.getProperty("presetModified", false)
+                             || ! parametersMatchProgram(operation.programIndex));
+        clickSequenceGeneration.fetch_add(1, std::memory_order_seq_cst);
+        ++restoreEpoch;
+        pendingProgramOperations.clear(); // only requests older than this restore; later callbacks may enqueue again
+        presets.restoreSelection(stateExtensions);
+    }
+    else
+    {
+        presetModified.store(! parametersMatchProgram(operation.programIndex));
+        presets.clearSelection(); // publish selection revision only after the complete factory commit
+    }
+    committedProgramNotification = ! restoring && operation.notifyHost;
+    committedRestoreNotification = restoring;
+    controlGeneration.fetch_add(1, std::memory_order_release);
+}
 
-    if (programChanged && operation.notifyHost) {
-        updateHostDisplay(ChangeDetails().withProgramChanged(true));
+void SubLab808Processor::drainStateNotifications()
+{
+    juce::Thread::ThreadID expected = nullptr;
+    if (! notificationOwner.compare_exchange_strong(expected, juce::Thread::getCurrentThreadId(),
+                                                    std::memory_order_acq_rel, std::memory_order_acquire))
+        return; // This caller may own a JUCE listener lock. Never wait for the dispatcher.
+    internalParameterChangeDepth.fetch_add(1);
+    const juce::ScopeGuard finish { [this] {
+        internalParameterChangeDepth.fetch_sub(1);
+        {
+            const std::lock_guard lock(controlMutex);
+            if (! parametersMatchProgram(currentProgram.load())) presetModified.store(true);
+        }
+        notifyingRestore.store(false, std::memory_order_release);
+        notificationOwner.store(nullptr, std::memory_order_release);
+        bool more = false;
+        {
+            const std::lock_guard lock(controlMutex);
+            more = controlGeneration.load() != notifiedGeneration.load() || ! pendingProgramOperations.empty();
+        }
+        if (more) triggerAsyncUpdate(); // no lost queue entries or stranded generation on budget exhaustion
+    } };
+    unsigned remaining = maxGenerationsPerDrain;
+    while (remaining > 0)
+    {
+        uint64_t generation = 0;
+        bool notifyProgram = false;
+        std::optional<ControlOperation> pending;
+        {
+            const std::lock_guard lock(controlMutex);
+            generation = controlGeneration.load(std::memory_order_acquire);
+            if (generation == notifiedGeneration.load(std::memory_order_acquire))
+            {
+                if (pendingProgramOperations.empty()) return;
+                pending = std::move(pendingProgramOperations.front());
+                pendingProgramOperations.pop_front();
+            }
+            notifyProgram = committedProgramNotification;
+            notifyingRestore.store(committedRestoreNotification, std::memory_order_release);
+        }
+        if (pending.has_value())
+        {
+#if JUCE_STANDALONE_APPLICATION
+            if (auto callback = beforeQueuedProgramCommitForTesting) callback();
+#endif
+            commitControlOperation(std::move(*pending));
+            // A no-op host echo must not spend a notification generation or loop forever.
+            if (generation == controlGeneration.load(std::memory_order_acquire)) --remaining;
+            continue;
+        }
+        --remaining;
+        bool superseded = false;
+        for (auto* parameter : rangedParameters)
+        {
+            if (generation != controlGeneration.load(std::memory_order_acquire)) { superseded = true; break; }
+            // Notify CURRENT values only. Never write an old notification argument
+            // back to a parameter after a nested or independent state commit.
+            parameter->sendValueChangedMessageToListeners(parameter->getValue());
+            if (generation != controlGeneration.load(std::memory_order_acquire)) { superseded = true; break; }
+        }
+        if (superseded) continue;
+        if (notifyProgram)
+        {
+            updateHostDisplay(ChangeDetails().withProgramChanged(true));
+            if (generation != controlGeneration.load(std::memory_order_acquire)) continue;
+        }
+        notifiedGeneration.store(generation, std::memory_order_release);
     }
 }
 
-bool SubLab808Processor::applyProgramNow(int index)
+void SubLab808Processor::handleAsyncUpdate()
 {
-    if (! juce::isPositiveAndBelow(index, getNumPrograms())) return false;
-
-    if (currentProgram.load() == index && parametersMatchProgram(index)) {
-        presetModified.store(false);
-        return false;
-    }
-
-    struct ParameterUpdate { juce::RangedAudioParameter* parameter; float normalisedValue; };
-    std::array<ParameterUpdate, presetFields.size() + 1> updates {};
-    size_t updateCount = 0;
-
-    internalParameterChangeDepth.fetch_add(1);
-    const auto& preset = factoryPresets[(size_t) index];
-    const auto stage = [&] (juce::RangedAudioParameter* parameter, float normalisedValue) {
-        if (parameter == nullptr) return;
-        parameter->setValue(normalisedValue);
-        updates[updateCount++] = { parameter, parameter->getValue() };
-    };
-    for (const auto& field : presetFields)
-        if (auto* parameter = parameters.getParameter(field.id))
-            stage(parameter, parameter->convertTo0to1(preset.values.*field.member));
-    stage(parameters.getParameter("oneshot"), preset.oneShot ? 1.0f : 0.0f);
-
-    for (size_t i = 0; i < updateCount; ++i)
-        updates[i].parameter->sendValueChangedMessageToListeners(updates[i].normalisedValue);
-
-    currentProgram.store(index);
-    // Do not blindly clear this flag: a host automation write may interleave with
-    // the parameter notifications above. Check once while callbacks are suppressed,
-    // then again after opening the callback gate to close both race windows.
-    presetModified.store(! parametersMatchProgram(index));
-    internalParameterChangeDepth.fetch_sub(1);
-    if (! parametersMatchProgram(index)) presetModified.store(true);
-
-    return true;
+    drainStateNotifications();
+    applyRestoredEditorSize();
 }
 
 void SubLab808Processor::parameterChanged(const juce::String&, float)
@@ -193,13 +244,27 @@ uint64_t SubLab808Processor::packEditorSize(int width, int height) noexcept
 juce::Point<int> SubLab808Processor::getEditorSize() const noexcept
 {
     const auto packed = editorSize.load();
-    return { (int) (uint32_t) (packed >> 32), (int) (uint32_t) packed };
+    return { (int) (uint32_t) ((packed & ~editorRestorePendingMask) >> 32), (int) (uint32_t) packed };
 }
 
 void SubLab808Processor::setEditorSize(int width, int height) noexcept
 {
-    editorSize.store(packEditorSize(juce::jlimit(820, 1100, width),
-                                    juce::jlimit(430, 680, height)));
+    const auto desired = packEditorSize(juce::jlimit(820, 1100, width), juce::jlimit(430, 680, height));
+    auto current = editorSize.load();
+    while ((current & editorRestorePendingMask) == 0 && ! editorSize.compare_exchange_weak(current, desired)) {}
+}
+
+void SubLab808Processor::applyRestoredEditorSize()
+{
+    auto expected = editorSize.load();
+    if ((expected & editorRestorePendingMask) == 0) return;
+    if (auto* manager = juce::MessageManager::getInstanceWithoutCreating(); manager != nullptr && manager->isThisTheMessageThread())
+    {
+        if (auto* editor = getActiveEditor())
+            editor->setSize((int) (uint32_t) ((expected & ~editorRestorePendingMask) >> 32), (int) (uint32_t) expected);
+        const auto acknowledged = expected & ~editorRestorePendingMask;
+        editorSize.compare_exchange_strong(expected, acknowledged);
+    }
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout SubLab808Processor::makeLayout()
@@ -222,40 +287,61 @@ juce::AudioProcessorValueTreeState::ParameterLayout SubLab808Processor::makeLayo
     return { p.begin(), p.end() };
 }
 
+float SubLab808Processor::readParameter(size_t index) const noexcept
+{
+    const auto* parameter = rangedParameters[index];
+    const auto fallback = parameter->convertFrom0to1(parameter->getDefaultValue());
+    const auto normalised = parameter->getValue();
+    if (! std::isfinite(normalised) || normalised < 0.0f || normalised > 1.0f) return fallback;
+    const auto raw = parameter->convertFrom0to1(normalised);
+    const auto& range = parameter->getNormalisableRange();
+    return std::isfinite(raw) && raw >= range.start && raw <= range.end ? raw : fallback;
+}
+
 SubLab808Processor::RuntimeParameters SubLab808Processor::readRuntimeParameters() const
 {
     RuntimeParameters result;
-    result.decay = parameters.getRawParameterValue("decay")->load();
-    result.release = parameters.getRawParameterValue("release")->load();
-    result.punch = parameters.getRawParameterValue("punch")->load();
-    result.pitchDecay = parameters.getRawParameterValue("pitchdecay")->load();
-    result.glide = parameters.getRawParameterValue("glide")->load();
-    result.tune = parameters.getRawParameterValue("tune")->load();
-    result.body = parameters.getRawParameterValue("body")->load();
-    result.click = parameters.getRawParameterValue("click")->load();
-    result.drive = parameters.getRawParameterValue("drive")->load();
-    result.tone = parameters.getRawParameterValue("tone")->load();
-    result.velocity = parameters.getRawParameterValue("velocity")->load();
-    result.output = parameters.getRawParameterValue("output")->load();
-    result.oneShot = parameters.getRawParameterValue("oneshot")->load() >= 0.5f;
+    result.decay = readParameter(0);
+    result.release = readParameter(1);
+    result.punch = readParameter(2);
+    result.pitchDecay = readParameter(3);
+    result.glide = readParameter(4);
+    result.tune = readParameter(5);
+    result.body = readParameter(6);
+    result.click = readParameter(7);
+    result.drive = readParameter(8);
+    result.tone = readParameter(9);
+    result.velocity = readParameter(10);
+    result.output = readParameter(11);
+    result.oneShot = readParameter(12) >= 0.5f;
+    result.clickSequenceGeneration = clickSequenceGeneration.load(std::memory_order_seq_cst);
     return result;
 }
 
 void SubLab808Processor::refreshRuntimeParameters() noexcept
 {
-    const auto before = parameterTransactionSequence.load(std::memory_order_acquire);
+    const auto before = parameterTransactionSequence.load(std::memory_order_seq_cst);
     if ((before & 1u) != 0) return;
 
     const auto candidate = readRuntimeParameters();
-    const auto after = parameterTransactionSequence.load(std::memory_order_acquire);
-    if (before == after) runtimeParameters = candidate;
+    const auto after = parameterTransactionSequence.load(std::memory_order_seq_cst);
+    if (before == after) {
+        // State restore only publishes a generation on the control thread. Adopt it
+        // with the matching, committed parameters; noiseState remains audio-owned.
+        if (candidate.clickSequenceGeneration != runtimeParameters.clickSequenceGeneration)
+            noiseState = initialNoiseSeed;
+        runtimeParameters = candidate;
+    }
 }
 
 void SubLab808Processor::prepareToPlay(double sr, int)
 {
     sampleRate = sr;
     resetSound();
-    runtimeParameters = readRuntimeParameters();
+    {
+        const std::lock_guard lock(controlMutex);
+        runtimeParameters = readRuntimeParameters();
+    }
     clickCoef = std::exp(-1.0f / (0.0006f * (float) sampleRate));
     ampCoef.reset(sampleRate, 0.02); pitchCoef.reset(sampleRate, 0.02);
     glideCoef.reset(sampleRate, 0.02); releaseCoef.reset(sampleRate, 0.02);
@@ -281,6 +367,7 @@ void SubLab808Processor::prepareToPlay(double sr, int)
 void SubLab808Processor::resetSound()
 {
     phase = 0.0; amp = 0.0f; pitchEnv = 0.0f; filterState = 0.0f; click = 0.0f;
+    noiseState = initialNoiseSeed;
     active = false; gateReleased = false; currentKey = -1;
     for (auto& bend : channelBendSemitones) bend.setCurrentAndTargetValue(0.0f);
     clearHeldKeys();
@@ -462,7 +549,11 @@ float SubLab808Processor::renderSample()
     auto sample = (fundamental + bodyNow * 0.22f * harmonic + transient) * amp * velocity;
     sample = std::tanh(sample * driveNow) / std::max(1.0f, std::tanh(driveNow));
     filterState = (1.0f - filterNow) * sample + filterNow * filterState;
-    amp *= gateReleased ? releaseCoef.getNextValue() : ampCoef.getNextValue();
+    // Both ramps follow audio time, including while their envelope phase is inactive.
+    // Otherwise an earlier Release edit would only begin smoothing at NoteOff.
+    const auto decayNow = ampCoef.getNextValue();
+    const auto releaseNow = releaseCoef.getNextValue();
+    amp *= gateReleased ? releaseNow : decayNow;
     pitchEnv *= pitchCoef.getNextValue();
     if (amp < amplitudeSilenceThreshold) {
         amp = 0.0f;
@@ -550,109 +641,64 @@ juce::AudioProcessorEditor* SubLab808Processor::createEditor()
 
 void SubLab808Processor::getStateInformation(juce::MemoryBlock& dest)
 {
-    uint64_t observedGeneration = 0;
+    juce::ValueTree extensions, selection("PARAMETERS");
+    std::array<float, parameterIds.size()> values;
+    int program = 0;
+    bool modified = false;
+    juce::Point<int> size;
     {
-        const juce::ScopedLock lock(stateSnapshotLock);
-        if (stateTransactionActive) {
-            dest = lastCommittedState;
-            return;
-        }
-        observedGeneration = stateSnapshotGeneration;
+        const std::lock_guard lock(controlMutex);
+        extensions = stateExtensions;
+        for (size_t i = 0; i < parameterIds.size(); ++i) values[i] = readParameter(i);
+        program = currentProgram.load();
+        modified = presetModified.load() || ! parametersMatchProgram(program);
+        size = getEditorSize();
+        presets.appendSelection(selection);
     }
-
-    auto snapshot = createStateSnapshot();
+    // Copy and serialize only our immutable state, never the APVTS handle. A
+    // parameter callback can capture the complete committed state without waiting
+    // for the old notification owner or taking JUCE's parameter-listener locks.
+    auto state = extensions.createCopy();
+    for (int child = state.getNumChildren(); --child >= 0;)
+        if (state.getChild(child).hasType("WkPresetSelection")) state.removeChild(child, nullptr);
+    if (const auto selected = selection.getChildWithName("WkPresetSelection"); selected.isValid())
+        state.addChild(selected.createCopy(), -1, nullptr);
+    for (size_t i = 0; i < parameterIds.size(); ++i)
     {
-        const juce::ScopedLock lock(stateSnapshotLock);
-        if (stateTransactionActive || stateSnapshotGeneration != observedGeneration)
-            dest = lastCommittedState;
-        else {
-            lastCommittedState = snapshot;
-            dest = std::move(snapshot);
+        juce::ValueTree parameter;
+        for (int child = state.getNumChildren(); --child >= 0;)
+            if (state.getChild(child)["id"].toString() == parameterIds[i])
+            {
+                parameter = state.getChild(child);
+                break;
+            }
+        if (! parameter.isValid())
+        {
+            parameter = juce::ValueTree("PARAM");
+            parameter.setProperty("id", parameterIds[i], nullptr);
+            state.addChild(parameter, -1, nullptr);
         }
+        parameter.setProperty("value", values[i], nullptr);
     }
-}
-
-juce::MemoryBlock SubLab808Processor::createStateSnapshot()
-{
-    juce::MemoryBlock result;
-    auto state = parameters.copyState();
-    const auto size = getEditorSize();
-    state.setProperty("factoryProgram", currentProgram.load(), nullptr);
-    state.setProperty("presetModified", presetModified.load(), nullptr);
+    state.setProperty("factoryProgram", program, nullptr);
+    state.setProperty("presetModified", modified, nullptr);
     state.setProperty("editorWidth", size.x, nullptr);
     state.setProperty("editorHeight", size.y, nullptr);
-    if (auto xml = state.createXml()) copyXmlToBinary(*xml, result);
-    return result;
-}
-
-void SubLab808Processor::beginStateTransaction()
-{
-    auto baseline = createStateSnapshot();
-    {
-        const juce::ScopedLock lock(stateSnapshotLock);
-        lastCommittedState = std::move(baseline);
-        stateTransactionActive = true;
-        ++stateSnapshotGeneration;
-    }
-    const auto previous = parameterTransactionSequence.fetch_add(1, std::memory_order_acq_rel);
-    juce::ignoreUnused(previous);
-    jassert((previous & 1u) == 0);
-}
-
-void SubLab808Processor::endStateTransaction()
-{
-    auto committed = createStateSnapshot();
-    {
-        const juce::ScopedLock lock(stateSnapshotLock);
-        lastCommittedState = std::move(committed);
-        stateTransactionActive = false;
-        ++stateSnapshotGeneration;
-    }
-    const auto previous = parameterTransactionSequence.fetch_add(1, std::memory_order_release);
-    juce::ignoreUnused(previous);
-    jassert((previous & 1u) != 0);
+    if (auto xml = state.createXml()) copyXmlToBinary(*xml, dest);
 }
 
 bool SubLab808Processor::parametersMatchProgram(int index)
 {
     if (! juce::isPositiveAndBelow(index, getNumPrograms())) return false;
-    const auto& preset = factoryPresets[(size_t) index];
-    for (const auto& field : presetFields) {
-        const auto* value = parameters.getRawParameterValue(field.id);
-        if (value == nullptr || std::abs(value->load() - preset.values.*field.member) > 0.0005f) return false;
+    const auto& preset = factoryBank()[(size_t) index];
+    for (const auto& [id, value] : preset.values) {
+        const auto* parameter = parameters.getParameter(id);
+        if (parameter == nullptr) return false;
+        const auto normalised = parameter->getValue();
+        const auto expected = parameter->convertTo0to1(value);
+        if (! std::isfinite(normalised) || normalised < 0.0f || normalised > 1.0f
+            || ! std::isfinite(expected) || std::abs(normalised - expected) > 0.00002f) return false;
     }
-    const auto* oneShot = parameters.getRawParameterValue("oneshot");
-    return oneShot != nullptr && (oneShot->load() >= 0.5f) == preset.oneShot;
-}
-
-bool SubLab808Processor::applyStateNow(const juce::ValueTree& state)
-{
-    if (! state.isValid() || state.getType() != parameters.state.getType()) return false;
-
-    stateRestoreActive.store(true);
-    const juce::ScopeGuard finishRestore { [this] { stateRestoreActive.store(false); } };
-    const auto restoredProgram = juce::jlimit(0, getNumPrograms() - 1,
-                                              (int) state.getProperty("factoryProgram", 0));
-    const auto hasModifiedFlag = state.hasProperty("presetModified");
-    const auto wasModified = (bool) state.getProperty("presetModified", false);
-    const auto restoredWidth = (int) state.getProperty("editorWidth", 860);
-    const auto restoredHeight = (int) state.getProperty("editorHeight", 520);
-
-    internalParameterChangeDepth.fetch_add(1);
-    parameters.replaceState(state);
-    currentProgram.store(restoredProgram);
-    setEditorSize(restoredWidth, restoredHeight);
-    const auto matchesFactoryProgram = parametersMatchProgram(restoredProgram);
-    presetModified.store((hasModifiedFlag && wasModified) || ! matchesFactoryProgram);
-    internalParameterChangeDepth.fetch_sub(1);
-    if (! parametersMatchProgram(restoredProgram)) presetModified.store(true);
-
-    if (auto* messageManager = juce::MessageManager::getInstanceWithoutCreating();
-        messageManager != nullptr && messageManager->isThisTheMessageThread())
-        if (auto* editor = getActiveEditor()) {
-            const auto restoredSize = getEditorSize();
-            editor->setSize(restoredSize.x, restoredSize.y);
-        }
     return true;
 }
 
@@ -660,7 +706,29 @@ void SubLab808Processor::setStateInformation(const void* data, int size)
 {
     if (auto xml = getXmlFromBinary(data, size)) {
         auto state = juce::ValueTree::fromXml(*xml);
-        if (! state.isValid() || state.getType() != parameters.state.getType()) return;
+        // The schema is fixed. Do not inspect the live APVTS handle before the
+        // control operation is serialized: another restore may be replacing it.
+        if (! state.hasType("PARAMETERS")) return;
+
+        // Reject the complete state before submitting any part of it. A hostile or
+        // damaged project must not commit metadata/reset Click while an invalid
+        // parameter is silently clamped (or poison DSP with NaN/Inf).
+        for (const auto& child : state)
+        {
+            const auto id = child["id"].toString();
+            for (size_t index = 0; index < parameterIds.size(); ++index)
+                if (id == parameterIds[index])
+                {
+                    if (! child.hasType("PARAM")) return;
+                    if (! child.hasProperty("value")) break; // pinned legacy behavior: missing value uses the default
+                    double value = 0.0;
+                    const auto& range = rangedParameters[index]->getNormalisableRange();
+                    if (! parseFiniteStateValue(child["value"], value)
+                        || value < static_cast<double>(range.start)
+                        || value > static_cast<double>(range.end)) return;
+                    break;
+                }
+        }
 
         ControlOperation operation;
         operation.kind = ControlOperation::Kind::state;
