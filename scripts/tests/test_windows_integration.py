@@ -43,6 +43,17 @@ class WindowsIntegrationContractTests(unittest.TestCase):
                         if "add_subdirectory" in self.root_cmake
                         else self.root_cmake.index("FetchContent_MakeAvailable"))
 
+    def test_windows_api_contract_is_unicode_and_uses_portable_summary_ids(self) -> None:
+        self.assertIn("UNICODE _UNICODE _WIN32_WINNT=0x0A00 WINVER=0x0A00", self.cmake)
+        self.assertIn("constexpr UINT kMsiSummaryTemplate = 7u;", self.updater)
+        self.assertIn("constexpr UINT kMsiSummaryRevisionNumber = 9u;", self.updater)
+        self.assertGreaterEqual(self.updater.count("MsiOpenDatabaseW(path.c_str(), nullptr"), 2)
+        self.assertNotIn("MSIDBOPEN_READONLY", self.updater)
+        self.assertNotIn("PIDSI_TEMPLATE", self.updater)
+        self.assertNotIn("PIDSI_REVNUMBER", self.updater)
+        self.assertNotIn("PID_TEMPLATE", self.updater)
+        self.assertNotIn("PID_REVNUMBER", self.updater)
+
     def test_configured_production_target_is_fail_closed(self) -> None:
         for token in (
             'file(READ "${CMAKE_CURRENT_SOURCE_DIR}/Installer/Windows/package-config.json"',

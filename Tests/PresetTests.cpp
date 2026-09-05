@@ -521,7 +521,7 @@ juce::AlertWindow* waitForAlert(const juce::String& title)
     }
     throw std::runtime_error("Expected asynchronous alert did not open");
 }
-enum class OwnerAction { hideAncestor, detach, destroy };
+enum class OwnerAction { hideAncestor, detach, destroy, hideThenDestroy };
 enum class LifecycleDialog { saveAs, rename, browser, unsaved, deletePreset, warning, management };
 
 const char* actionName(OwnerAction action)
@@ -531,6 +531,7 @@ const char* actionName(OwnerAction action)
         case OwnerAction::hideAncestor: return "ancestor-hide";
         case OwnerAction::detach: return "detach";
         case OwnerAction::destroy: return "destroy";
+        case OwnerAction::hideThenDestroy: return "hide-then-destroy";
     }
     throw std::runtime_error("unknown owner action");
 }
@@ -588,12 +589,21 @@ struct LifecycleEditor
                 // let the detach path mask a broken destructor cleanup.
                 editor.reset();
                 break;
+            case OwnerAction::hideThenDestroy:
+                // Hide queues native-chooser teardown. Destroy immediately,
+                // without pumping that queue, to exercise pending UI cleanup
+                // before the plug-in instance could be unloaded.
+                window->setVisible(false);
+                require(! editor->isShowing(), "pending-destroy owner is hidden before immediate destruction");
+                editor.reset();
+                break;
         }
         require(editor == nullptr || ! editor->isShowing(), "owner action actually hides/detaches/destroys editor");
     }
     void reopen(OwnerAction action)
     {
-        if (action == OwnerAction::destroy) editor.reset(processor.createEditor());
+        if (action == OwnerAction::destroy || action == OwnerAction::hideThenDestroy)
+            editor.reset(processor.createEditor());
         if (action != OwnerAction::hideAncestor) window->setContentNonOwned(editor.get(), true);
         window->setVisible(true);
         window->toFront(true);

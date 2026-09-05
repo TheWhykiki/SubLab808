@@ -110,6 +110,35 @@ private:
         // pump a nested message loop, or delete CallOutBox's callback-owned data.
     }
 
+    void cancelFileChooser(std::unique_ptr<juce::FileChooser> fileChooser)
+    {
+        if (fileChooser == nullptr) return;
+#if JUCE_MAC
+        // JUCE's macOS FileChooser destructor exits a JUCE modal component,
+        // removes its peer, and closes the NSSavePanel/NSOpenPanel. Doing that
+        // synchronously from our ComponentMovementWatcher re-enters the same
+        // visibility/peer teardown that asked us to cancel and can deadlock
+        // AppKit. The owner and callback have already been invalidated; retain
+        // the chooser in this owner until its next message-thread timer event.
+        // Using the existing Timer avoids leaving a separately posted callback
+        // object behind if the plug-in owner is destroyed before that event.
+        pendingFileChoosers.push_back(std::move(fileChooser));
+        if (! destroying) startTimer(1);
+#else
+        fileChooser.reset();
+#endif
+    }
+
+#if JUCE_MAC
+    void destroyPendingFileChoosers()
+    {
+        // Move first so native teardown may safely cause another owner callback.
+        auto pending = std::move(pendingFileChoosers);
+        pendingFileChoosers.clear();
+        pending.clear();
+    }
+#endif
+
     void cancelOwnedUi()
     {
         if (cancellingUi) return;
@@ -121,8 +150,13 @@ private:
         ownedModals.clear();
         auto messages = std::move(messageScopes);
         messageScopes.clear();
+        // During destruction, leave active and already-deferred choosers in
+        // their members. OwnerWatcher is declared last, so it unregisters
+        // before those members perform JUCE/AppKit teardown.
+        std::unique_ptr<juce::FileChooser> fileChooser;
+        if (! destroying) fileChooser = std::move(chooser);
         managementParent.reset(); // Cancels only the menu parented here.
-        chooser.reset();          // FileChooser clears its pending callback.
+        cancelFileChooser(std::move(fileChooser));
         for (auto& message : messages) message->box.close();
         for (auto modal : modals) cancelModal(modal);
     }
@@ -468,6 +502,13 @@ private:
     }
     void timerCallback() override
     {
+#if JUCE_MAC
+        if (! pendingFileChoosers.empty())
+        {
+            destroyPendingFileChoosers();
+            if (! destroying) startTimerHz(5);
+        }
+#endif
         pruneUiHandles();
         const auto preset = presets.current();
         browse.setButtonText((preset.factoryIndex >= 0 ? "Factory / " : "User / ") + preset.name + (presets.isModified() ? " *" : "") + juce::String::fromUTF8("  ▾"));
@@ -486,6 +527,10 @@ private:
     std::vector<std::shared_ptr<MessageScope>> messageScopes;
     std::unique_ptr<juce::Component> managementParent;
     std::unique_ptr<juce::FileChooser> chooser;
+#if JUCE_MAC
+    std::vector<std::unique_ptr<juce::FileChooser>> pendingFileChoosers;
+#endif
+    // Must remain last: unregister before chooser members are destroyed.
     OwnerWatcher ownerWatcher;
 };
 } // namespace wk

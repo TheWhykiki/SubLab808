@@ -92,7 +92,7 @@ function(wk_add_updater product)
         WK_WINDOWS_UPDATER_GITHUB_REPOSITORY="${product}"
         WK_WINDOWS_UPDATER_UPGRADE_CODE="${updater_upgrade_code}"
         WK_WINDOWS_UPDATER_OTHER_UPGRADE_CODE="${updater_other_upgrade_code}"
-        _WIN32_WINNT=0x0A00 WINVER=0x0A00)
+        UNICODE _UNICODE _WIN32_WINNT=0x0A00 WINVER=0x0A00)
     set(updater_libraries juce::juce_core bcrypt comctl32 crypt32 msi ole32 shell32 winhttp wintrust advapi32)
 
     # This target compiles the complete native implementation but is prevented

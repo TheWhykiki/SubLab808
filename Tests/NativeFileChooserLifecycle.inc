@@ -61,6 +61,10 @@ void checkNativeFileChooserLifecycle(const juce::File& root, bool importing, Own
     {
         if (juce::Time::getMillisecondCounterHiRes() - activationStarted >= 10000.0)
             throw std::runtime_error("NATIVE_PANEL_SETUP_TIMEOUT: the test process/window did not become active");
+        // Desktop runners may briefly reactivate their controller immediately
+        // after launching this process. Keep requesting focus until AppKit has
+        // delivered activation to our real test window.
+        juce::Process::makeForegroundProcess();
         require(juce::MessageManager::getInstance()->runDispatchLoopUntil(10), "activate native test window");
     }
     const LifecycleSnapshot stateBefore(processor);
@@ -88,6 +92,17 @@ void checkNativeFileChooserLifecycle(const juce::File& root, bool importing, Own
     owner.apply(action);
     std::printf("NATIVE_CHOOSER_OWNER_ACTION_END: %s / %s\n",
                 importing ? "Import" : "Export", actionName(action));
+    if (action == OwnerAction::destroy || action == OwnerAction::hideThenDestroy)
+    {
+        require(nativeModal.component == nullptr && ! panel->isVisible() && ! panel->hasDelegate(),
+                "editor destruction does not leave plugin code or a native chooser pending past owner lifetime");
+    }
+    else
+    {
+        require(nativeModal.component != nullptr && nativeModal.component->isCurrentlyModal()
+                    && panel->isVisible() && panel->hasDelegate(),
+                "hide/detach returns before non-reentrant native chooser teardown runs on a later timer event");
+    }
     waitForDeletion(nativeModal.component, "native file-chooser modal");
     const auto started = juce::Time::getMillisecondCounterHiRes();
     while (panel->isVisible() || panel->hasDelegate())
@@ -119,7 +134,8 @@ void checkNativeFileChooserLifecycles(const juce::File& root, const juce::String
     NativeFilePanel::prepareTestApplication();
     int executed = 0;
     for (const bool importing : { true, false })
-        for (const auto action : { OwnerAction::hideAncestor, OwnerAction::detach, OwnerAction::destroy })
+        for (const auto action : { OwnerAction::hideAncestor, OwnerAction::detach,
+                                   OwnerAction::destroy, OwnerAction::hideThenDestroy })
         {
             const auto caseName = juce::String(importing ? "import-" : "export-") + actionName(action);
             if (requestedCase.isNotEmpty() && requestedCase != caseName) continue;

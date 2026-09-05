@@ -27,7 +27,8 @@ void NativeFilePanel::prepareTestApplication()
     @autoreleasepool
     {
         [NSApplication sharedApplication];
-        if (![NSApp setActivationPolicy:NSApplicationActivationPolicyRegular])
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        if ([NSApp activationPolicy] != NSApplicationActivationPolicyRegular)
             throw std::runtime_error("NATIVE_PANEL_SETUP: test application cannot become a regular GUI process");
         [NSApp finishLaunching];
     }

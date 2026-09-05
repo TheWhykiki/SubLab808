@@ -104,6 +104,11 @@ constexpr std::uint64_t kMaximumMetadataBytes = 1024u * 1024u;
 constexpr std::uint64_t kMaximumMsiBytes = 256u * 1024u * 1024u;
 constexpr std::uint64_t kMaximumManifestBytes = 1024u * 1024u;
 constexpr DWORD kMaximumRedirects = 5;
+// SummaryInformation property identifiers from [MS-OLEPS] section 2.18.2.
+// Keep these local: the Windows SDK does not expose the PIDSI_* aliases in
+// every supported header configuration.
+constexpr UINT kMsiSummaryTemplate = 7u;
+constexpr UINT kMsiSummaryRevisionNumber = 9u;
 
 #if defined(WK_WINDOWS_UPDATER_ARCHITECTURE_ARM64EC)
 constexpr Architecture kArchitecture = Architecture::arm64ec;
@@ -1118,7 +1123,7 @@ void verifyMsiDatabase(const Path& path, const SemVersion& version)
     require(version.major <= 255 && version.minor <= 255 && version.patch <= 65535,
             "Release version cannot be represented by Windows Installer");
     MSIHANDLE rawDatabase{};
-    require(MsiOpenDatabaseW(path.c_str(), MSIDBOPEN_READONLY, &rawDatabase) == ERROR_SUCCESS,
+    require(MsiOpenDatabaseW(path.c_str(), nullptr, &rawDatabase) == ERROR_SUCCESS,
             "Windows Installer cannot open the MSI read-only");
     MsiHandle database(rawDatabase);
     std::set<std::string> tables;
@@ -1173,13 +1178,13 @@ void verifyMsiDatabase(const Path& path, const SemVersion& version)
                 "WIX_UPGRADE_DETECTED", "WIX_DOWNGRADE_DETECTED", "OTHERARCHITECTUREDETECTED" },
             "MSI SecureCustomProperties is not the exact upgrade-detection set");
 
-    const auto summaryTemplate = summaryString(database.get(), PID_TEMPLATE);
+    const auto summaryTemplate = summaryString(database.get(), kMsiSummaryTemplate);
     const auto separator = summaryTemplate.find(';');
     const auto platform = summaryTemplate.substr(0, separator);
     require(kArchitecture == Architecture::x64 ? (platform == "x64" || platform == "Intel64")
                                                : (platform == "Arm64" || platform == "ARM64"),
             "MSI summary architecture mismatch");
-    const auto packageCode = normalizedGuid(summaryString(database.get(), PID_REVNUMBER));
+    const auto packageCode = normalizedGuid(summaryString(database.get(), kMsiSummaryRevisionNumber));
     require(packageCode != productCode && packageCode != kUpgradeCode && packageCode != kOtherUpgradeCode,
             "MSI PackageCode must be distinct from ProductCode and UpgradeCodes");
 
@@ -1320,7 +1325,7 @@ void verifyMsiDatabase(const Path& path, const SemVersion& version)
 std::size_t msiPayloadFileCount(const Path& path)
 {
     MSIHANDLE rawDatabase{};
-    require(MsiOpenDatabaseW(path.c_str(), MSIDBOPEN_READONLY, &rawDatabase) == ERROR_SUCCESS,
+    require(MsiOpenDatabaseW(path.c_str(), nullptr, &rawDatabase) == ERROR_SUCCESS,
             "Windows Installer cannot reopen the verified MSI");
     MsiHandle database(rawDatabase);
     const auto rows = msiRows(database.get(), L"SELECT `File` FROM `File`");
