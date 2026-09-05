@@ -181,6 +181,252 @@ void checkClickPresetContract(const juce::File& directory)
 #endif
 #include "PresetSaveRestoreTests.inc"
 
+#if defined(PRESET_TEST_SUBLAB)
+int selectionTreeCount(const juce::ValueTree& state)
+{
+    int count = 0;
+    for (const auto& child : state) if (child.hasType("WkPresetSelection")) ++count;
+    return count;
+}
+
+void checkActionTokenGuards(const juce::File& root)
+{
+    using Step = wk::PresetLibrary::TestStep;
+    enum class Action { saveAs, rename, deletePreset, exportPreset, loadPreset };
+    for (const auto action : { Action::saveAs, Action::rename, Action::deletePreset, Action::exportPreset, Action::loadPreset })
+    {
+        const auto label = action == Action::saveAs ? "SaveAs" : action == Action::rename ? "Rename"
+            : action == Action::deletePreset ? "Delete" : action == Action::exportPreset ? "Export" : "Load";
+        const auto fixture = root.getChildFile(label);
+        Processor processor(fixture.getChildFile("Library"));
+        processor.setCurrentProgram(1); set(processor, "output", -8.0f);
+        ok(processor.presets.saveAs("Confirmed X", "Tests"));
+        const auto token = processor.presets.currentSoundToken();
+        require(token.has_value(), "action token captures a coherent confirmed sound");
+        const auto xFile = processor.presets.storageDirectory().getChildFile(token->sound.id + processor.presets.extension());
+        juce::MemoryBlock xBytes;
+        require(xFile.loadFileAsData(xBytes), "confirmed X file exists before guarded action");
+
+        Processor source(fixture.getChildFile("Source"));
+        source.setCurrentProgram(2); set(source, "output", -18.0f);
+        ok(source.presets.saveAs("Newer Y", "Tests"));
+        set(source, "output", -17.0f);
+        auto newer = saveRaceTree(saveRaceState(source));
+        // Keep the same identity as X so an ID-only guard would falsely pass.
+        newer.getChildWithName("WkPresetSelection").setProperty("id", token->sound.id, nullptr);
+        const auto newerState = saveRaceBytes(newer);
+
+        unsigned captures = 0;
+        bool restored = false;
+        processor.presets.testStep = [&](Step step) {
+            if (step != Step::selectionCaptured) return;
+            ++captures;
+            if (restored) return;
+            restored = true;
+            restoreSaveRaceWorker(processor, newerState);
+        };
+        const auto exported = fixture.getChildFile("MustNotExist" + processor.presets.extension());
+        juce::Result result = juce::Result::fail("guarded action was not selected");
+        if (action == Action::saveAs)
+            result = processor.presets.saveAs("Must not save", "Tests", nullptr, &*token);
+        else if (action == Action::rename)
+            result = processor.presets.renameCurrent("Must not rename", token->sound.id, &*token);
+        else if (action == Action::deletePreset)
+            result = processor.presets.deleteCurrent(&*token);
+        else if (action == Action::exportPreset)
+            result = processor.presets.exportCurrent(exported, &*token);
+        else
+            result = processor.presets.load(factoryBank()[4], &*token);
+        processor.presets.testStep = {};
+
+        require(restored && captures == 2 && result.failed(), "newer same-ID sound is detected inside the library action");
+        requireSaveRaceState(processor, newerState);
+        const auto users = processor.presets.userPresets();
+        require(users.size() == 1 && users.front().id == token->sound.id && users.front().name == "Confirmed X",
+                "guarded action preserves the confirmed user file and its name");
+        juce::MemoryBlock afterBytes;
+        require(xFile.loadFileAsData(afterBytes) && afterBytes == xBytes && ! exported.exists(),
+                "guarded action preserves exact X bytes and creates no export");
+        std::printf("PASS: %s token rejects a restore in the pre-capture window with the same ID and a different sound.\n", label);
+    }
+
+    for (const auto action : { Action::rename, Action::deletePreset })
+    {
+        const auto label = action == Action::rename ? "Rename" : "Delete";
+        const auto fixture = root.getChildFile(juce::String(label) + "FinalGuard");
+        Processor processor(fixture.getChildFile("Library"));
+        processor.setCurrentProgram(1); set(processor, "output", -8.1f);
+        ok(processor.presets.saveAs("Final guard X", "Tests"));
+        const auto token = processor.presets.currentSoundToken();
+        require(token.has_value(), "final file guard captures X");
+        const auto xFile = processor.presets.storageDirectory().getChildFile(token->sound.id + processor.presets.extension());
+        juce::MemoryBlock xBytes;
+        require(xFile.loadFileAsData(xBytes), "final file guard fixture exists");
+
+        Processor source(fixture.getChildFile("Source"));
+        source.setCurrentProgram(2); set(source, "output", -17.1f);
+        ok(source.presets.saveAs("Final guard Y", "Tests"));
+        auto newer = saveRaceTree(saveRaceState(source));
+        newer.getChildWithName("WkPresetSelection").setProperty("id", token->sound.id, nullptr);
+        const auto newerState = saveRaceBytes(newer);
+        unsigned captures = 0;
+        processor.presets.testStep = [&](Step step) {
+            if (step == Step::selectionCaptured && ++captures == 2)
+                restoreSaveRaceWorker(processor, newerState);
+        };
+        const auto result = action == Action::rename
+            ? processor.presets.renameCurrent("Must not rename", token->sound.id, &*token)
+            : processor.presets.deleteCurrent(&*token);
+        processor.presets.testStep = {};
+        juce::MemoryBlock afterBytes;
+        require(result.failed() && captures == 3 && xFile.loadFileAsData(afterBytes) && afterBytes == xBytes,
+                "final token guard after file lock preserves exact X file");
+        requireSaveRaceState(processor, newerState);
+        std::printf("PASS: %s revalidates its token after acquiring the file lock and before mutation.\n", label);
+    }
+
+    Processor contended(root.getChildFile("CaptureExhaustion"));
+    ok(contended.presets.saveAs("Capture exhaustion", "Tests"));
+    const auto stableState = saveRaceState(contended);
+    const auto stableFile = contended.presets.storageDirectory().getChildFile(
+        contended.presets.current().id + contended.presets.extension());
+    juce::MemoryBlock stableBytes;
+    require(stableFile.loadFileAsData(stableBytes), "capture-exhaustion fixture exists");
+    unsigned attempts = 0;
+    contended.presets.testStep = [&](Step step) {
+        if (step != Step::selectionCaptured) return;
+        ++attempts;
+        restoreSaveRaceWorker(contended, stableState);
+    };
+    const auto unavailable = contended.presets.currentSoundToken();
+    contended.presets.testStep = {};
+    juce::MemoryBlock afterBytes;
+    require(! unavailable.has_value() && attempts == 8 && stableFile.loadFileAsData(afterBytes) && afterBytes == stableBytes,
+            "token capture is bounded and fails without mutating the preset file");
+    requireSaveRaceState(contended, stableState);
+    std::puts("PASS: action-token capture exhaustion stops after eight coherent attempts and fails closed.");
+
+    // Save As must return the token of the exact selection it committed. Recapturing
+    // after the call would let a newer restore masquerade as the saved sound and
+    // authorise the stale follow-up load.
+    Processor saved(root.getChildFile("SavedToken"));
+    saved.setCurrentProgram(1); set(saved, "output", -8.5f);
+    const auto originalToken = saved.presets.currentSoundToken();
+    require(originalToken.has_value(), "Save As follow-up starts with a coherent original token");
+    bool savedSelectionStillCurrent = false;
+    std::optional<wk::PresetLibrary::SoundToken> savedToken;
+    ok(saved.presets.saveAs("Exact saved token", "Tests", &savedSelectionStillCurrent, &*originalToken, &savedToken));
+    require(savedSelectionStillCurrent && savedToken.has_value()
+                && saved.presets.isCurrentSound(*savedToken),
+            "Save As returns the exact committed selection token");
+    Processor restored(root.getChildFile("SavedTokenSource"));
+    restored.setCurrentProgram(2); set(restored, "output", -17.25f);
+    ok(restored.presets.saveAs("Newer follow-up Y", "Tests"));
+    const auto restoredState = saveRaceState(restored);
+    restoreSaveRaceWorker(saved, restoredState);
+    const auto staleFollowUp = saved.presets.load(factoryBank()[4], &*savedToken);
+    require(staleFollowUp.failed(), "saved token rejects a follow-up after a newer restore");
+    requireSaveRaceState(saved, restoredState);
+    std::puts("PASS: Save As returns its exact committed token; a later restore cannot be recaptured as follow-up authority.");
+
+    Processor guardedLoad(root.getChildFile("FinalUserLoadGuard"));
+    guardedLoad.setCurrentProgram(1); set(guardedLoad, "output", -8.75f);
+    ok(guardedLoad.presets.saveAs("Final guard X", "Tests"));
+    const auto loadToken = guardedLoad.presets.currentSoundToken();
+    require(loadToken.has_value(), "guarded user load starts from a coherent token");
+    Processor targetWriter(guardedLoad.presets.storageDirectory());
+    targetWriter.setCurrentProgram(4); set(targetWriter, "output", -13.5f);
+    ok(targetWriter.presets.saveAs("User load target", "Tests"));
+    const auto userTarget = targetWriter.presets.current();
+    Processor finalRestore(root.getChildFile("FinalUserLoadRestore"));
+    finalRestore.setCurrentProgram(3); set(finalRestore, "output", -18.5f);
+    ok(finalRestore.presets.saveAs("Final guard Y", "Tests"));
+    const auto finalRestoreState = saveRaceState(finalRestore);
+    unsigned loadCaptures = 0;
+    guardedLoad.presets.testStep = [&](Step step) {
+        if (step == Step::selectionCaptured && ++loadCaptures == 2)
+            restoreSaveRaceWorker(guardedLoad, finalRestoreState);
+    };
+    const auto guardedResult = guardedLoad.presets.load(userTarget, &*loadToken);
+    guardedLoad.presets.testStep = {};
+    require(guardedResult.failed() && loadCaptures == 3,
+            "second user-load guard detects a restore after file/state preparation");
+    requireSaveRaceState(guardedLoad, finalRestoreState);
+    std::puts("PASS: user Load revalidates its token after file/state preparation and preserves a newer restore.");
+}
+
+void checkSelectionStateHardening(const juce::File& root)
+{
+    Processor source(root.getChildFile("Source"));
+    source.setCurrentProgram(3); set(source, "output", -8.25f);
+    ok(source.presets.saveAs("Valid embedded selection", "Tests"));
+    set(source, "output", -11.5f);
+    const auto validState = saveRaceTree(saveRaceState(source));
+    const auto validSelection = validState.getChildWithName("WkPresetSelection");
+    const auto outputRange = source.parameters.getParameter("output")->getNormalisableRange();
+    const auto justAboveOutput = std::nextafter(static_cast<double>(outputRange.end),
+                                                std::numeric_limits<double>::infinity());
+    const auto justAboveOutputText = juce::String(justAboveOutput, 17);
+    require(validSelection.isValid() && selectionTreeCount(validState) == 1,
+            "selection hardening starts from one real binary-XML-roundtripped user selection");
+
+    {
+        Processor restored(root.getChildFile("Valid"));
+        const auto bytes = saveRaceBytes(validState);
+        restored.setStateInformation(bytes.getData(), static_cast<int>(bytes.getSize()));
+        require(restored.presets.current().id == validSelection["id"].toString()
+                    && selectionTreeCount(saveRaceTree(saveRaceState(restored))) == 1,
+                "one fully valid embedded selection survives a real binary XML roundtrip");
+    }
+
+    for (int variant = 0; variant < 7; ++variant)
+    {
+        auto malformed = validState.createCopy();
+        auto selection = malformed.getChildWithName("WkPresetSelection");
+        if (variant == 0)
+            malformed.addChild(selection.createCopy(), -1, nullptr);
+        else if (variant == 1)
+            selection.setProperty("description", juce::String::repeatedString("x", 1025), nullptr);
+        else if (variant == 2)
+            selection.setProperty("name", "invalid\nname", nullptr);
+        else if (variant == 3)
+            selection.setProperty("id", "not-a-valid-id", nullptr);
+        else if (variant == 4)
+            selection.removeChild(0, nullptr);
+        else if (variant == 5)
+            selection.addChild(selection.getChild(0).createCopy(), -1, nullptr);
+        else
+            selection.getChildWithProperty("id", "output").setProperty("value", justAboveOutputText, nullptr);
+
+        Processor restored(root.getChildFile("Malformed-" + juce::String(variant)));
+        const auto bytes = saveRaceBytes(malformed);
+        restored.setStateInformation(bytes.getData(), static_cast<int>(bytes.getSize()));
+        const auto canonical = saveRaceTree(saveRaceState(restored));
+        require(restored.presets.current().factoryIndex == restored.getCurrentProgram()
+                    && selectionTreeCount(canonical) == 0,
+                "malformed or duplicate embedded selection is rejected and not re-serialized");
+        if (variant == 1)
+        {
+            ok(restored.presets.saveAs("Recovered after invalid metadata", "Tests"));
+            Processor reader(restored.presets.storageDirectory());
+            const auto users = reader.presets.userPresets();
+            require(users.size() == 1 && users.front().description.length() <= 1024,
+                    "Save As cannot write metadata that the same library refuses to read");
+        }
+    }
+    const auto invalidImport = root.getChildFile("OutsideRange" + source.presets.extension());
+    ok(source.presets.exportCurrent(invalidImport));
+    auto json = juce::JSON::parse(invalidImport);
+    require(json.isObject(), "strict-range fixture is valid exported JSON");
+    json["parameters"].getDynamicObject()->setProperty("output", justAboveOutput);
+    require(invalidImport.replaceWithText(juce::JSON::toString(json)), "write strict-range fixture");
+    wk::Preset rejected;
+    require(source.presets.importPreset(invalidImport, rejected).failed(),
+            "persisted preset cannot use the old out-of-range tolerance");
+    std::puts("PASS: embedded selection requires one valid node, bounded metadata and a complete unique baseline; output is canonical.");
+}
+#endif
+
 struct Tempo : juce::AudioPlayHead
 {
     double bpm = 120;
@@ -793,6 +1039,106 @@ void checkReentrantLibraryAction(const juce::File& root, ReentrantAction action)
     std::printf("PASS: reentrancy %s: one mounted editor destroyed, confirmed operation committed, no stale follow-up/modal, replacement interactive.\n",
                 reentrantName(action));
 }
+
+#if defined(PRESET_TEST_SUBLAB)
+void checkUiActionTokenGuards(const juce::File& root)
+{
+    using Step = wk::PresetLibrary::TestStep;
+    enum class Action { saveAs, rename, deletePreset, discardLoad };
+    for (const auto action : { Action::saveAs, Action::rename, Action::deletePreset, Action::discardLoad })
+    {
+        const auto label = action == Action::saveAs ? "SaveAs" : action == Action::rename ? "Rename"
+            : action == Action::deletePreset ? "Delete" : "Discard";
+        const auto fixture = root.getChildFile(label);
+        Processor processor(fixture.getChildFile("Library"));
+        processor.setCurrentProgram(1); set(processor, "output", -8.0f);
+        ok(processor.presets.saveAs("UI confirmed X", "Tests"));
+        const auto confirmed = processor.presets.current();
+        const auto xFile = processor.presets.storageDirectory().getChildFile(confirmed.id + processor.presets.extension());
+        juce::MemoryBlock xBytes;
+        require(xFile.loadFileAsData(xBytes), "UI token fixture X exists");
+        if (action == Action::discardLoad) set(processor, "output", -9.0f);
+
+        Processor source(fixture.getChildFile("Source"));
+        source.setCurrentProgram(2); set(source, "output", -18.0f);
+        ok(source.presets.saveAs("UI newer Y", "Tests"));
+        set(source, "output", -17.0f);
+        auto newer = saveRaceTree(saveRaceState(source));
+        newer.getChildWithName("WkPresetSelection").setProperty("id", confirmed.id, nullptr);
+        const auto newerState = saveRaceBytes(newer);
+
+        LifecycleEditor owner(processor);
+        OwnedModalCleanup modal;
+        if (action == Action::saveAs)
+        {
+            modal.component = openLifecycleDialog(*owner.editor, LifecycleDialog::saveAs);
+            dynamic_cast<juce::AlertWindow*>(modal.component.getComponent())->getTextEditor("name")->setText("Must not save");
+        }
+        else if (action == Action::rename)
+        {
+            modal.component = openLifecycleDialog(*owner.editor, LifecycleDialog::rename);
+            dynamic_cast<juce::AlertWindow*>(modal.component.getComponent())->getTextEditor("name")->setText("Must not rename");
+        }
+        else if (action == Action::deletePreset)
+            modal.component = openLifecycleDialog(*owner.editor, LifecycleDialog::deletePreset);
+        else
+            modal.component = openLifecycleDialog(*owner.editor, LifecycleDialog::unsaved);
+
+        unsigned captures = 0;
+        bool restored = false;
+        const auto restoreOnCapture = action == Action::discardLoad ? 2u : 1u;
+        processor.presets.testStep = [&](Step step) {
+            if (step != Step::selectionCaptured || ++captures != restoreOnCapture) return;
+            restored = true;
+            restoreSaveRaceWorker(processor, newerState);
+        };
+        closeAlertAndWait(dynamic_cast<juce::AlertWindow*>(modal.component.getComponent()),
+                          action == Action::discardLoad ? 2 : 1, "guarded UI action");
+        processor.presets.testStep = {};
+        require(restored, "newer state lands after the UI check and inside the guarded library action");
+        OwnedModalCleanup warning { waitForAlert("Preset library") };
+        closeAlertAndWait(dynamic_cast<juce::AlertWindow*>(warning.component.getComponent()), 0, "guarded action warning");
+        requireNoModals();
+        requireSaveRaceState(processor, newerState);
+        const auto users = processor.presets.userPresets();
+        juce::MemoryBlock afterBytes;
+        require(users.size() == 1 && users.front().id == confirmed.id && users.front().name == "UI confirmed X"
+                    && xFile.loadFileAsData(afterBytes) && afterBytes == xBytes,
+                "actual UI action preserves the confirmed X file when same-ID Y wins");
+        checkReopenedControls(owner);
+        std::printf("PASS: actual %s UI path carries its token into the mutation and preserves newer same-ID Y.\n", label);
+    }
+
+    Processor contended(root.getChildFile("RenameCaptureExhaustion"));
+    ok(contended.presets.saveAs("Rename remains unchanged", "Tests"));
+    const auto stableState = saveRaceState(contended);
+    const auto stableFile = contended.presets.storageDirectory().getChildFile(
+        contended.presets.current().id + contended.presets.extension());
+    juce::MemoryBlock stableBytes;
+    require(stableFile.loadFileAsData(stableBytes), "UI capture-exhaustion fixture exists");
+    LifecycleEditor owner(contended);
+    unsigned attempts = 0;
+    contended.presets.testStep = [&](Step step) {
+        if (step != Step::selectionCaptured) return;
+        ++attempts;
+        restoreSaveRaceWorker(contended, stableState);
+    };
+    lifecycleButton(*owner.editor, "Manage presets").onClick();
+    auto* warning = waitForAlert("Preset library");
+    contended.presets.testStep = {};
+    OwnedModalCleanup warningCleanup { warning };
+    require(attempts == 8 && dynamic_cast<juce::AlertWindow*>(warning) != nullptr,
+            "eight failed captures open only an error, never a Rename dialog with an empty identity");
+    closeAlertAndWait(warning, 0, "capture-exhaustion warning");
+    requireNoModals();
+    juce::MemoryBlock afterBytes;
+    require(stableFile.loadFileAsData(afterBytes) && afterBytes == stableBytes
+                && contended.presets.current().name == "Rename remains unchanged",
+            "capture exhaustion preserves the exact selected file and identity");
+    checkReopenedControls(owner);
+    std::puts("PASS: actual Rename entry fails closed after eight capture collisions; no empty-ID dialog opens.");
+}
+#endif
 #include "PresetSaveThenLoadTests.inc"
 
 void checkPresetReentrancy(const juce::File& root)
@@ -806,6 +1152,9 @@ void checkPresetReentrancy(const juce::File& root)
         checkReentrantLibraryAction(root.getChildFile(reentrantName(action)), action);
     std::puts("PASS: 8 synchronous host-callback editor-destruction regressions.");
     checkSaveThenLoadOrdering(root.getChildFile("SaveThenLoadOrdering"));
+#if defined(PRESET_TEST_SUBLAB)
+    checkUiActionTokenGuards(root.getChildFile("ActionTokenUi"));
+#endif
 }
 void checkPresetDialogLifecycles(const juce::File& root)
 {
@@ -850,6 +1199,10 @@ int main(int argc, char** argv)
         checkAuthoritativeDirtyState(root.getChildFile("AuthoritativeDirty"));
         if (dirtyOnly) return 0;
         checkPresetSaveRestore(root.getChildFile("SaveRestore"));
+#if defined(PRESET_TEST_SUBLAB)
+        checkActionTokenGuards(root.getChildFile("ActionTokens"));
+        checkSelectionStateHardening(root.getChildFile("SelectionState"));
+#endif
         if (saveRestoreOnly) return 0;
         if (juce::SystemStats::getEnvironmentVariable("WHYKIKI_PRESET_TEST_NATIVE_ONLY", {}) == "1")
         {
@@ -942,7 +1295,7 @@ int main(int argc, char** argv)
         const auto safeState = values(p); const auto countBefore = p.presets.userPresets().size();
         const auto bad = root.getChildFile("invalid" + p.presets.extension());
         const auto originalJSON = juce::JSON::parse(exported);
-        for (int variant = 0; variant < 5; ++variant)
+        for (int variant = 0; variant < 6; ++variant)
         {
             auto json = originalJSON.clone();
             if (variant == 0) json.getDynamicObject()->setProperty("plugin", "AnotherPlugin");
@@ -950,6 +1303,13 @@ int main(int argc, char** argv)
             if (variant == 2) json["parameters"].getDynamicObject()->removeProperty("output");
             if (variant == 3) json["parameters"].getDynamicObject()->setProperty("output", 999.0);
             if (variant == 4) json["parameters"].getDynamicObject()->setProperty("output", "not a number");
+            if (variant == 5)
+            {
+                const auto& range = p.parameters.getParameter("output")->getNormalisableRange();
+                json["parameters"].getDynamicObject()->setProperty(
+                    "output", std::nextafter(static_cast<double>(range.end),
+                                              std::numeric_limits<double>::infinity()));
+            }
             require(bad.replaceWithText(juce::JSON::toString(json)), "write invalid fixture");
             wk::Preset rejected; require(p.presets.importPreset(bad, rejected).failed(), "bad import rejected");
             sameValues(p, safeState);

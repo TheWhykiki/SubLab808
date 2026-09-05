@@ -925,6 +925,131 @@ juce::MemoryBlock userRestoreFixture()
     return encodedState(state);
 }
 
+bool invalidStateValuesAreRejected()
+{
+    SubLab808Processor subject, reference;
+    for (auto* processor : { &subject, &reference })
+    {
+        setClickTestParameters(*processor);
+        processor->setEditorSize(840, 470);
+        processor->prepareToPlay(48000.0, 512);
+        renderClickPhrase(*processor);
+    }
+    const auto before = capturedState(subject);
+    const auto targetBytes = userRestoreFixture();
+    auto targetXml = juce::AudioProcessor::getXmlFromBinary(targetBytes.getData(), (int) targetBytes.getSize());
+    if (targetXml == nullptr) return false;
+    const auto target = juce::ValueTree::fromXml(*targetXml);
+    const auto* output = subject.parameters.getParameter("output");
+    if (output == nullptr) return false;
+    const auto& range = output->getNormalisableRange();
+    const std::array<std::pair<const char*, juce::var>, 8> invalid {{
+        { "non-numeric", juce::var("not-a-number") },
+        { "NaN", juce::var(std::numeric_limits<double>::quiet_NaN()) },
+        { "+Inf", juce::var(std::numeric_limits<double>::infinity()) },
+        { "-Inf", juce::var(-std::numeric_limits<double>::infinity()) },
+        { "below range", juce::var(static_cast<double>(range.start) - 1.0) },
+        { "above range", juce::var(static_cast<double>(range.end) + 1.0) },
+        { "just below range", juce::var("-24.00000001") },
+        { "just above range", juce::var("6.00000001") }
+    }};
+    for (const auto& [label, value] : invalid)
+    {
+        auto state = target.createCopy();
+        auto parameter = state.getChildWithProperty("id", "output");
+        if (! parameter.isValid()) return false;
+        parameter.setProperty("value", value, nullptr);
+        const auto encoded = encodedState(state);
+        auto roundTripXml = juce::AudioProcessor::getXmlFromBinary(encoded.getData(), (int) encoded.getSize());
+        if (roundTripXml == nullptr) return false;
+        const auto roundTrip = juce::ValueTree::fromXml(*roundTripXml);
+        if (! roundTrip.getChildWithProperty("id", "output").hasProperty("value")) return false;
+
+        subject.setStateInformation(encoded.getData(), (int) encoded.getSize());
+        if (! capturedState(subject).isEquivalentTo(before)
+            || ! matchesCommittedState(subject, reference, true)
+            || maximumSampleDifference(renderClickPhrase(subject), renderClickPhrase(reference)) != 0.0f)
+            return false;
+        std::fprintf(stderr, "[state-schema] rejected known PARAM %s before state/program/editor/selection/Click commit\n", label);
+    }
+
+    auto wrongType = target.createCopy();
+    juce::ValueTree masqueradingExtension("Future");
+    masqueradingExtension.setProperty("id", "output", nullptr);
+    masqueradingExtension.setProperty("value", -6.0, nullptr);
+    wrongType.addChild(masqueradingExtension, -1, nullptr);
+    const auto wrongTypeBytes = encodedState(wrongType);
+    subject.setStateInformation(wrongTypeBytes.getData(), (int) wrongTypeBytes.getSize());
+    if (! capturedState(subject).isEquivalentTo(before)
+        || ! matchesCommittedState(subject, reference, true)
+        || maximumSampleDifference(renderClickPhrase(subject), renderClickPhrase(reference)) != 0.0f)
+        return false;
+    std::fprintf(stderr, "[state-schema] rejected non-PARAM child masquerading as known output before any commit\n");
+
+    // Unknown parameter children remain forward-compatible even if their payload
+    // is not meaningful to this version of the plugin.
+    auto forwardState = target.createCopy();
+    juce::ValueTree future("PARAM");
+    future.setProperty("id", "future-parameter", nullptr);
+    future.setProperty("value", "not-a-number", nullptr);
+    forwardState.addChild(future, -1, nullptr);
+    const auto forwardBytes = encodedState(forwardState);
+    SubLab808Processor accepted, expected;
+    accepted.setStateInformation(forwardBytes.getData(), (int) forwardBytes.getSize());
+    expected.setStateInformation(targetBytes.getData(), (int) targetBytes.getSize());
+    if (accepted.getCurrentProgram() != expected.getCurrentProgram()
+        || accepted.getEditorSize() != expected.getEditorSize()
+        || accepted.isPresetModified() != expected.isPresetModified()
+        || accepted.presets.current().id != expected.presets.current().id) return false;
+    for (const auto* id : stateParameterIds)
+        if (!(std::abs(accepted.parameters.getParameter(id)->getValue()
+                       - expected.parameters.getParameter(id)->getValue()) <= 0.0f)) return false;
+    if (! capturedState(accepted).getChildWithProperty("id", "future-parameter").isEquivalentTo(future)) return false;
+    std::fprintf(stderr, "[state-schema] unknown PARAM extension remains accepted; invalid known values/types rejected atomically\n");
+    return true;
+}
+
+bool invalidAutomationIsContained()
+{
+    const std::array<float, 5> invalid { std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(), -0.25f, 1.25f };
+    for (const auto value : invalid)
+    {
+        SubLab808Processor processor;
+        auto* output = processor.parameters.getParameter("output");
+        if (output == nullptr) return false;
+        output->setValueNotifyingHost(value); // the public normalised host-automation path
+        if (! processor.presets.isModified()) return false;
+        processor.prepareToPlay(48000.0, 512);
+        juce::AudioBuffer<float> audio(2, 512);
+        juce::MidiBuffer midi;
+        midi.addEvent(juce::MidiMessage::noteOn(1, 36, (juce::uint8) 110), 0);
+        processor.processBlock(audio, midi);
+        for (int channel = 0; channel < audio.getNumChannels(); ++channel)
+            for (int sample = 0; sample < audio.getNumSamples(); ++sample)
+                if (! std::isfinite(audio.getSample(channel, sample))) return false;
+
+        // A poisoned value must not satisfy the same-program coalescing check.
+        // Recalling the current factory program repairs the parameter and dirty flag.
+        processor.setCurrentProgram(0);
+        if (! matchesFactoryProgram(processor, 0) || processor.isPresetModified()
+            || ! std::isfinite(output->getValue()) || output->getValue() < 0.0f || output->getValue() > 1.0f)
+            return false;
+    }
+
+    SubLab808Processor valid;
+    auto* output = valid.parameters.getParameter("output");
+    if (output == nullptr) return false;
+    const auto legalNormalised = output->convertTo0to1(-12.3f);
+    output->setValueNotifyingHost(legalNormalised);
+    const auto state = capturedState(valid);
+    const auto savedValue = static_cast<float>(state.getChildWithProperty("id", "output")["value"]);
+    if (! std::isfinite(savedValue) || std::abs(savedValue - output->convertFrom0to1(legalNormalised)) > 0.0001f
+        || ! valid.presets.isModified()) return false;
+    std::fprintf(stderr, "[automation] NaN/Inf/out-of-normalised-range remain finite in DSP and dirty; same-program recall repairs; legal value preserved\n");
+    return true;
+}
+
 struct CallbackParameterListener final : juce::AudioProcessorParameter::Listener
 {
     explicit CallbackParameterListener(std::function<void()> callback) : invoke(std::move(callback)) {}
@@ -1043,6 +1168,7 @@ struct LongFiniteProgramCascade final : juce::AudioProcessorListener
 
 bool twoPhaseStateRegressions()
 {
+    if (! invalidStateValuesAreRejected() || ! invalidAutomationIsContained()) return false;
     SubLab808Processor x, expected, subject;
     x.setCurrentProgram(1); x.setEditorSize(1000, 640);
     const auto stateX = encodedState(capturedState(x)), stateY = userRestoreFixture();

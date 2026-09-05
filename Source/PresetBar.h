@@ -299,31 +299,50 @@ private:
         if (! canOpenUi()) return;
         const juce::Component::SafePointer<PresetBar> safe(this);
         const auto generation = uiGeneration;
-        if (! presets.isModified())
+        const auto originalSound = presets.currentSoundToken();
+        if (! originalSound.has_value())
         {
-            applyAndReport(safe, generation, [preset](PresetLibrary& library) { return library.load(preset); });
+            report(juce::Result::fail("The plugin state is changing. Please try again."));
             return;
         }
-        const auto originalSound = presets.currentSound();
+        if (! presets.isModified())
+        {
+            applyAndReport(safe, generation, [preset, originalSound = *originalSound](PresetLibrary& library) {
+                return library.load(preset, &originalSound);
+            });
+            return;
+        }
         showMessage(juce::MessageBoxOptions().withIconType(juce::MessageBoxIconType::QuestionIcon)
             .withTitle("Unsaved preset changes").withMessage("Save your current sound before loading " + preset.name + "?")
             .withButton("Save As...").withButton("Discard changes").withButton("Cancel").withAssociatedComponent(this),
-            [safe, generation, preset, originalSound](int result) {
+            [safe, generation, preset, originalSound = *originalSound](int result) {
                 if (safe == nullptr || ! safe->acceptsCallback(generation) || (result != 1 && result != 2)) return;
                 if (! safe->checkSound(originalSound)) return;
-                if (result == 1) safe->nameDialog(false, [safe, generation, preset] {
-                    applyAndReport(safe, generation, [preset](PresetLibrary& library) { return library.load(preset); });
-                });
+                if (result == 1) safe->nameDialog(false, [safe, generation, preset](const PresetLibrary::SoundToken& savedSound) {
+                    applyAndReport(safe, generation, [preset, savedSound](PresetLibrary& library) {
+                        return library.load(preset, &savedSound);
+                    });
+                }, originalSound);
                 else if (result == 2)
-                    applyAndReport(safe, generation, [preset](PresetLibrary& library) { return library.load(preset); });
+                    applyAndReport(safe, generation, [preset, originalSound](PresetLibrary& library) {
+                        return library.load(preset, &originalSound);
+                    });
             });
     }
-    void nameDialog(bool rename, std::function<void()> afterSave = {})
+    void nameDialog(bool rename, std::function<void(const PresetLibrary::SoundToken&)> afterSave = {},
+                    std::optional<PresetLibrary::SoundToken> expected = std::nullopt)
     {
         if (! canOpenUi()) return;
         pruneUiHandles();
         const auto generation = uiGeneration;
-        const auto current = presets.currentSound();
+        if (! expected.has_value()) expected = presets.currentSoundToken();
+        if (! expected.has_value())
+        {
+            report(juce::Result::fail("The plugin state is changing. Please try again."));
+            return;
+        }
+        const auto token = *expected;
+        const auto& current = token.sound;
         auto* dialog = new juce::AlertWindow(rename ? "Rename preset" : "Save preset as",
             rename ? "Rename the saved user preset." : "Store all current sound settings as your own preset.", juce::MessageBoxIconType::NoIcon, this);
         dialog->addTextEditor("name", rename ? current.name : current.name.substring(0, 75) + " Copy", "Name");
@@ -333,15 +352,20 @@ private:
         const juce::Component::SafePointer<PresetBar> safe(this);
         const juce::Component::SafePointer<juce::AlertWindow> dialogLifetime(dialog);
         ownedModals.emplace_back(dialog);
-        dialog->enterModalState(true, juce::ModalCallbackFunction::create([safe, generation, dialogLifetime, rename, afterSave, current](int result) {
+        dialog->enterModalState(true, juce::ModalCallbackFunction::create([safe, generation, dialogLifetime, rename, afterSave, token](int result) {
             if (safe == nullptr || ! safe->acceptsCallback(generation) || dialogLifetime == nullptr || result != 1) return;
-            if (! rename && ! safe->checkSound(current)) return;
             const auto name = dialogLifetime->getTextEditorContents("name");
             const auto category = rename ? juce::String() : dialogLifetime->getTextEditorContents("category");
             bool savedSelectionStillCurrent = false;
-            if (applyAndReport(safe, generation, [rename, name, category, id = current.id, &savedSelectionStillCurrent](PresetLibrary& library) {
-                    return rename ? library.renameCurrent(name, id) : library.saveAs(name, category, &savedSelectionStillCurrent);
-                }) && afterSave && savedSelectionStillCurrent) afterSave();
+            std::optional<PresetLibrary::SoundToken> savedSound;
+            if (applyAndReport(safe, generation, [rename, name, category, token, &savedSelectionStillCurrent, &savedSound](PresetLibrary& library) {
+                    return rename ? library.renameCurrent(name, token.sound.id, &token)
+                                  : library.saveAs(name, category, &savedSelectionStillCurrent, &token, &savedSound);
+                }) && afterSave && savedSelectionStillCurrent)
+            {
+                if (savedSound.has_value()) afterSave(*savedSound);
+                else safe->report(juce::Result::fail("The plugin state is changing. The requested preset was not loaded."));
+            }
         }), true);
         if (safe == nullptr || ! safe->acceptsCallback(generation)) cancelModal(dialogLifetime.getComponent());
     }
@@ -350,6 +374,12 @@ private:
         if (! canOpenUi()) return;
         auto* editor = findParentComponentOfClass<juce::AudioProcessorEditor>();
         if (editor == nullptr) return;
+        const auto currentToken = presets.currentSoundToken();
+        if (! currentToken.has_value())
+        {
+            report(juce::Result::fail("The plugin state is changing. Please try again."));
+            return;
+        }
         // A private, editor-sized parent gives this menu an explicit lifetime.
         // Destroying it cancels only our menu, including on hide/peer changes.
         managementParent = std::make_unique<juce::Component>();
@@ -359,31 +389,31 @@ private:
         editor->addAndMakeVisible(*managementParent);
         const juce::Component::SafePointer<juce::Component> menuOwner(managementParent.get());
         const auto generation = uiGeneration;
-        const auto current = presets.current();
+        const auto current = currentToken->sound;
         juce::PopupMenu menu;
         menu.addItem(1, "Rename...", current.factoryIndex < 0);
         menu.addItem(2, "Delete...", current.factoryIndex < 0);
         menu.addSeparator(); menu.addItem(3, "Import preset..."); menu.addItem(4, "Export current sound...");
         const juce::Component::SafePointer<PresetBar> safe(this);
         menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&manage)
-            .withParentComponent(menuOwner.getComponent()).withDeletionCheck(*this), [safe, generation, menuOwner, current](int result) {
+            .withParentComponent(menuOwner.getComponent()).withDeletionCheck(*this), [safe, generation, menuOwner, currentToken = *currentToken](int result) {
             if (safe == nullptr || ! safe->acceptsCallback(generation) || menuOwner == nullptr
                 || safe->managementParent.get() != menuOwner.getComponent()) return;
             safe->managementParent.reset();
-            if ((result == 1 || result == 2) && safe->presets.current().id != current.id)
+            if ((result == 1 || result == 2) && ! safe->checkSound(currentToken))
             {
-                safe->report(juce::Result::fail("The selected preset changed while the menu was open. Please choose the action again."));
                 return;
             }
-            if (result == 1) safe->nameDialog(true);
+            if (result == 1) safe->nameDialog(true, {}, currentToken);
             if (result == 2)
                 safe->showMessage(juce::MessageBoxOptions().withIconType(juce::MessageBoxIconType::QuestionIcon)
-                    .withTitle("Delete user preset?").withMessage("Delete " + current.name + " from the library? The current sound remains in this project.")
+                    .withTitle("Delete user preset?").withMessage("Delete " + currentToken.sound.name + " from the library? The current sound remains in this project.")
                     .withButton("Delete").withButton("Cancel").withAssociatedComponent(safe.getComponent()),
-                    [safe, generation, current](int choice) {
-                        if (safe != nullptr && safe->acceptsCallback(generation) && choice == 1
-                            && safe->presets.current().id == current.id)
-                            applyAndReport(safe, generation, [](PresetLibrary& library) { return library.deleteCurrent(); });
+                    [safe, generation, currentToken](int choice) {
+                        if (safe != nullptr && safe->acceptsCallback(generation) && choice == 1)
+                            applyAndReport(safe, generation, [currentToken](PresetLibrary& library) {
+                                return library.deleteCurrent(&currentToken);
+                            });
                     });
             if (result == 3 || result == 4) safe->chooseFile(result == 3);
         });
@@ -392,14 +422,20 @@ private:
     {
         if (! canOpenUi()) return;
         const auto generation = uiGeneration;
-        const auto originalSound = presets.currentSound();
+        const auto exportToken = importing ? std::optional<PresetLibrary::SoundToken> {} : presets.currentSoundToken();
+        if (! importing && ! exportToken.has_value())
+        {
+            report(juce::Result::fail("The plugin state is changing. Please try again."));
+            return;
+        }
+        const auto currentName = importing ? presets.current().name : exportToken->sound.name;
         chooser = std::make_unique<juce::FileChooser>(importing ? "Import preset" : "Export current sound",
             juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
-                .getChildFile(juce::File::createLegalFileName(presets.current().name) + presets.extension()), "*" + presets.extension());
+                .getChildFile(juce::File::createLegalFileName(currentName) + presets.extension()), "*" + presets.extension());
         const juce::Component::SafePointer<PresetBar> safe(this);
         const auto flags = importing ? juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles
             : juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles | juce::FileBrowserComponent::warnAboutOverwriting;
-        chooser->launchAsync(flags, [safe, generation, importing, originalSound](const juce::FileChooser& completed) {
+        chooser->launchAsync(flags, [safe, generation, importing, exportToken](const juce::FileChooser& completed) {
             if (safe == nullptr || ! safe->acceptsCallback(generation) || safe->chooser.get() != &completed
                 || completed.getResult() == juce::File()) return;
             const auto file = completed.getResult();
@@ -409,11 +445,13 @@ private:
                 if (applyAndReport(safe, generation, [file, &imported](PresetLibrary& library) { return library.importPreset(file, imported); }))
                     safe->requestLoad(imported);
             }
-            else if (safe->checkSound(originalSound))
-                applyAndReport(safe, generation, [file](PresetLibrary& library) { return library.exportCurrent(file); });
+            else
+                applyAndReport(safe, generation, [file, exportToken](PresetLibrary& library) {
+                    return library.exportCurrent(file, &*exportToken);
+                });
         });
     }
-    bool checkSound(const Preset& expected)
+    bool checkSound(const PresetLibrary::SoundToken& expected)
     {
         if (presets.isCurrentSound(expected)) return true;
         report(juce::Result::fail("The sound changed while the dialog was open. The action was cancelled to preserve the current sound. Please try again."));

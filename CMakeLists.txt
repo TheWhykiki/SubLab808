@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 if(CMAKE_HOST_APPLE)
     # Must be set before project(); Apple-only so the test suite still configures elsewhere.
     set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version" FORCE)
-    set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "Apple Silicon build" FORCE)
+    set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "Universal macOS build" FORCE)
 endif()
 project(SubLab808 VERSION 1.4.0 LANGUAGES C CXX)
 
@@ -26,6 +26,52 @@ else()
         GIT_SHALLOW TRUE)
     FetchContent_MakeAvailable(JUCE)
 endif()
+
+if(WIN32)
+    # JUCE names the two delivered ABIs x86_64 and arm64ec. Plain ARM64 uses a
+    # different ABI/folder and cannot be loaded by the x64/ARM64EC hosts targeted here.
+    set(SUBLAB808_SUPPORTED_WINDOWS_ARCHITECTURES x86_64 arm64ec)
+    if(NOT JUCE_TARGET_ARCHITECTURE IN_LIST SUBLAB808_SUPPORTED_WINDOWS_ARCHITECTURES)
+        message(FATAL_ERROR
+            "Unsupported SubLab808 Windows architecture '${JUCE_TARGET_ARCHITECTURE}'; "
+            "configure Visual Studio with -A x64 or -A ARM64EC")
+    endif()
+
+    # Reject a manually overridden or stale JUCE architecture cache instead of
+    # putting one PE architecture into another architecture's VST3 folder.
+    if(CMAKE_GENERATOR MATCHES "^Visual Studio ")
+        if(JUCE_TARGET_ARCHITECTURE STREQUAL "x86_64")
+            set(SUBLAB808_EXPECTED_VISUAL_STUDIO_PLATFORM x64)
+        else()
+            set(SUBLAB808_EXPECTED_VISUAL_STUDIO_PLATFORM ARM64EC)
+        endif()
+        if(NOT CMAKE_GENERATOR_PLATFORM STREQUAL SUBLAB808_EXPECTED_VISUAL_STUDIO_PLATFORM)
+            message(FATAL_ERROR
+                "Visual Studio platform '${CMAKE_GENERATOR_PLATFORM}' does not match JUCE's "
+                "detected architecture '${JUCE_TARGET_ARCHITECTURE}'. Use a fresh build directory "
+                "with -A ${SUBLAB808_EXPECTED_VISUAL_STUDIO_PLATFORM}.")
+        endif()
+    endif()
+
+    # The pinned JUCE manifest helper must load the target VST3 during the build.
+    # Require native Windows on Arm instead of misrepresenting a cross-build as validation.
+    if(JUCE_TARGET_ARCHITECTURE STREQUAL "arm64ec")
+        if(NOT CMAKE_GENERATOR MATCHES "^Visual Studio ")
+            message(FATAL_ERROR "SubLab808 ARM64EC builds require a Visual Studio generator")
+        endif()
+        string(TOLOWER "${CMAKE_HOST_SYSTEM_PROCESSOR}" SUBLAB808_WINDOWS_HOST_ARCHITECTURE)
+        if(NOT SUBLAB808_WINDOWS_HOST_ARCHITECTURE MATCHES "^(arm64|arm64ec|aarch64)$"
+           OR NOT JUCE_WINDOWS_HELPERS_CAN_RUN)
+            message(FATAL_ERROR
+                "SubLab808 ARM64EC builds require native Windows on Arm so the VST3 manifest "
+                "helper and host test can run")
+        endif()
+    endif()
+endif()
+
+# JUCE 8.0.15 omits the Visual Studio platform from its nested VST3 manifest-helper
+# configure. Keep the pinned workaround outside JUCE so ARM64EC builds generate metadata.
+include(cmake/JuceVST3ManifestHelperPlatform.cmake)
 
 juce_add_plugin(SubLab808
     COMPANY_NAME "Whykiki Audio"
@@ -54,12 +100,15 @@ if(APPLE)
     # bundle last so the downloadable artifact has a valid resource seal.
     find_program(SUBLAB808_CODESIGN_EXECUTABLE codesign REQUIRED)
     set(SUBLAB808_CODESIGN_IDENTITY "-" CACHE STRING "Final VST3 signing identity; '-' selects ad-hoc signing")
-    set(SUBLAB808_CODESIGN_OPTIONS --force --deep --sign "${SUBLAB808_CODESIGN_IDENTITY}")
+    # The current VST3 has no nested code objects. Sign the root bundle explicitly;
+    # recursive signing can hide a missing inside-out rule if helpers are added later.
+    set(SUBLAB808_CODESIGN_OPTIONS --force --sign "${SUBLAB808_CODESIGN_IDENTITY}")
     if(NOT SUBLAB808_CODESIGN_IDENTITY STREQUAL "-")
         list(APPEND SUBLAB808_CODESIGN_OPTIONS --options runtime --timestamp)
     endif()
     add_custom_command(TARGET SubLab808_VST3 POST_BUILD
         COMMAND "${SUBLAB808_CODESIGN_EXECUTABLE}" ${SUBLAB808_CODESIGN_OPTIONS} "$<TARGET_BUNDLE_DIR:SubLab808_VST3>"
+        COMMAND "${SUBLAB808_CODESIGN_EXECUTABLE}" --verify --deep --strict --verbose=2 "$<TARGET_BUNDLE_DIR:SubLab808_VST3>"
         COMMENT "Signing completed SubLab808 VST3 bundle"
         VERBATIM)
 endif()
@@ -92,7 +141,7 @@ target_link_libraries(SubLab808HostTests PRIVATE juce::juce_audio_utils
     PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
 add_dependencies(SubLab808HostTests SubLab808_VST3)
 add_test(NAME SubLab808BundleLoad COMMAND SubLab808HostTests
-    "${CMAKE_BINARY_DIR}/SubLab808_artefacts/$<CONFIG>/VST3/SubLab808.vst3")
+    "$<GENEX_EVAL:$<TARGET_PROPERTY:SubLab808_VST3,JUCE_PLUGIN_ARTEFACT_FILE>>")
 set_tests_properties(SubLab808BundleLoad PROPERTIES TIMEOUT 300)
 
 # Preset persistence and complete factory-bank audio checks.

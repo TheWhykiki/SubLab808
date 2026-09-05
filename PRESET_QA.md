@@ -23,6 +23,12 @@ The separate acceptance-review changes are integrated and released by the coordi
 Run `SubLab808PresetTests <absolute-output-directory>` to retain the audio CSV and PNG previews.
 The interactive part requires a desktop display. Tests use a temporary library and do not change real user presets.
 
+## Cross-platform build follow-up (2026-09-05)
+
+- A clean local macOS build produced exactly `arm64` and `x86_64` slices, both with a macOS 11.0 deployment target and an intact strict ad-hoc signature.
+- Smoke, listener-lock, VST3 load/render/state recall and the non-UI preset save/restore subset passed natively on Apple Silicon, including the ZIP extraction roundtrip with identical binary and `moduleinfo.json` hashes.
+- Native Intel-macOS, Windows x64 and Windows ARM64EC jobs are configured in CI; those remote runners and physical Cubase acceptance were not run by this local follow-up.
+
 ## Follow-up: preset file and dialog safety
 
 - Managed exports (including directory symlinks) are rejected without changing stored bytes. Ordinary exports, including UTF-8 file paths, remain supported.

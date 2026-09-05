@@ -2,13 +2,12 @@
 
 ## Requirements
 
-- macOS 11 or newer
-- Apple Silicon Mac
-- Xcode command-line tools
+- macOS 11 or newer on an Apple Silicon or Intel Mac; Windows 10 or newer for x64, or Windows 11 on Arm for ARM64EC
+- Xcode command-line tools on macOS; Visual Studio 2022 17.3 or a newer supported MSVC with Desktop C++, a Windows 11 SDK and ARM64/ARM64EC tools on Windows
 - CMake 3.25 or newer
 - JUCE 8.0.15 at commit `91ad83ae34a81e0833b1a2b0866f54846370ae53` (downloaded automatically when no local checkout is supplied)
 
-## Configure and build
+## Configure and build on macOS
 
 ```sh
 cmake -S . -B build -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release
@@ -26,9 +25,45 @@ The VST3 bundle is created at:
 
 `build/SubLab808_artefacts/Release/VST3/SubLab808.vst3`
 
+The macOS VST3 is a universal binary containing native `arm64` and `x86_64`
+slices. Both slices have a macOS 11 deployment target. CI builds that universal
+bundle on both `macos-15` (Arm) and `macos-15-intel`, then runs the VST3 host,
+render and state-recall checks natively on each processor architecture.
+
+## Configure and build on Windows
+
+Windows uses separate build trees for the two supported VST3 ABIs:
+
+```powershell
+cmake -S . -B build-windows-x64 -A x64
+cmake --build build-windows-x64 --config Release --target SubLab808Tests SubLab808_VST3 SubLab808HostTests SubLab808PresetTests --parallel
+ctest --test-dir build-windows-x64 -C Release --output-on-failure
+
+cmake -S . -B build-windows-arm64ec -A ARM64EC
+cmake --build build-windows-arm64ec --config Release --target SubLab808Tests SubLab808_VST3 SubLab808HostTests SubLab808PresetTests --parallel
+ctest --test-dir build-windows-arm64ec -C Release --output-on-failure
+```
+
+The resulting VST3 binaries are below `Contents/x86_64-win` and
+`Contents/arm64ec-win`, respectively. ARM64EC requires Windows 11 and is the
+Windows-on-Arm ABI for x64/ARM64EC plug-in hosts; classic ARM64 binaries cannot
+be loaded into those processes. Configure ARM64EC on a native Windows-on-Arm
+machine. An x64-hosted ARM64EC cross-build is rejected because the pinned JUCE
+VST3 manifest helper must execute for the target ABI during the build.
+
+The CI runs the JUCE VST3 scan, instantiation, render and state-recall host test
+natively on both Windows architectures. This includes the non-UI smoke tests and
+deterministic preset persistence subset; the desktop-dialog suite remains a
+separate interactive test. CI uses the explicit GitHub-hosted Windows 11 Arm +
+Visual Studio 2026 image for ARM64EC. These checks do not replace release
+acceptance in Cubase on physical Windows x64 and Arm systems.
+
 ## Local installation
 
-Copy the bundle to `~/Library/Audio/Plug-Ins/VST3/`, then restart Cubase or rescan plugins in Cubase's Plug-in Manager.
+On macOS, copy the bundle to `~/Library/Audio/Plug-Ins/VST3/`. On Windows, copy
+the matching architecture's bundle to `C:\Program Files\Common Files\VST3\`
+with administrator permission. Then restart Cubase or rescan plug-ins in its
+Plug-in Manager.
 
 ## Tests
 
@@ -57,7 +92,11 @@ Editor size is applied on the message thread; a worker restore publishes its dim
 Release builds must be created from a clean build directory. Verify the compatibility target with:
 
 ```sh
-otool -l build/SubLab808_artefacts/Release/VST3/SubLab808.vst3/Contents/MacOS/SubLab808 | grep -A3 LC_BUILD_VERSION
+binary="build/SubLab808_artefacts/Release/VST3/SubLab808.vst3/Contents/MacOS/SubLab808"
+test "$(lipo -archs "$binary" | tr ' ' '\n' | LC_ALL=C sort | xargs)" = "arm64 x86_64"
+for architecture in arm64 x86_64; do
+  otool -arch "$architecture" -l "$binary" | grep -A3 LC_BUILD_VERSION | grep "minos 11.0"
+done
 ```
 
 The completed local bundle is ad-hoc signed by default. To apply an available Developer ID Application certificate as the final build step, configure with:

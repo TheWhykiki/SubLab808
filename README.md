@@ -1,7 +1,23 @@
 # SubLab808
 
-Eigenständiger, nativer 808-Bass-Synth für Apple Silicon und Cubase (VST3), Entwicklungsstand 1.4.0.
+Eigenständiger, nativer 808-Bass-Synth für Cubase und andere VST3-Hosts auf macOS und Windows, Entwicklungsstand 1.4.0.
 Die Klangerzeugung ist neu implementiert und verwendet keine Binärdaten oder Samples von 808 Lab.
+Das macOS-VST3 wird als Universal Binary mit nativen `arm64`- und `x86_64`-Slices
+für macOS 11 oder neuer gebaut. Unter Windows entstehen getrennte `x64`- und
+`ARM64EC`-Bundles. `ARM64EC` ist die native Windows-on-Arm-Ausprägung, die von
+x64-/ARM64EC-Plug-in-Hosts geladen werden kann; ein klassisches `ARM64`-VST3 ist
+mit diesen Hosts nicht ABI-kompatibel. Der ARM64EC-Build erfolgt nativ auf
+Windows on Arm, damit JUCE die VST3-Metadaten mit seinem Zielsystem-Helper erzeugt.
+
+## Lizenz und öffentliche Binärverteilung
+
+Der Projektcode steht unter der proprietären [LICENSE](LICENSE). Die eingebundenen
+JUCE-Module sind wahlweise unter AGPLv3 oder einer kommerziellen JUCE-Lizenz
+verfügbar. Vor einer öffentlichen Binärverteilung muss deshalb für genau den
+verwendeten JUCE-Stand entweder die passende kommerzielle Berechtigung dokumentiert
+oder eine mit AGPLv3 vereinbare Lizenzierung einschließlich der erforderlichen
+Hinweise und Quellcodebereitstellung gewählt werden. Das Repository selbst belegt
+keine kommerzielle JUCE-Berechtigung.
 
 ## Regler
 
@@ -54,7 +70,8 @@ Den Preset-Namen anklicken, um den Browser mit Suche, Kategorien und Favoriten z
 **Save** speichert Änderungen an einem eigenen Preset; **Save As** legt eine neue Variante mit Namen und Kategorie an.
 Unter **More** stehen Umbenennen, Löschen, Import und Export bereit. `*` kennzeichnet ungespeicherte Änderungen.
 
-Eigene Dateien liegen auf macOS unter `~/Library/Whykiki Audio/SubLab808/Presets` und verwenden
+Eigene Dateien liegen auf macOS unter `~/Library/Whykiki Audio/SubLab808/Presets`
+und unter Windows in `%APPDATA%\Whykiki Audio\SubLab808\Presets`; sie verwenden
 `.sublab808preset`. Factory-Sounds bleiben geschützt. Der DAW-Projektzustand enthält zusätzlich den aktuellen
 Klang einschließlich ungespeicherter Änderungen und des eigenen Preset-Namens.
 

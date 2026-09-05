@@ -1,7 +1,28 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include "FactoryBank.h"
+#include <cmath>
 #include <limits>
+
+namespace
+{
+bool parseFiniteStateValue(const juce::var& encoded, double& result)
+{
+    if (encoded.isDouble() || encoded.isInt() || encoded.isInt64())
+        result = static_cast<double>(encoded);
+    else if (encoded.isString())
+    {
+        const auto text = encoded.toString().trim();
+        if (text.isEmpty()) return false;
+        auto cursor = text.getCharPointer();
+        const auto parsed = juce::CharacterFunctions::readDoubleValue(cursor);
+        if (! cursor.isEmpty() || ! std::isfinite(parsed)) return false;
+        result = parsed;
+    }
+    else return false;
+    return std::isfinite(result) && std::isfinite(static_cast<float>(result));
+}
+}
 
 SubLab808Processor::SubLab808Processor(juce::File presetStorage)
     : AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true)),
@@ -269,7 +290,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout SubLab808Processor::makeLayo
 float SubLab808Processor::readParameter(size_t index) const noexcept
 {
     const auto* parameter = rangedParameters[index];
-    return parameter->convertFrom0to1(parameter->getValue());
+    const auto fallback = parameter->convertFrom0to1(parameter->getDefaultValue());
+    const auto normalised = parameter->getValue();
+    if (! std::isfinite(normalised) || normalised < 0.0f || normalised > 1.0f) return fallback;
+    const auto raw = parameter->convertFrom0to1(normalised);
+    const auto& range = parameter->getNormalisableRange();
+    return std::isfinite(raw) && raw >= range.start && raw <= range.end ? raw : fallback;
 }
 
 SubLab808Processor::RuntimeParameters SubLab808Processor::readRuntimeParameters() const
@@ -633,7 +659,8 @@ void SubLab808Processor::getStateInformation(juce::MemoryBlock& dest)
     // parameter callback can capture the complete committed state without waiting
     // for the old notification owner or taking JUCE's parameter-listener locks.
     auto state = extensions.createCopy();
-    state.removeChild(state.getChildWithName("WkPresetSelection"), nullptr);
+    for (int child = state.getNumChildren(); --child >= 0;)
+        if (state.getChild(child).hasType("WkPresetSelection")) state.removeChild(child, nullptr);
     if (const auto selected = selection.getChildWithName("WkPresetSelection"); selected.isValid())
         state.addChild(selected.createCopy(), -1, nullptr);
     for (size_t i = 0; i < parameterIds.size(); ++i)
@@ -666,7 +693,11 @@ bool SubLab808Processor::parametersMatchProgram(int index)
     const auto& preset = factoryBank()[(size_t) index];
     for (const auto& [id, value] : preset.values) {
         const auto* parameter = parameters.getParameter(id);
-        if (parameter == nullptr || std::abs(parameter->getValue() - parameter->convertTo0to1(value)) > 0.00002f) return false;
+        if (parameter == nullptr) return false;
+        const auto normalised = parameter->getValue();
+        const auto expected = parameter->convertTo0to1(value);
+        if (! std::isfinite(normalised) || normalised < 0.0f || normalised > 1.0f
+            || ! std::isfinite(expected) || std::abs(normalised - expected) > 0.00002f) return false;
     }
     return true;
 }
@@ -678,6 +709,26 @@ void SubLab808Processor::setStateInformation(const void* data, int size)
         // The schema is fixed. Do not inspect the live APVTS handle before the
         // control operation is serialized: another restore may be replacing it.
         if (! state.hasType("PARAMETERS")) return;
+
+        // Reject the complete state before submitting any part of it. A hostile or
+        // damaged project must not commit metadata/reset Click while an invalid
+        // parameter is silently clamped (or poison DSP with NaN/Inf).
+        for (const auto& child : state)
+        {
+            const auto id = child["id"].toString();
+            for (size_t index = 0; index < parameterIds.size(); ++index)
+                if (id == parameterIds[index])
+                {
+                    if (! child.hasType("PARAM")) return;
+                    if (! child.hasProperty("value")) break; // pinned legacy behavior: missing value uses the default
+                    double value = 0.0;
+                    const auto& range = rangedParameters[index]->getNormalisableRange();
+                    if (! parseFiniteStateValue(child["value"], value)
+                        || value < static_cast<double>(range.start)
+                        || value > static_cast<double>(range.end)) return;
+                    break;
+                }
+        }
 
         ControlOperation operation;
         operation.kind = ControlOperation::Kind::state;

@@ -7,6 +7,8 @@
 #include <locale>
 #include <filesystem>
 #include <cstdint>
+#include <functional>
+#include <optional>
 
 namespace wk
 {
@@ -27,6 +29,12 @@ class PresetLibrary
         std::uint64_t revision = 0;
     };
 public:
+    struct SoundToken
+    {
+        Preset sound;
+        std::uint64_t revision = 0;
+    };
+
 #if defined(PRESET_TEST_SUBLAB)
     // Defined for every translation unit in the preset-test target only. The
     // product target has neither this scheduling hook nor its storage/calls.
@@ -62,17 +70,28 @@ public:
     juce::File storageDirectory() const { return directory; }
     juce::String extension() const { return "." + product.toLowerCase() + "preset"; }
 
-    // Used by asynchronous UI actions to avoid acting on a different DAW sound
-    // when a dialog completes. Metadata-only changes do not invalidate the sound.
+    // The plain snapshot supports display/tests. Async UI mutations use the token:
+    // its revision also detects same-ID restore/selection ABA between UI turns.
     Preset currentSound() const
     {
+        if (const auto captured = currentSoundToken()) return captured->sound;
+        return {};
+    }
+    std::optional<SoundToken> currentSoundToken() const
+    {
         CapturedPreset captured;
-        return capture(captured) ? captured.sound : Preset {};
+        if (! capture(captured)) return std::nullopt;
+        return SoundToken { std::move(captured.sound), captured.revision };
     }
     bool isCurrentSound(const Preset& expected) const
     {
         const auto actual = currentSound();
         return expected.id.isNotEmpty() && actual.id == expected.id && actual.values == expected.values;
+    }
+    bool isCurrentSound(const SoundToken& expected) const
+    {
+        CapturedPreset actual;
+        return capture(actual) && matches(actual, expected);
     }
 
     std::vector<Preset> userPresets() const
@@ -113,8 +132,13 @@ public:
             // integer ranges such as ReverseLab's random seed (1..999999).
             const auto tolerance = juce::jmax(0.000001f, range.interval * 0.25f,
                 std::abs(legal) * std::numeric_limits<float>::epsilon() * 2.0f);
-            // APVTS raw values may lag until the parameter's notification arrives.
-            const auto actual = parameter->convertFrom0to1(parameter->getValue());
+            // APVTS raw values may lag until the parameter's notification arrives,
+            // so read the authoritative ranged parameter. Invalid host automation
+            // is always dirty and must never make NaN compare as "unchanged".
+            const auto normalised = parameter->getValue();
+            if (! std::isfinite(normalised) || normalised < 0.0f || normalised > 1.0f) return true;
+            const auto actual = parameter->convertFrom0to1(normalised);
+            if (! std::isfinite(actual) || actual < range.start || actual > range.end) return true;
             if (std::abs(actual - legal) > tolerance) return true;
         }
         return false;
@@ -129,22 +153,45 @@ public:
     }
     void appendSelection(juce::ValueTree& state) const
     {
-        state.removeChild(state.getChildWithName("WkPresetSelection"), nullptr);
+        removeSelectionTrees(state);
         const juce::ScopedLock lock(selectionLock);
-        if (selected.id.isNotEmpty()) state.addChild(selectionTree(selected), -1, nullptr);
+        if (selected.id.isNotEmpty() && validatePersistedPreset(selected).wasOk())
+            state.addChild(selectionTree(selected), -1, nullptr);
     }
     void restoreSelection(const juce::ValueTree& state)
     {
         Preset candidate;
-        const auto tree = state.getChildWithName("WkPresetSelection");
-        if (tree.isValid())
+        juce::ValueTree tree;
+        int selectionCount = 0;
+        for (const auto& child : state)
+            if (child.hasType("WkPresetSelection"))
+            {
+                tree = child;
+                ++selectionCount;
+            }
+        bool valid = selectionCount == 1;
+        if (valid)
         {
             candidate.id = tree["id"].toString(); candidate.name = tree["name"].toString();
             candidate.category = tree["category"].toString(); candidate.description = tree["description"].toString();
             for (const auto& child : tree)
-                candidate.values[child["id"].toString()] = static_cast<float>(child["value"]);
-            if (! validId(candidate.id) || candidate.name.isEmpty() || validateValues(candidate).failed()) candidate = {};
+            {
+                const auto id = child["id"].toString();
+                float value = 0.0f;
+                if (! child.hasType("VALUE") || ! child.hasProperty("id") || ! child.hasProperty("value")
+                    || ! decodePresetValue(id, child["value"], value)
+                    || candidate.values.contains(id))
+                {
+                    valid = false;
+                    break;
+                }
+                candidate.values.emplace(id, value);
+            }
+            if (valid && (tree.getNumChildren() != static_cast<int>(factory.front().values.size())
+                          || validatePersistedPreset(candidate).failed()))
+                valid = false;
         }
+        if (! valid) candidate = {};
         const juce::ScopedLock lock(selectionLock);
         selected = std::move(candidate);
         // A same-ID restore is still a newer state, including X -> Y -> X ABA.
@@ -152,21 +199,23 @@ public:
     }
 
     juce::Result saveAs(const juce::String& name, const juce::String& category,
-                        bool* savedSelectionStillCurrent = nullptr)
+                        bool* savedSelectionStillCurrent = nullptr, const SoundToken* expected = nullptr,
+                        std::optional<SoundToken>* savedSound = nullptr)
     {
         if (savedSelectionStillCurrent != nullptr) *savedSelectionStillCurrent = false;
+        if (savedSound != nullptr) savedSound->reset();
         if (auto result = validateName(name); result.failed()) return result;
         if (! fileLock.enter(2000)) return busy();
         const juce::ScopeGuard unlock { [this] { fileLock.exit(); } };
         if (nameExists(name.trim())) return juce::Result::fail("A user preset with this name already exists. Choose another name.");
         CapturedPreset captured;
-        if (! capture(captured)) return captureBusy();
+        if (auto result = captureForAction(captured, expected); result.failed()) return result;
         auto preset = captured.sound;
         preset.id = juce::Uuid().toString(); preset.name = name.trim();
         preset.category = category.trim().substring(0, 48); preset.factoryIndex = -1;
         if (preset.category.isEmpty()) preset.category = "User";
         if (auto result = writeFile(pathFor(preset.id), preset); result.failed()) return result;
-        const auto stillCurrent = selectIfRevision(preset, captured.revision);
+        const auto stillCurrent = selectIfRevision(preset, captured.revision, savedSound);
         if (savedSelectionStillCurrent != nullptr) *savedSelectionStillCurrent = stillCurrent;
         return juce::Result::ok();
     }
@@ -195,12 +244,25 @@ public:
         return juce::Result::ok();
     }
 
-    juce::Result load(const Preset& requested)
+    juce::Result load(const Preset& requested, const SoundToken* expected = nullptr)
     {
+        if (expected != nullptr)
+        {
+            CapturedPreset current;
+            if (auto result = captureForAction(current, expected); result.failed()) return result;
+        }
         if (requested.factoryIndex >= 0)
         {
             if (! juce::isPositiveAndBelow(requested.factoryIndex, static_cast<int>(factory.size())))
                 return juce::Result::fail("Unknown factory preset.");
+            if (expected != nullptr)
+            {
+                CapturedPreset current;
+                if (auto result = captureForAction(current, expected); result.failed()) return result;
+            }
+            // This final guard is the UI action's linearisation point. A host
+            // restore that begins afterwards is a distinct writer; the processor's
+            // normal commit ordering determines which operation is last.
             processor.setCurrentProgram(requested.factoryIndex);
             changed();
             return juce::Result::ok();
@@ -216,20 +278,28 @@ public:
             if (const auto it = preset.values.find(id); it != preset.values.end())
                 child.setProperty("value", it->second, nullptr);
         }
-        state.removeChild(state.getChildWithName("WkPresetSelection"), nullptr);
+        removeSelectionTrees(state);
         state.addChild(selectionTree(preset), -1, nullptr);
         juce::MemoryBlock data;
         juce::AudioProcessor::copyXmlToBinary(*state.createXml(), data);
+        if (expected != nullptr)
+        {
+            CapturedPreset current;
+            if (auto result = captureForAction(current, expected); result.failed()) return result;
+        }
+        // As above, this last check linearises the UI decision immediately before
+        // the processor commit without holding a library lock through callbacks.
         processor.setStateInformation(data.getData(), static_cast<int>(data.getSize()));
         changed();
         return juce::Result::ok();
     }
 
-    juce::Result renameCurrent(const juce::String& name, const juce::String& expectedId = {})
+    juce::Result renameCurrent(const juce::String& name, const juce::String& expectedId = {},
+                               const SoundToken* expected = nullptr)
     {
         if (auto result = validateName(name); result.failed()) return result;
         CapturedPreset captured;
-        if (! capture(captured)) return captureBusy();
+        if (auto result = captureForAction(captured, expected); result.failed()) return result;
         const auto& active = captured.baseline;
         if (expectedId.isNotEmpty() && active.id != expectedId)
             return juce::Result::fail("The selected preset changed while the dialog was open. Rename was cancelled.");
@@ -239,6 +309,11 @@ public:
         if (nameExists(name.trim(), active.id)) return juce::Result::fail("A user preset with this name already exists.");
         Preset disk;
         if (auto result = readStored(active.id, disk); result.failed()) return result;
+        if (expected != nullptr)
+        {
+            CapturedPreset current;
+            if (auto result = captureForAction(current, expected); result.failed()) return result;
+        }
         disk.name = name.trim();
         if (auto result = writeFile(pathFor(disk.id), disk); result.failed()) return result;
         {
@@ -255,12 +330,19 @@ public:
         return juce::Result::ok();
     }
 
-    juce::Result deleteCurrent()
+    juce::Result deleteCurrent(const SoundToken* expected = nullptr)
     {
-        const auto active = current();
+        CapturedPreset captured;
+        if (auto result = captureForAction(captured, expected); result.failed()) return result;
+        const auto& active = captured.baseline;
         if (active.factoryIndex >= 0) return juce::Result::fail("Factory presets cannot be deleted.");
         if (! fileLock.enter(2000)) return busy();
         const juce::ScopeGuard unlock { [this] { fileLock.exit(); } };
+        if (expected != nullptr)
+        {
+            CapturedPreset current;
+            if (auto result = captureForAction(current, expected); result.failed()) return result;
+        }
         if (! pathFor(active.id).existsAsFile() || ! pathFor(active.id).deleteFile())
             return juce::Result::fail("Could not delete the user preset.");
         favouritePath(active.id).deleteFile();
@@ -283,7 +365,7 @@ public:
         imported = std::move(preset);
         return juce::Result::ok();
     }
-    juce::Result exportCurrent(const juce::File& file) const
+    juce::Result exportCurrent(const juce::File& file, const SoundToken* expected = nullptr) const
     {
         // Export must not bypass Save's conflict checks or replace another UUID's
         // managed file, making that preset disappear from the library.
@@ -293,7 +375,7 @@ public:
         if (resolvedFile == resolvedDirectory || resolvedFile.isAChildOf(resolvedDirectory))
             return juce::Result::fail("Choose an export location outside the preset library. Use Save or Save As to store a library preset.");
         CapturedPreset captured;
-        if (! capture(captured)) return captureBusy();
+        if (auto result = captureForAction(captured, expected); result.failed()) return result;
         auto preset = captured.sound;
         if (preset.factoryIndex >= 0) preset.id = juce::Uuid().toString();
         preset.factoryIndex = -1;
@@ -316,6 +398,52 @@ public:
     }
 
 private:
+    static void removeSelectionTrees(juce::ValueTree& state)
+    {
+        for (int index = state.getNumChildren(); --index >= 0;)
+            if (state.getChild(index).hasType("WkPresetSelection")) state.removeChild(index, nullptr);
+    }
+    static bool sameSound(const Preset& first, const Preset& second)
+    {
+        return first.id == second.id && first.values == second.values;
+    }
+    static bool matches(const CapturedPreset& captured, const SoundToken& expected)
+    {
+        return captured.revision == expected.revision && sameSound(captured.sound, expected.sound);
+    }
+    static bool parseFiniteNumber(const juce::var& encoded, double& result)
+    {
+        if (encoded.isDouble() || encoded.isInt() || encoded.isInt64())
+            result = static_cast<double>(encoded);
+        else if (encoded.isString())
+        {
+            const auto text = encoded.toString().trim();
+            if (text.isEmpty()) return false;
+            auto cursor = text.getCharPointer();
+            const auto parsed = juce::CharacterFunctions::readDoubleValue(cursor);
+            if (! cursor.isEmpty() || ! std::isfinite(parsed)) return false;
+            result = parsed;
+        }
+        else return false;
+        return std::isfinite(result) && std::isfinite(static_cast<float>(result));
+    }
+    bool decodePresetValue(const juce::String& id, const juce::var& encoded, float& result) const
+    {
+        const auto* parameter = parameters.getParameter(id);
+        double parsed = 0.0;
+        if (parameter == nullptr || ! parseFiniteNumber(encoded, parsed)) return false;
+        const auto& range = parameter->getNormalisableRange();
+        if (parsed < static_cast<double>(range.start) || parsed > static_cast<double>(range.end)) return false;
+        result = static_cast<float>(parsed);
+        return std::isfinite(result) && result >= range.start && result <= range.end;
+    }
+    juce::Result captureForAction(CapturedPreset& captured, const SoundToken* expected) const
+    {
+        if (! capture(captured)) return captureBusy();
+        if (expected != nullptr && ! matches(captured, *expected))
+            return juce::Result::fail("The sound changed while the dialog was open. The action was cancelled. Please try again.");
+        return juce::Result::ok();
+    }
     static juce::Result resolvePath(const juce::File& file, juce::File& resolved)
     {
         // Resolve existing ancestors as well as the file itself. Lexical ancestry
@@ -420,10 +548,18 @@ private:
             const auto* parameter = parameters.getParameter(id);
             if (parameter == nullptr || ! std::isfinite(value)) return juce::Result::fail("Unknown or invalid preset parameter: " + id);
             const auto& range = parameter->getNormalisableRange();
-            if (value < range.start - 0.0001f || value > range.end + 0.0001f)
+            if (value < range.start || value > range.end)
                 return juce::Result::fail("Preset parameter is outside its supported range: " + id);
         }
         return juce::Result::ok();
+    }
+    juce::Result validatePersistedPreset(const Preset& preset) const
+    {
+        if (! validId(preset.id)) return juce::Result::fail("Invalid preset identity.");
+        if (auto result = validateName(preset.name); result.failed()) return result;
+        if (preset.category.length() > 48 || preset.description.length() > 1024)
+            return juce::Result::fail("Preset metadata is too long.");
+        return validateValues(preset);
     }
     juce::Result readFile(const juce::File& file, Preset& preset) const
     {
@@ -437,18 +573,17 @@ private:
             return juce::Result::fail("This file is not a supported " + product + " preset.");
         preset = {}; preset.id = json["id"].toString(); preset.name = json["name"].toString();
         preset.category = json["category"].toString(); preset.description = json["description"].toString();
-        if (! validId(preset.id)) return juce::Result::fail("Invalid preset identity.");
-        if (auto result = validateName(preset.name); result.failed()) return result;
-        if (preset.category.length() > 48 || preset.description.length() > 1024)
-            return juce::Result::fail("Preset metadata is too long.");
         if (auto* values = json["parameters"].getDynamicObject())
             for (const auto& property : values->getProperties())
             {
                 if (! property.value.isDouble() && ! property.value.isInt() && ! property.value.isInt64())
                     return juce::Result::fail("Preset parameters must be numbers.");
-                preset.values[property.name.toString()] = static_cast<float>(property.value);
+                float value = 0.0f;
+                if (! decodePresetValue(property.name.toString(), property.value, value))
+                    return juce::Result::fail("Unknown or invalid preset parameter: " + property.name.toString());
+                preset.values[property.name.toString()] = value;
             }
-        return validateValues(preset);
+        return validatePersistedPreset(preset);
     }
     juce::Result readStored(const juce::String& id, Preset& preset) const
     {
@@ -458,7 +593,7 @@ private:
     }
     juce::Result writeFile(const juce::File& file, const Preset& preset) const
     {
-        if (auto result = validateValues(preset); result.failed()) return result;
+        if (auto result = validatePersistedPreset(preset); result.failed()) return result;
         auto root = std::make_unique<juce::DynamicObject>();
         root->setProperty("format", "WhykikiPreset"); root->setProperty("version", 1);
         root->setProperty("plugin", product); root->setProperty("id", preset.id);
@@ -496,8 +631,10 @@ private:
         }
         return tree;
     }
-    bool selectIfRevision(const Preset& preset, std::uint64_t expectedRevision)
+    bool selectIfRevision(const Preset& preset, std::uint64_t expectedRevision,
+                          std::optional<SoundToken>* savedSound = nullptr)
     {
+        if (savedSound != nullptr) savedSound->reset();
         std::uint64_t committedRevision = 0;
         bool applied = false;
         {
@@ -513,7 +650,10 @@ private:
         // Host callbacks may themselves replace selection or destroy the editor.
         changed();
         const juce::ScopedLock lock(selectionLock);
-        return applied && selectionRevision == committedRevision;
+        const auto stillCurrent = applied && selectionRevision == committedRevision;
+        if (stillCurrent && savedSound != nullptr)
+            *savedSound = SoundToken { preset, committedRevision };
+        return stillCurrent;
     }
     void changed() { processor.updateHostDisplay(juce::AudioProcessorListener::ChangeDetails().withNonParameterStateChanged(true)); }
 

@@ -6,17 +6,32 @@ on:
   pull_request:
 
 jobs:
-  macos-arm64:
-    runs-on: macos-14
+  macos-universal:
+    name: macOS universal build + ${{ matrix.host_arch }} tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host_arch: arm64
+            runner: macos-15
+            runner_arch: ARM64
+          - host_arch: x86_64
+            runner: macos-15-intel
+            runner_arch: X64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Cache JUCE
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: build/_deps
-          key: juce-91ad83ae34a81e0833b1a2b0866f54846370ae53
+          key: juce-macos-${{ matrix.host_arch }}-universal-release-91ad83ae34a81e0833b1a2b0866f54846370ae53
       - name: Verify factory bank
         run: python3 scripts/generate-presets.py --check
+      - name: Verify native host architecture
+        run: |
+          test "${{ runner.arch }}" = "${{ matrix.runner_arch }}"
+          test "$(uname -m)" = "${{ matrix.host_arch }}"
       - name: Configure
         # Same generator as BUILDING.md; the Xcode generator adds entitlement/codesign steps that
         # are not part of the documented build and were the only difference to passing local runs.
@@ -25,37 +40,199 @@ jobs:
         run: cmake --build build --target SubLab808Tests SubLab808_VST3 SubLab808HostTests SubLab808PresetTests -j "$(sysctl -n hw.ncpu)"
       - name: Test
         run: ctest --test-dir build --output-on-failure
-      - name: Verify deployment target and architecture
+      - name: Verify universal slices and deployment target
         run: |
           binary="build/SubLab808_artefacts/Release/VST3/SubLab808.vst3/Contents/MacOS/SubLab808"
-          test "$(lipo -archs "$binary")" = "arm64"
-          otool -l "$binary" | grep -A3 LC_BUILD_VERSION | grep "minos 11.0"
+          architectures="$(lipo -archs "$binary" | tr ' ' '\n' | LC_ALL=C sort | xargs)"
+          test "$architectures" = "arm64 x86_64"
+          for architecture in arm64 x86_64; do
+            otool -arch "$architecture" -l "$binary" | grep -A3 LC_BUILD_VERSION | grep "minos 11.0"
+          done
+          module_info="build/SubLab808_artefacts/Release/VST3/SubLab808.vst3/Contents/Resources/moduleinfo.json"
+          test -s "$module_info"
+          grep -q '"Name": "SubLab808"' "$module_info"
+          grep -q '"Classes"' "$module_info"
       - name: Package and validate downloadable bundle
         run: |
           bundle="build/SubLab808_artefacts/Release/VST3/SubLab808.vst3"
-          archive="build/SubLab808-VST3.zip"
+          archive="build/SubLab808-VST3-macOS-${{ matrix.host_arch }}.zip"
           ditto -c -k --keepParent "$bundle" "$archive"
           mkdir -p build/artifact-roundtrip
           ditto -x -k "$archive" build/artifact-roundtrip
           restored="build/artifact-roundtrip/SubLab808.vst3"
           test -x "$restored/Contents/MacOS/SubLab808"
+          test -s "$restored/Contents/Resources/moduleinfo.json"
+          test "$(shasum -a 256 "$bundle/Contents/MacOS/SubLab808" | awk '{print $1}')" = "$(shasum -a 256 "$restored/Contents/MacOS/SubLab808" | awk '{print $1}')"
+          test "$(shasum -a 256 "$bundle/Contents/Resources/moduleinfo.json" | awk '{print $1}')" = "$(shasum -a 256 "$restored/Contents/Resources/moduleinfo.json" | awk '{print $1}')"
+          grep -q '"Name": "SubLab808"' "$restored/Contents/Resources/moduleinfo.json"
+          grep -q '"Classes"' "$restored/Contents/Resources/moduleinfo.json"
           codesign --verify --deep --strict "$restored"
           build/SubLab808HostTests_artefacts/Release/SubLab808HostTests "$restored"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: SubLab808-VST3-${{ github.sha }}
-          path: build/SubLab808-VST3.zip
+          name: SubLab808-VST3-macOS-${{ matrix.host_arch }}-${{ github.sha }}
+          path: build/SubLab808-VST3-macOS-${{ matrix.host_arch }}.zip
+          if-no-files-found: error
+
+  windows:
+    name: Windows ${{ matrix.label }} build + tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: x64
+            runner: windows-2022
+            runner_arch: X64
+            host_arch: AMD64
+            cmake_generator: Visual Studio 17 2022
+            cmake_platform: x64
+            vst3_directory: x86_64-win
+            pe_header: '8664 machine \(x64\)'
+          - label: ARM64EC
+            runner: windows-11-vs2026-arm
+            runner_arch: ARM64
+            host_arch: ARM64
+            cmake_generator: Visual Studio 18 2026
+            cmake_platform: ARM64EC
+            vst3_directory: arm64ec-win
+            pe_header: '8664 machine \(x64\) \(ARM64X\)'
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Cache JUCE
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: build/_deps
+          key: juce-windows-${{ matrix.label }}-release-91ad83ae34a81e0833b1a2b0866f54846370ae53
+      - name: Verify factory bank
+        run: python scripts/generate-presets.py --check
+      - name: Verify native host architecture
+        shell: pwsh
+        run: |
+          if ("${{ runner.arch }}" -ne "${{ matrix.runner_arch }}") {
+            throw "Expected ${{ matrix.runner_arch }} runner, found ${{ runner.arch }}"
+          }
+          if ($env:PROCESSOR_ARCHITECTURE -ne "${{ matrix.host_arch }}") {
+            throw "Expected native ${{ matrix.host_arch }} runner, found $env:PROCESSOR_ARCHITECTURE"
+          }
+      - name: Configure
+        run: cmake -S . -B build -G "${{ matrix.cmake_generator }}" -A ${{ matrix.cmake_platform }}
+      - name: Build
+        run: cmake --build build --config Release --target SubLab808Tests SubLab808_VST3 SubLab808HostTests SubLab808PresetTests --parallel
+      - name: Test without desktop dialogs
+        shell: pwsh
+        run: |
+          ctest --test-dir build -C Release --output-on-failure --no-tests=error -E "^SubLab808Presets$"
+          if ($LASTEXITCODE -ne 0) { throw "Non-GUI CTest suite failed" }
+          $env:WHYKIKI_PRESET_TEST_SAVE_RESTORE_ONLY = "1"
+          ctest --test-dir build -C Release --output-on-failure --no-tests=error -R "^SubLab808Presets$"
+          if ($LASTEXITCODE -ne 0) { throw "Preset persistence subset failed" }
+      - name: Verify Windows VST3 architecture
+        shell: pwsh
+        run: |
+          $bundle = "build/SubLab808_artefacts/Release/VST3/SubLab808.vst3"
+          $contents = Join-Path $bundle "Contents"
+          $architectureDirectories = @(Get-ChildItem -LiteralPath $contents -Directory |
+            Where-Object Name -Like "*-win" | ForEach-Object Name)
+          if ($architectureDirectories.Count -ne 1 -or
+              $architectureDirectories[0] -ne "${{ matrix.vst3_directory }}") {
+            throw "Unexpected VST3 architecture directories: $($architectureDirectories -join ', ')"
+          }
+          $binary = Join-Path $contents "${{ matrix.vst3_directory }}/SubLab808.vst3"
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+            throw "Missing VST3 binary: $binary"
+          }
+          $moduleInfo = Join-Path $contents "Resources/moduleinfo.json"
+          if (-not (Test-Path -LiteralPath $moduleInfo -PathType Leaf) -or
+              (Get-Item -LiteralPath $moduleInfo).Length -eq 0) {
+            throw "Missing or empty VST3 moduleinfo.json: $moduleInfo"
+          }
+          $moduleText = Get-Content -LiteralPath $moduleInfo -Raw
+          if ($moduleText -notmatch '"Name"\s*:\s*"SubLab808"' -or
+              $moduleText -notmatch '"Classes"\s*:') {
+            throw "Unexpected VST3 moduleinfo.json content: $moduleInfo"
+          }
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+            throw "vswhere.exe was not found: $vswhere"
+          }
+          $visualStudio = (& $vswhere -latest -products * -property installationPath).Trim()
+          if (-not $visualStudio) {
+            throw "Visual Studio installation could not be resolved"
+          }
+          $hostTools = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "Hostarm64" } else { "Hostx64" }
+          $targetTools = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
+          $toolVersionFile = Join-Path $visualStudio "VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt"
+          $toolVersion = (Get-Content -LiteralPath $toolVersionFile -Raw).Trim()
+          $dumpbin = Join-Path $visualStudio "VC/Tools/MSVC/$toolVersion/bin/$hostTools/$targetTools/dumpbin.exe"
+          if (-not (Test-Path -LiteralPath $dumpbin -PathType Leaf)) {
+            throw "Native dumpbin.exe was not found: $dumpbin"
+          }
+          $hostBinary = "build/SubLab808HostTests_artefacts/Release/SubLab808HostTests.exe"
+          foreach ($peBinary in @($binary, $hostBinary)) {
+            if (-not (Test-Path -LiteralPath $peBinary -PathType Leaf)) {
+              throw "Missing PE binary: $peBinary"
+            }
+            $headers = & $dumpbin /headers $peBinary 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0) {
+              throw "dumpbin failed for $peBinary with exit code $LASTEXITCODE`n$headers"
+            }
+            if ($headers -notmatch "(?m)^\s*${{ matrix.pe_header }}\s*$") {
+              throw "Unexpected PE architecture for $peBinary`n$headers"
+            }
+          }
+      - name: Package and validate Windows bundle
+        shell: pwsh
+        run: |
+          $bundle = "build/SubLab808_artefacts/Release/VST3/SubLab808.vst3"
+          $binary = Join-Path $bundle "Contents/${{ matrix.vst3_directory }}/SubLab808.vst3"
+          $moduleInfo = Join-Path $bundle "Contents/Resources/moduleinfo.json"
+          $archive = "build/SubLab808-VST3-Windows-${{ matrix.label }}.zip"
+          $roundtrip = "build/artifact-roundtrip"
+          Compress-Archive -LiteralPath $bundle -DestinationPath $archive
+          Expand-Archive -LiteralPath $archive -DestinationPath $roundtrip
+          $restored = Join-Path $roundtrip "SubLab808.vst3"
+          $restoredBinary = Join-Path $restored "Contents/${{ matrix.vst3_directory }}/SubLab808.vst3"
+          $restoredModuleInfo = Join-Path $restored "Contents/Resources/moduleinfo.json"
+          foreach ($file in @($restoredBinary, $restoredModuleInfo)) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+              throw "Missing roundtrip file: $file"
+            }
+          }
+          if ((Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash -ne
+              (Get-FileHash -LiteralPath $restoredBinary -Algorithm SHA256).Hash) {
+            throw "Roundtrip changed the VST3 binary"
+          }
+          if ((Get-FileHash -LiteralPath $moduleInfo -Algorithm SHA256).Hash -ne
+              (Get-FileHash -LiteralPath $restoredModuleInfo -Algorithm SHA256).Hash) {
+            throw "Roundtrip changed moduleinfo.json"
+          }
+          $restoredModuleText = Get-Content -LiteralPath $restoredModuleInfo -Raw
+          if ($restoredModuleText -notmatch '"Name"\s*:\s*"SubLab808"' -or
+              $restoredModuleText -notmatch '"Classes"\s*:') {
+            throw "Unexpected roundtrip moduleinfo.json content: $restoredModuleInfo"
+          }
+          $host = "build/SubLab808HostTests_artefacts/Release/SubLab808HostTests.exe"
+          & $host $restored
+          if ($LASTEXITCODE -ne 0) {
+            throw "Host test rejected the extracted VST3 bundle"
+          }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: SubLab808-VST3-Windows-${{ matrix.label }}-${{ github.sha }}
+          path: build/SubLab808-VST3-Windows-${{ matrix.label }}.zip
+          if-no-files-found: error
 
   sanitizers:
     name: ASan + UBSan (tests and host test)
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Cache JUCE
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: build-asan/_deps
-          key: juce-91ad83ae34a81e0833b1a2b0866f54846370ae53
+          key: juce-macos-arm64-universal-sanitizers-91ad83ae34a81e0833b1a2b0866f54846370ae53
       - name: Verify factory bank
         run: python3 scripts/generate-presets.py --check
       - name: Configure
