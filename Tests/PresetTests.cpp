@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "FactoryBank.h"
+#include "UpdaterLauncher.h"
 #include <cstdio>
 #include <set>
 #include <stdexcept>
@@ -1182,7 +1183,36 @@ void checkPresetDialogLifecycles(const juce::File& root)
         checkQueuedLifecycleResult(root.getChildFile("Queued-unsaved-" + juce::String(result)), LifecycleDialog::unsaved, result);
     for (const auto action : { OwnerAction::hideAncestor, OwnerAction::detach, OwnerAction::destroy })
         checkInstanceIsolation(root.getChildFile(juce::String("Isolation-") + actionName(action)), action);
-    std::puts("PASS: 29 preset lifecycle regressions (21 owner transitions, 5 queued confirmations, 3 instance-isolation cases).");
+    for (const auto action : { OwnerAction::hideAncestor, OwnerAction::detach,
+                               OwnerAction::destroy, OwnerAction::hideThenDestroy })
+    {
+        Processor processor(root.getChildFile(juce::String("Updater-error-") + actionName(action)));
+        LifecycleEditor owner(processor);
+        const LifecycleSnapshot before(processor);
+#if PRESET_TEST_SUBLAB
+        constexpr auto updaterTitle = "SubLab808 updates";
+#else
+        constexpr auto updaterTitle = "ReverseLab updates";
+#endif
+        auto* button = dynamic_cast<juce::TextButton*>(findButton(*owner.editor, updaterTitle));
+        require(button != nullptr && button->isShowing(), "updater lifecycle button is available");
+        button->setEnabled(true);
+        auto state = std::make_shared<wk::detail::UpdaterButtonState>(*button);
+        button->onClick = [state] { state->showError("Deterministic updater lifecycle failure"); };
+        state.reset(); // The button callback is now the only state owner.
+        button->triggerClick();
+        OwnedModalCleanup message { waitForAlert("Updater") };
+        owner.apply(action);
+        waitForDeletion(message.component, "updater error message");
+        requireNoModals();
+        before.unchanged(processor);
+        owner.reopen(action);
+        before.unchanged(processor);
+        checkReopenedControls(owner);
+        std::printf("PASS: updater error / %s closes with its owner and replacement editor remains interactive.\n",
+                    actionName(action));
+    }
+    std::puts("PASS: 33 preset lifecycle regressions (21 owner transitions, 5 queued confirmations, 3 instance-isolation and 4 updater-error cases).");
 }
 #include "NativeFileChooserLifecycle.inc"
 }

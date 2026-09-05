@@ -2,7 +2,6 @@
 
 #if JUCE_WINDOWS && WK_UPDATER_ENABLED
 
-#define NOMINMAX 1
 #include <windows.h>
 #include <softpub.h>
 #include <wincrypt.h>

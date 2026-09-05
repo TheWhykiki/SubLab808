@@ -108,6 +108,9 @@ class WindowsIntegrationContractTests(unittest.TestCase):
         self.assertNotIn("WindowsUpdaterLauncherShape OBJECT", self.cmake)
         self.assertIn("wk::launchNativeUpdater", self.launcher_shape)
         self.assertIn("INVALID/LAUNCHER-LINK-SHAPE", self.launcher_shape)
+        selftest_start = self.cmake.index("add_executable(${product}WindowsUpdaterSelfTests")
+        selftest_end = self.cmake.index("add_test(NAME ${product}WindowsUpdaterSelfTest", selftest_start)
+        self.assertIn("Updater/Windows/Updater.manifest", self.cmake[selftest_start:selftest_end])
 
     def test_distributed_updater_has_exact_windows_version_resource(self) -> None:
         for token in (
@@ -171,6 +174,18 @@ class WindowsIntegrationContractTests(unittest.TestCase):
         self.assertNotIn("ShellExecute", self.launcher)
         self.assertNotIn("system(", self.launcher)
         self.assertNotIn("toStdWString", self.launcher)
+        self.assertNotIn("#define NOMINMAX", self.launcher)
+        for token in (
+            "class UpdaterButtonState final",
+            "juce::ComponentMovementWatcher",
+            "juce::Component::SafePointer<juce::TextButton>",
+            "juce::ScopedMessageBox message",
+            "juce::AlertWindow::showScopedAsync",
+            ".withAssociatedComponent(button.getComponent())",
+            "if (! state.ownerIsShowing()) state.closeMessage()",
+        ):
+            self.assertIn(token, self.launcher_header)
+        self.assertNotIn("showMessageBoxAsync", self.launcher_header)
         self.assertIn("JUCE_WINDOWS", self.launcher_header)
         self.assertIn("Automatic updates require a signed Windows release build", self.launcher_header)
 

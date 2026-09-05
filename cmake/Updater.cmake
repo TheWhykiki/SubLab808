@@ -98,7 +98,8 @@ function(wk_add_updater product)
     # This target compiles the complete native implementation but is prevented
     # in source from opening files, networking, elevating or installing.
     add_executable(${product}WindowsUpdaterSelfTests
-        Tests/WindowsUpdater/WindowsUpdaterTests.cpp ${updater_sources})
+        Tests/WindowsUpdater/WindowsUpdaterTests.cpp
+        Updater/Windows/Updater.manifest ${updater_sources})
     target_include_directories(${product}WindowsUpdaterSelfTests PRIVATE Updater/Windows)
     target_compile_definitions(${product}WindowsUpdaterSelfTests PRIVATE
         ${updater_definitions} WK_WINDOWS_UPDATER_TEST_MODE=1)

@@ -375,7 +375,7 @@ class ReleasePipelineTests(unittest.TestCase):
         self.assertEqual(package_assessment[1:5], ["--assess", "--type", "install", "--verbose=4"])
         self.assertTrue(package_assessment[-1].endswith(".pkg"))
         self.assertEqual(vst3_assessment[1:5], ["--assess", "--type", "execute", "--verbose=4"])
-        self.assertTrue(vst3_assessment[-1].endswith("zip-roundtrip/SubLab808.vst3"))
+        self.assertEqual(Path(vst3_assessment[-1]).parts[-2:], ("zip-roundtrip", "SubLab808.vst3"))
 
         signing = [command for command in commands
                    if Path(command[0]).name == "codesign" and "--sign" in command]
@@ -507,12 +507,13 @@ class ReleasePipelineTests(unittest.TestCase):
     def test_fresh_snapshot_ignores_stale_same_version_build_and_binds_dirty_source(self):
         (self.root / "build").mkdir()
         (self.root / "build/stale.vst3").write_bytes(b"old binary with same version")
-        (self.root / "Source/processor.cpp").write_text("uncommitted current source\n")
+        dirty_source = self.root / "Source/processor.cpp"
+        dirty_source.write_text("uncommitted current source\n")
         tools = FakeTools()
         candidate = self.package(tools)
         manifest = json.loads((candidate / "release-manifest.json").read_text())
         self.assertTrue(manifest["dirty"])
-        self.assertEqual(manifest["built_binary_sha256"], pipeline.digest(b"uncommitted current source\n"))
+        self.assertEqual(manifest["built_binary_sha256"], pipeline.file_hash(dirty_source))
         self.assertEqual(self.previous.read_bytes(), b"keep previous release")
         self.assertFalse((candidate / "build/stale.vst3").exists())
         commands = [Path(command[0]).name for command in tools.commands]
