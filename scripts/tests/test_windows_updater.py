@@ -154,6 +154,17 @@ class WindowsUpdaterContractTests(unittest.TestCase):
         self.assertIn("FILE_FLAG_OPEN_REPARSE_POINT", self.source)
         self.assertIn("Windows updater self-test failed: %s", self.source)
 
+    def test_directory_leases_participate_in_delete_share_checks(self):
+        start = self.source.index("Handle lockDirectoryAgainstReplacement(")
+        end = self.source.index("Path localOperationsRoot()", start)
+        directory_lock = self.source[start:end]
+        self.assertIn("FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES", directory_lock)
+        open_start = directory_lock.index("Handle directory(")
+        open_end = directory_lock.index("));", open_start)
+        self.assertNotIn("FILE_SHARE_DELETE", directory_lock[open_start:open_end])
+        self.assertIn("Active updater directory lease did not block deletion", self.source)
+        self.assertIn("Released updater directory lease still blocked deletion", self.source)
+
     def test_copied_updater_is_locked_and_reverified_until_process_start(self):
         start = self.source.index("void launchCopiedUpdater(")
         end = self.source.index("class ProductMutex", start)

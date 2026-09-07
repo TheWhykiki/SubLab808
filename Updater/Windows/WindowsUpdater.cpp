@@ -547,7 +547,10 @@ void createPrivateDirectory(const Path& path, bool mustBeNew)
 Handle lockDirectoryAgainstReplacement(const Path& path, const char* description)
 {
     ensureNotReparsePoint(path, description);
-    Handle directory(CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+    // FILE_READ_ATTRIBUTES alone is exempt from Windows share-mode checks and
+    // therefore would not make the missing FILE_SHARE_DELETE an actual lock.
+    // FILE_LIST_DIRECTORY participates in those checks for directory handles.
+    Handle directory(CreateFileW(path.c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
                                  FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
                                  FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
     require(directory.valid(), winError(description));
@@ -2824,12 +2827,28 @@ int runWindowsUpdaterSelfTests()
         createPrivateDirectory(invalidOperation, true);
         atomicWrite(invalidOperation / L"journal.json", "not-json");
         auto activeLease = lockDirectoryAgainstReplacement(active, "Active cleanup fixture");
+        Handle blockedDeletion(CreateFileW(active.c_str(), DELETE | FILE_READ_ATTRIBUTES,
+                                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS
+                                                | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        const auto blockedDeletionError = GetLastError();
+        require(! blockedDeletion.valid() && blockedDeletionError == ERROR_SHARING_VIOLATION,
+                "Active updater directory lease did not block deletion");
         const auto retained = cleanupOldOperations(cleanupRoot, true);
-        require(retained == newestId && ! std::filesystem::exists(terminal)
-                    && ! std::filesystem::exists(old) && std::filesystem::exists(newest)
-                    && std::filesystem::exists(active) && std::filesystem::exists(invalidOperation),
-                "Cleanup retention, terminal removal, or fail-closed validation failed");
+        require(retained == newestId, "Cleanup did not select the newest resumable operation");
+        require(! std::filesystem::exists(terminal), "Terminal operation was not removed");
+        require(! std::filesystem::exists(old), "Old incomplete operation was not removed");
+        require(std::filesystem::exists(newest), "Newest incomplete operation was not retained");
+        require(std::filesystem::exists(active), "Active operation was not retained");
+        require(std::filesystem::exists(invalidOperation),
+                "Invalid operation was not retained fail-closed");
         activeLease.reset();
+        Handle allowedDeletion(CreateFileW(active.c_str(), DELETE | FILE_READ_ATTRIBUTES,
+                                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS
+                                                | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        require(allowedDeletion.valid(), "Released updater directory lease still blocked deletion");
+        allowedDeletion.reset();
         (void) cleanupOldOperations(cleanupRoot, true);
         require(! std::filesystem::exists(active), "Inactive old operation was retained");
 
