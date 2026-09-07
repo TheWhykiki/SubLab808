@@ -50,8 +50,8 @@ int main()
                    "SubLab808-1.4.1-Windows-x64.msi",
             "exact repository, tag and asset URL");
     require(releasesApiUrl("TheWhykiki", "SubLab808")
-                == "https://api.github.com/repos/TheWhykiki/SubLab808/releases/latest",
-            "exact releases API URL");
+                == "https://api.github.com/repos/TheWhykiki/SubLab808/releases?per_page=100",
+            "exact bounded releases API URL");
 
     const std::string digest(64, 'a');
     const auto normalized = digestHex("sha256:" + digest);

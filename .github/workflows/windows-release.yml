@@ -35,6 +35,9 @@ jobs:
       matrix:
         include:
           - artifact_arch: x64
+            msi_architecture: x64
+            upgrade_code: DB0CABBA-9411-5738-8A43-98D900748C58
+            other_architecture_upgrade_code: 8494E96B-8735-5AB6-8E20-D1BF667DADD9
             runner: windows-2022
             runner_arch: X64
             processor_arch: AMD64
@@ -44,6 +47,9 @@ jobs:
             vst3_directory: x86_64-win
             sign_tool_arch: x64
           - artifact_arch: arm64ec
+            msi_architecture: arm64
+            upgrade_code: 8494E96B-8735-5AB6-8E20-D1BF667DADD9
+            other_architecture_upgrade_code: DB0CABBA-9411-5738-8A43-98D900748C58
             runner: windows-11-vs2026-arm
             runner_arch: ARM64
             processor_arch: ARM64
@@ -56,6 +62,7 @@ jobs:
     env:
       PRODUCT: SubLab808
       SIGNER_SHA256: ${{ vars.WINDOWS_CODE_SIGNING_CERT_SHA256 }}
+      NEXT_SIGNER_SHA256: ${{ vars.WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256 }}
       TIMESTAMP_URL: ${{ vars.WINDOWS_RFC3161_TIMESTAMP_URL }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -112,6 +119,13 @@ jobs:
           if ($pin -cnotmatch '^[0-9A-F]{64}$') {
             throw 'WINDOWS_CODE_SIGNING_CERT_SHA256 must be exactly 64 hexadecimal characters.'
           }
+          $nextPin = ([string]$env:NEXT_SIGNER_SHA256).Replace(' ', '').ToUpperInvariant()
+          if ($nextPin -and $nextPin -cnotmatch '^[0-9A-F]{64}$') {
+            throw 'WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256 must be empty or exactly 64 hexadecimal characters.'
+          }
+          if ($nextPin -and $nextPin -ceq $pin) {
+            throw 'WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256 must differ from the current certificate pin.'
+          }
           $timestamp = $null
           if (-not [uri]::TryCreate($env:TIMESTAMP_URL, [System.UriKind]::Absolute, [ref]$timestamp) -or
               $timestamp.Scheme -cne 'https') {
@@ -121,13 +135,15 @@ jobs:
           "WK_RELEASE_VERSION=$($tag.Substring(1))" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "WK_TAG_COMMIT=$tagCommit" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "WK_SIGNER_SHA256=$pin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WK_NEXT_SIGNER_SHA256=$nextPin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Configure production updater pin
         shell: pwsh
         run: |
           cmake -S . -B '${{ matrix.build_dir }}' `
             -G '${{ matrix.generator }}' -A '${{ matrix.platform }}' `
-            "-DSUBLAB808_WINDOWS_UPDATER_SIGNER_SHA256:STRING=$env:WK_SIGNER_SHA256"
+            "-DSUBLAB808_WINDOWS_UPDATER_SIGNER_SHA256:STRING=$env:WK_SIGNER_SHA256" `
+            "-DSUBLAB808_WINDOWS_UPDATER_NEXT_SIGNER_SHA256:STRING=$env:WK_NEXT_SIGNER_SHA256"
           if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed.' }
           $versionRows = @(Get-Content -LiteralPath '${{ matrix.build_dir }}/CMakeCache.txt' |
             Where-Object { $_ -like 'CMAKE_PROJECT_VERSION:STATIC=*' })
@@ -243,32 +259,70 @@ jobs:
           $updater = (Resolve-Path -LiteralPath (Join-Path $bundle 'Contents/Helpers/SubLab808Updater.exe')).Path
           $hostTest = (Resolve-Path -LiteralPath '${{ matrix.build_dir }}/SubLab808HostTests_artefacts/Release/SubLab808HostTests.exe').Path
           $output = '${{ matrix.build_dir }}/windows-installer'
-          & pwsh -NoProfile -File scripts/build-windows-installer.ps1 `
-            -Architecture '${{ matrix.artifact_arch }}' `
-            -BundlePath $bundle `
-            -Version $env:WK_RELEASE_VERSION `
-            -SourceCommit $env:WK_TAG_COMMIT `
-            -OutputDirectory $output `
-            -UpdaterPath $updater `
-            -ExpectedSignerSha256 $env:WK_SIGNER_SHA256 `
-            -HostTestPath $hostTest `
-            -SignToolPath $signTool `
-            -CertificateThumbprint $env:WK_CERT_THUMBPRINT `
-            -CertificateStoreName $env:WK_CERT_STORE_NAME `
-            -TimestampUrl $env:TIMESTAMP_URL
-          if ($LASTEXITCODE -ne 0) { throw 'Signed MSI pipeline failed.' }
+          $buildArguments = @{
+            Architecture = '${{ matrix.artifact_arch }}'
+            BundlePath = $bundle
+            Version = $env:WK_RELEASE_VERSION
+            SourceCommit = $env:WK_TAG_COMMIT
+            OutputDirectory = $output
+            UpdaterPath = $updater
+            ExpectedSignerSha256 = $env:WK_SIGNER_SHA256
+            HostTestPath = $hostTest
+            SignToolPath = $signTool
+            CertificateThumbprint = $env:WK_CERT_THUMBPRINT
+            CertificateStoreName = $env:WK_CERT_STORE_NAME
+            TimestampUrl = $env:TIMESTAMP_URL
+          }
+          if (-not [string]::IsNullOrEmpty($env:WK_NEXT_SIGNER_SHA256)) {
+            $buildArguments['ExpectedNextSignerSha256'] = $env:WK_NEXT_SIGNER_SHA256
+          }
+          & ./scripts/build-windows-installer.ps1 @buildArguments
           $base = "SubLab808-$env:WK_RELEASE_VERSION-Windows-${{ matrix.artifact_arch }}"
           $candidate = Join-Path $output $base
           $assets = 'release-assets-${{ matrix.artifact_arch }}'
           New-Item -ItemType Directory -Path $assets -ErrorAction Stop | Out-Null
           Copy-Item -LiteralPath (Join-Path $candidate "$base.msi") -Destination $assets
           Copy-Item -LiteralPath (Join-Path $candidate "$base.evidence.json") -Destination $assets
-          python scripts/validate-windows-release-assets.py `
-            --directory $assets --product SubLab808 --version $env:WK_RELEASE_VERSION `
-            --source-commit $env:WK_TAG_COMMIT `
-            --expected-signer-sha256 $env:WK_SIGNER_SHA256 `
-            --architecture '${{ matrix.artifact_arch }}'
+          $validatorArguments = @(
+            'scripts/validate-windows-release-assets.py',
+            '--directory', $assets,
+            '--product', 'SubLab808',
+            '--version', $env:WK_RELEASE_VERSION,
+            '--source-commit', $env:WK_TAG_COMMIT,
+            '--expected-signer-sha256', $env:WK_SIGNER_SHA256
+          )
+          if (-not [string]::IsNullOrEmpty($env:WK_NEXT_SIGNER_SHA256)) {
+            $validatorArguments += @('--expected-next-signer-sha256', $env:WK_NEXT_SIGNER_SHA256)
+          }
+          $validatorArguments += @('--architecture', '${{ matrix.artifact_arch }}')
+          & python @validatorArguments
           if ($LASTEXITCODE -ne 0) { throw 'Signed release asset validation failed.' }
+
+      - name: Install, load and uninstall signed Windows MSI
+        shell: pwsh
+        run: |
+          $base = "SubLab808-$env:WK_RELEASE_VERSION-Windows-${{ matrix.artifact_arch }}"
+          $assets = 'release-assets-${{ matrix.artifact_arch }}'
+          $msi = Join-Path $assets "$base.msi"
+          $evidence = Join-Path $assets "$base.evidence.json"
+          $hostTest = '${{ matrix.build_dir }}/SubLab808HostTests_artefacts/Release/SubLab808HostTests.exe'
+          $acceptanceArguments = @{
+            MsiPath = $msi
+            EvidencePath = $evidence
+            HostTestPath = $hostTest
+            Product = 'SubLab808'
+            Architecture = '${{ matrix.artifact_arch }}'
+            ExpectedMsiArchitecture = '${{ matrix.msi_architecture }}'
+            ExpectedVersion = $env:WK_RELEASE_VERSION
+            ExpectedManufacturer = 'Whykiki Audio'
+            ExpectedUpgradeCode = '${{ matrix.upgrade_code }}'
+            ExpectedOtherArchitectureUpgradeCode = '${{ matrix.other_architecture_upgrade_code }}'
+            ExpectedSignerSha256 = $env:WK_SIGNER_SHA256
+          }
+          if (-not [string]::IsNullOrEmpty($env:WK_NEXT_SIGNER_SHA256)) {
+            $acceptanceArguments['ExpectedNextSignerSha256'] = $env:WK_NEXT_SIGNER_SHA256
+          }
+          & ./scripts/test-windows-installer.ps1 @acceptanceArguments
 
       - name: Upload signed release candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -530,6 +584,7 @@ jobs:
     env:
       PRODUCT: SubLab808
       SIGNER_SHA256: ${{ vars.WINDOWS_CODE_SIGNING_CERT_SHA256 }}
+      NEXT_SIGNER_SHA256: ${{ vars.WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256 }}
       APPLICATION_IDENTITY: ${{ vars.MACOS_DEVELOPER_ID_APPLICATION_IDENTITY }}
       INSTALLER_IDENTITY: ${{ vars.MACOS_DEVELOPER_ID_INSTALLER_IDENTITY }}
       APPLICATION_SIGNER_SHA256: ${{ vars.MACOS_DEVELOPER_ID_APPLICATION_CERT_SHA256 }}
@@ -574,15 +629,19 @@ jobs:
           fi
           test "$remote_commit" = "$tag_commit"
           pin="$(printf '%s' "$SIGNER_SHA256" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+          next_pin="$(printf '%s' "$NEXT_SIGNER_SHA256" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
           app_pin="$(printf '%s' "$APPLICATION_SIGNER_SHA256" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
           installer_pin="$(printf '%s' "$INSTALLER_SIGNER_SHA256" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
           [[ "$pin" =~ ^[0-9A-F]{64}$ ]]
+          [[ -z "$next_pin" || "$next_pin" =~ ^[0-9A-F]{64}$ ]]
+          [[ -z "$next_pin" || "$next_pin" != "$pin" ]]
           [[ "$app_pin" =~ ^[0-9A-F]{64}$ ]]
           [[ "$installer_pin" =~ ^[0-9A-F]{64}$ ]]
           python3 scripts/validate-windows-release-assets.py \
             --directory release-assets/windows --product SubLab808 --version "$version" \
             --source-commit "$tag_commit" \
             --expected-signer-sha256 "$pin" \
+            --expected-next-signer-sha256 "$next_pin" \
             --architecture x64 --architecture arm64ec
           python3 -B scripts/macos-release-assets.py validate \
             --directory release-assets/macos --product SubLab808 --version "$version" \

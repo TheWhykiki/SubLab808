@@ -59,7 +59,10 @@ class WindowsIntegrationContractTests(unittest.TestCase):
             'file(READ "${CMAKE_CURRENT_SOURCE_DIR}/Installer/Windows/package-config.json"',
             'WK_WINDOWS_UPDATER_GITHUB_OWNER="TheWhykiki"',
             'WK_WINDOWS_UPDATER_SIGNER_SHA256="${updater_signer}"',
+            'WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256="${updater_next_signer}"',
             'if(updater_signer STREQUAL "")',
+            'next_signer_variable "${product_upper}_WINDOWS_UPDATER_NEXT_SIGNER_SHA256"',
+            'must differ from ${signer_variable}',
             'must be exactly 64 hexadecimal characters',
             'WK_UPDATER_ENABLED=1',
             'Contents/Helpers/${product}Updater.exe',
@@ -111,6 +114,10 @@ class WindowsIntegrationContractTests(unittest.TestCase):
         selftest_start = self.cmake.index("add_executable(${product}WindowsUpdaterSelfTests")
         selftest_end = self.cmake.index("add_test(NAME ${product}WindowsUpdaterSelfTest", selftest_start)
         self.assertIn("Updater/Windows/Updater.manifest", self.cmake[selftest_start:selftest_end])
+        self.assertIn("WK_WINDOWS_UPDATER_SIGNER_SHA256", self.cmake[selftest_start:selftest_end])
+        self.assertIn("WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256", self.cmake[selftest_start:selftest_end])
+        launcher_shape = self.cmake[launcher_shape_start:launcher_shape_end]
+        self.assertNotIn("WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256", launcher_shape)
 
     def test_distributed_updater_has_exact_windows_version_resource(self) -> None:
         for token in (

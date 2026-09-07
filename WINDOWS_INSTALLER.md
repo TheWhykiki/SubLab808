@@ -71,6 +71,7 @@ $updater = (Resolve-Path "$bundle\Contents\Helpers\<Product>Updater.exe").Path
     -SourceCommit '<40-lowercase-hex-tag-commit>' `
     -UpdaterPath $updater `
     -ExpectedSignerSha256 '<64-hex-certificate-sha256-from-cmake>' `
+    -ExpectedNextSignerSha256 '<optional-distinct-64-hex-next-certificate-sha256>' `
     -CertificateThumbprint '<40-hex-certificate-thumbprint>' `
     -TimestampUrl 'https://<your-rfc3161-provider>' `
     -HostTestPath $hostTest
@@ -82,11 +83,15 @@ Computerkonto benötigen zusätzlich `-UseMachineCertificateStore`. Ein
 Produktionspaket verlangt exakt `Contents\Helpers\<Product>Updater.exe` über
 `-UpdaterPath` und bindet die Evidence über `-SourceCommit` exakt an den
 40-stelligen, kleingeschriebenen Git-Commit des Release-Tags. Dessen in CMake
-eingebrannter 64-stelliger Zertifikat-SHA-256
-muss zusätzlich unverändert als `-ExpectedSignerSha256` übergeben werden. Das
-Skript bricht ab, wenn der tatsächliche Fingerprint des ausgewählten Zertifikats
-abweicht. Der Updater muss dieselbe x64- beziehungsweise ARM64EC-PE-Architektur
-wie das Plug-in besitzen. Vor jeder Signatur führt das Skript den gestagten Helper
+eingebrannter aktueller 64-stelliger Zertifikat-SHA-256 muss zusätzlich
+unverändert als `-ExpectedSignerSha256` übergeben werden. Der optionale, davon
+verschiedene nächste Updater-Pin wird mit `-ExpectedNextSignerSha256` gebunden.
+Er erweitert ausschließlich die vom Updater akzeptierte Download-Payload und
+darf nicht das Zertifikat der PFX oder einer in diesem Lauf erzeugten Signatur
+sein. Das Skript bricht ab, wenn der tatsächliche Fingerprint des ausgewählten
+Zertifikats vom aktuellen Pin abweicht. Der Updater muss dieselbe x64-
+beziehungsweise ARM64EC-PE-Architektur wie das Plug-in besitzen. Vor jeder
+Signatur führt das Skript den gestagten Helper
 mit dessen rein lesendem `--validate-build-contract`-Modus aus. Dazu erzeugt es
 für jeden Aufruf eine kryptografisch zufällige 32-Byte-Challenge und eine zufällige,
 auf den aktuellen Benutzer beschränkte Named Pipe mit genau einer Instanz.
@@ -99,11 +104,13 @@ kanonischen ASCII-/UTF-8-JSON-Datensatz.
 Der Datensatz enthält Schema und Schemaversion, Challenge, Server-PID,
 Produktions-/Compile-only-Modus sowie die vollständige kompilierte Identität:
 Produkt, Version, Hersteller, GitHub-Owner und -Repository, Architektur, beide
-UpgradeCodes und Signer-Pin. Verbindung, begrenztes Lesen und Prozessende teilen
-sich ein 30-Sekunden-Limit; das Skript liest höchstens die erwartete Länge plus
-ein Byte. Nur bytegenaue Übereinstimmung ohne BOM, Zusatz-Whitespace oder
-Folgedaten **und** Exitcode 0 besteht. Ein bloßer Exitcode 0, Console-Ausgabe,
-ein umbenannter Fremd-Helper, Testmodus oder der nur kompilierte CI-Shape reichen
+UpgradeCodes, aktuellen Signer-Pin und optionalen nächsten Signer-Pin. Der
+kanonische Build-Vertrag verwendet Schema 2 mit `currentSignerSha256` und
+`nextSignerSha256`. Verbindung, begrenztes Lesen und Prozessende teilen sich ein
+30-Sekunden-Limit; das Skript liest höchstens die erwartete Länge plus ein Byte.
+Nur bytegenaue Übereinstimmung ohne BOM, Zusatz-Whitespace oder Folgedaten
+**und** Exitcode 0 besteht. Ein bloßer Exitcode 0, Console-Ausgabe, ein
+umbenannter Fremd-Helper, Testmodus oder der nur kompilierte CI-Shape reichen
 damit nicht aus und werden vor der Paketierung abgelehnt.
 
 Der Payload-Snapshot selbst ist die Autorität: Neben diesem exakten Helper darf
@@ -142,7 +149,8 @@ Nur für interne Tests darf die bewusste Ausnahme verwendet werden:
     -HostTestPath (Resolve-Path '<path-to-native-host-test.exe>').Path
 ```
 
-`-AllowUnsigned` darf mit keiner Signing-Option kombiniert werden. Verzeichnis,
+`-AllowUnsigned` darf weder mit einer Signing-Option noch mit einem aktuellen
+oder nächsten erwarteten Signer-Pin kombiniert werden. Verzeichnis,
 MSI-Dateiname und Evidence tragen zwingend
 `UNSIGNED-NOT-FOR-DISTRIBUTION`. Solche Dateien dürfen nicht veröffentlicht oder
 an Endnutzer verteilt werden. Eine bereits vorhandene Signatur einzelner
@@ -209,8 +217,11 @@ Das Resultat ist ein neues, atomar veröffentlichtes Kandidatenverzeichnis unter
 `dist\windows` (oder `-OutputDirectory`). Es enthält genau das MSI und eine
 `*.evidence.json` mit MSI-Hash, vollständiger Payload-Hashliste, Produkt- und
 UpgradeCodes sowie expliziten Ergebnissen für Graph-, Referenz-, Side-Effect-,
-Sequenz- und Extraktionslayout-Prüfung. Schema 2 protokolliert zusätzlich den
-`moduleinfo.json`-Hash und seine gebundene Identität, die fünf geprüften Felder der
+Sequenz- und Extraktionslayout-Prüfung. Evidence-Schema 3 protokolliert zusätzlich
+`updaterCurrentSignerSha256`, den optionalen `updaterNextSignerSha256` und die
+exakt geordnete `payloadSignerAllowlistSha256` als `[current]` oder
+`[current, next]`. Außerdem enthält es den `moduleinfo.json`-Hash und seine
+gebundene Identität, die fünf geprüften Felder der
 Plugin- und Updater-PE-Versionresources samt Mutationstestzahlen, sämtliche erkannten PE-Pfade,
 Updater-/Helper-Klassifikation, tatsächlich signierte PE-Pfade, den exakten
 MSI-Produkt-/Hersteller-/Sprach-/UAC-Vertrag, sichere Upgrade-Properties,
@@ -289,6 +300,54 @@ separat freigegebener Release-Schritt hängt daraus die **signierte** MSI unter
 ihrem unveränderten kanonischen Dateinamen und die zugehörige Evidence als zwei
 Release-Assets an; nur so findet der native Updater die MSI. Ein unsignierter
 Kandidat darf diesen Schritt nie erreichen.
+
+## Installations-Abnahme im Release-Workflow
+
+Der signierte Release-Workflow führt vor dem Artefakt-Upload zusätzlich
+`scripts/test-windows-installer.ps1` auf dem jeweils nativen x64- beziehungsweise
+ARM64-Runner aus. Das Skript prüft MSI-Hash, gültige Authenticode-Signatur,
+Zeitstempel und den aktuellen öffentlichen SHA-256-Signer-Pin. Der optionale
+nächste Pin und die daraus gebildete geordnete Allowlist müssen zusätzlich exakt
+mit der Evidence übereinstimmen; das MSI selbst muss weiterhin mit dem aktuellen
+Pin signiert sein. Zusätzlich bindet der Gate die
+direkt aus Property-, Summary- und Upgrade-Tabellen gelesenen Werte für Version,
+Hersteller, MSI-Architektur und beide UpgradeCodes an unabhängige, explizite
+Workflow-Vorgaben. Eine Evidence-Datei allein darf diese Identitäten nicht
+vorgeben. Vor der ersten Prüfung öffnet der Gate die exakte MSI mit ausschließlich
+lesendem Share und hält dieses Handle bis zum Ende aller `msiexec`-Prozesse; damit
+können die geprüften Bytes vor der erhöhten Installation weder überschrieben noch
+ersetzt werden. Erst dann installiert er den Kandidaten mit
+`msiexec /i /qn /norestart` tatsächlich pro Maschine. Danach müssen
+`ProductState=INSTALLSTATE_DEFAULT`, der exakte Evidence-gebundene Datei- und
+Verzeichnisbaum unter `Common Files\VST3\<Product>.vst3` und ein erfolgreicher
+Ladevorgang dieses **installierten** Bundles durch den nativen Hosttest
+übereinstimmen.
+
+Anschließend deinstalliert der Gate denselben ProductCode mit
+`msiexec /x /qn /norestart` und verlangt sowohl
+`ProductState=INSTALLSTATE_UNKNOWN` als auch die Abwesenheit des Bundlepfads.
+Ein `finally`-Pfad wiederholt diese produktcodegenaue Bereinigung nach jedem
+Fehler und lässt den Job fehlschlagen, wenn Registrierung oder Payload nicht
+nachweislich entfernt wurden. Er löscht niemals selbst rekursiv aus dem
+systemweiten VST3-Ziel; ein Restpfad ist ein harter Fehler und der kurzlebige
+Runner wird verworfen. Der Gate verweigert einen vorinstallierten
+ProductCode oder bereits vorhandenen Zielpfad, damit er niemals fremde lokale
+Installationen bereinigt.
+
+Im eigentlichen Abnahmepfad ist ausschließlich Exitcode 0 erfolgreich. Auch
+`3010` (Neustart erforderlich) wird bewusst abgelehnt, weil der geprüfte
+MSI-Vertrag keine Reboot-Aktionen erlaubt. Nur der fehlerbedingte
+`finally`-Cleanup darf 3010 vorläufig tolerieren; bestehen kann der Job trotzdem
+erst nach dem nachgewiesenen `INSTALLSTATE_UNKNOWN` und einem entfernten
+Bundlepfad.
+
+Dieser gewöhnliche Release-Matrix-Gate belegt die Neuinstallation und
+Deinstallation des aktuellen Kandidaten. Ein echtes Upgrade N-1→N, die
+Downgrade-Ablehnung gegen einen real installierten neueren Kandidaten und der
+Wechsel zwischen x64 und ARM64EC bleiben separate Release-Gates: Sie benötigen
+unveränderliche, signierte Vorgängerartefakte beziehungsweise zwei
+architekturfähige Testumgebungen und werden nicht durch synthetische Fixtures als
+bestanden behauptet.
 
 Der konkrete, taggebundene GitHub-Actions-Vertrag einschließlich kurzlebigem
 PFX-Import, Architektur-Jobs, Evidence-Revalidierung und atomarem Draft-Publish

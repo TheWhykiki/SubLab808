@@ -188,6 +188,7 @@ def validate_assets(
     version: str,
     source_commit: str,
     expected_signer_sha256: str,
+    expected_next_signer_sha256: str,
     architectures: tuple[str, ...],
 ) -> None:
     _require(directory.is_dir() and not directory.is_symlink(), f"Asset directory is invalid: {directory}")
@@ -197,6 +198,13 @@ def validate_assets(
              "Source commit must be exactly 40 lowercase hexadecimal characters")
     signer = expected_signer_sha256.replace(" ", "").upper()
     _require(SHA256_RE.fullmatch(signer) is not None, "Expected signer must be exactly 64 hexadecimal characters")
+    next_signer = expected_next_signer_sha256.replace(" ", "").upper()
+    _require(
+        not next_signer or SHA256_RE.fullmatch(next_signer) is not None,
+        "Expected next signer must be empty or exactly 64 hexadecimal characters",
+    )
+    _require(not next_signer or next_signer != signer, "Expected current and next signers must be distinct")
+    signer_allowlist = [signer] + ([next_signer] if next_signer else [])
     _require(architectures and len(set(architectures)) == len(architectures), "Architectures must be unique")
 
     expected_names: set[str] = set()
@@ -219,7 +227,7 @@ def validate_assets(
         _require(msi.stat().st_size <= 256 * 1024 * 1024, f"MSI exceeds updater size policy: {msi.name}")
         evidence = _load_evidence(evidence_path)
         expected_values = {
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "artifactStatus": "SIGNED",
             "product": product,
             "version": version,
@@ -229,7 +237,9 @@ def validate_assets(
             "msiFile": msi.name,
             "signed": True,
             "signerCertificateSha256": signer,
-            "updaterSignerPinSha256": signer,
+            "updaterCurrentSignerSha256": signer,
+            "updaterNextSignerSha256": next_signer or None,
+            "payloadSignerAllowlistSha256": signer_allowlist,
         }
         for key, expected in expected_values.items():
             _require(evidence.get(key) == expected, f"Evidence field {key!r} is invalid for {architecture}")
@@ -310,6 +320,7 @@ def main() -> int:
     parser.add_argument("--version", required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--expected-signer-sha256", required=True)
+    parser.add_argument("--expected-next-signer-sha256", default="")
     parser.add_argument("--architecture", choices=tuple(ARCHITECTURES), action="append")
     args = parser.parse_args()
     architectures = tuple(args.architecture or ARCHITECTURES)
@@ -320,6 +331,7 @@ def main() -> int:
             args.version,
             args.source_commit,
             args.expected_signer_sha256,
+            args.expected_next_signer_sha256,
             architectures,
         )
     except (ContractError, OSError) as error:

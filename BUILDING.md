@@ -65,7 +65,8 @@ distribution certificate:
 
 ```powershell
 cmake -S . -B build-windows-x64 -A x64 `
-  -DSUBLAB808_WINDOWS_UPDATER_SIGNER_SHA256=<64-hex-certificate-fingerprint>
+  -DSUBLAB808_WINDOWS_UPDATER_SIGNER_SHA256=<current-64-hex-certificate-fingerprint> `
+  -DSUBLAB808_WINDOWS_UPDATER_NEXT_SIGNER_SHA256=<optional-next-64-hex-certificate-fingerprint>
 cmake --build build-windows-x64 --config Release --target SubLab808_VST3 --parallel
 ```
 
@@ -74,6 +75,8 @@ staged helper and every PE payload before signing the MSI; see
 [WINDOWS_UPDATER.md](WINDOWS_UPDATER.md) and
 [WINDOWS_INSTALLER.md](WINDOWS_INSTALLER.md). Never substitute a dummy pin in a
 distributed build.
+The next pin is optional, must differ from the current pin, and is used only for
+the documented two-release certificate-rotation bridge.
 
 ## Local installation
 

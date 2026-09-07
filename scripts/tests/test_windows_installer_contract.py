@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
+import subprocess
 import unittest
 import uuid
 import xml.etree.ElementTree as ET
@@ -20,6 +23,9 @@ class WindowsInstallerContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.script = (ROOT / "scripts" / "build-windows-installer.ps1").read_text(
+            encoding="utf-8"
+        )
+        cls.acceptance = (ROOT / "scripts" / "test-windows-installer.ps1").read_text(
             encoding="utf-8"
         )
         cls.wxs_text = (ROOT / "Installer" / "Windows" / "Package.wxs").read_text(
@@ -41,6 +47,37 @@ class WindowsInstallerContractTests(unittest.TestCase):
 
     def elements(self, name: str) -> list[ET.Element]:
         return list(self.wxs.iter(f"{{{WIX_NAMESPACE}}}{name}"))
+
+    @unittest.skipUnless(os.name == "nt", "PowerShell AST parsing requires Windows")
+    def test_powershell_sources_parse_on_windows(self) -> None:
+        pwsh = shutil.which("pwsh")
+        self.assertIsNotNone(pwsh, "pwsh is required by the Windows workflows")
+        parser = r"""
+$tokens = $null
+$errors = $null
+[System.Management.Automation.Language.Parser]::ParseFile(
+    $env:WK_PARSE_PATH, [ref]$tokens, [ref]$errors) | Out-Null
+if ($errors.Count -ne 0) {
+    $errors | ForEach-Object { [Console]::Error.WriteLine($_.ToString()) }
+    exit 1
+}
+"""
+        for relative in (
+            "scripts/build-windows-installer.ps1",
+            "scripts/test-windows-installer.ps1",
+        ):
+            with self.subTest(relative=relative):
+                environment = os.environ.copy()
+                environment["WK_PARSE_PATH"] = str(ROOT / relative)
+                result = subprocess.run(
+                    [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", parser],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                    timeout=30,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_wix_is_exactly_pinned_and_signature_trusted(self) -> None:
         self.assertEqual(
@@ -69,6 +106,8 @@ class WindowsInstallerContractTests(unittest.TestCase):
             "Restored WiX reported",
         ):
             self.assertIn(token, self.script)
+        self.assertIn("WiX failed with exit code ${exitCode}:", self.script)
+        self.assertNotIn("WiX failed with exit code $exitCode:", self.script)
 
     def test_product_configuration_has_stable_architecture_identities(self) -> None:
         self.assertEqual(self.config["schemaVersion"], 1)
@@ -321,7 +360,7 @@ class WindowsInstallerContractTests(unittest.TestCase):
             "moduleInfoIdentityValidated = $true",
             "classIdentities = @($moduleInfoContract.ClassIdentities)",
             "sha256 = $moduleInfoContract.Sha256",
-            "schemaVersion = 2",
+            "schemaVersion = 3",
         ):
             self.assertIn(token, self.script)
 
@@ -463,6 +502,8 @@ class WindowsInstallerContractTests(unittest.TestCase):
             "Production mode requires exactly one of -CertificateThumbprint or -CertificateSubject",
             "Production mode requires -TimestampUrl",
             "Production mode requires the exact 64-hex -ExpectedSignerSha256 compiled into the updater",
+            "ExpectedNextSignerSha256 must be empty or exactly 64 hexadecimal characters",
+            "ExpectedNextSignerSha256 must differ from the current ExpectedSignerSha256",
             "Selected signing certificate does not match the SHA-256 fingerprint compiled into the updater",
             "Production packages require exactly the product updater",
             "Invoke-UpdaterBuildContract",
@@ -473,6 +514,9 @@ class WindowsInstallerContractTests(unittest.TestCase):
             "--manufacturer",
             "--github-owner",
             "--github-repository",
+            "--current-signer-sha256",
+            "--next-signer-sha256",
+            '"schemaVersion":2',
             "RandomNumberGenerator]::Fill",
             "PipeOptions]::CurrentUserOnly",
             "NamedPipeServerStream]::new",
@@ -501,7 +545,9 @@ class WindowsInstallerContractTests(unittest.TestCase):
             "Unexpected signer certificate after signing",
             "TimeStamperCertificate",
             "signerCertificateSha256",
-            "updaterSignerPinSha256",
+            "updaterCurrentSignerSha256",
+            "updaterNextSignerSha256",
+            "payloadSignerAllowlistSha256",
         ):
             self.assertIn(token, self.script)
         self.assertNotIn("@('/n',", self.script)
@@ -572,6 +618,73 @@ class WindowsInstallerContractTests(unittest.TestCase):
         ):
             self.assertIn(token, self.script)
         self.assertNotIn("timestampUrl = if", self.script)
+
+    def test_release_acceptance_really_installs_loads_and_removes_candidate(self) -> None:
+        for token in (
+            "$script:InstallStateUnknown = -1",
+            "$script:InstallStateDefault = 5",
+            "WindowsInstaller.Installer",
+            "Get-AuthenticodeSignature",
+            "GetCertHashString",
+            "Get-FileHash",
+            "Get-MsiIdentityContract",
+            "SELECT `Property`, `Value` FROM `Property`",
+            "Get-MsiSummaryProperty $installer $MsiPath 7",
+            "SELECT `UpgradeCode`, `VersionMin`, `VersionMax`",
+            "MSI Manufacturer does not match the independently expected manufacturer",
+            "MSI ProductVersion does not match the independently expected release version",
+            "MSI UpgradeCode does not match the independently expected architecture identity",
+            "ExpectedOtherArchitectureUpgradeCode",
+            "ExpectedMsiArchitecture",
+            "ExpectedNextSignerSha256",
+            "payloadSignerAllowlistSha256",
+            "$evidenceAllowlist.Count -eq $expectedAllowlist.Count",
+            "$evidenceAllowlist[$index] -cne $expectedAllowlist[$index]",
+            "Signed MSI ProductCode does not match the release evidence",
+            "Assert-InstalledPayloadMatchesEvidence",
+            "Invoke-MsiExec $msiExec '/i' $resolvedMsi",
+            "Invoke-NativeProcess $resolvedHostTest @($installedBundle)",
+            "Invoke-MsiExec $msiExec '/x' $productCode",
+            "@($Mode, $Target, '/qn', '/norestart', '/L*v', $LogPath)",
+            "$cleanupAuthorized = $true",
+            "finally {",
+            "ProductState remains registered after uninstallation",
+            "target bundle already exists",
+            "if ($installExit -ne 0)",
+            "if ($uninstallExit -ne 0)",
+            "$cleanupExit -notin @(0, 1605, 3010)",
+        ):
+            self.assertIn(token, self.acceptance)
+        self.assertNotIn("Win32_Product", self.acceptance)
+        self.assertNotIn("$evidenceAllowlist -cjoin", self.acceptance)
+        self.assertNotIn("Remove-SafeResidualBundle", self.acceptance)
+        self.assertNotIn("[System.IO.File]::Delete", self.acceptance)
+        self.assertNotIn("[System.IO.Directory]::Delete", self.acceptance)
+        lease = self.acceptance.index("$msiLease = [System.IO.File]::Open(")
+        hash_check = self.acceptance.index("$actualMsiHash = (Get-FileHash")
+        signature_check = self.acceptance.index("Get-AuthenticodeSignature")
+        product_code_binding = self.acceptance.index(
+            "$msiIdentity = Get-MsiIdentityContract $resolvedMsi"
+        )
+        clean_target_check = self.acceptance.index("target bundle already exists")
+        install_start = self.acceptance.index("$installAttempted = $true")
+        payload_check = self.acceptance.index(
+            "Assert-InstalledPayloadMatchesEvidence $installedBundle"
+        )
+        host_load = self.acceptance.index(
+            "Invoke-NativeProcess $resolvedHostTest @($installedBundle)"
+        )
+        uninstall = self.acceptance.index("Invoke-MsiExec $msiExec '/x' $productCode")
+        lease_release = self.acceptance.index("$msiLease.Dispose()")
+        self.assertIn("[System.IO.FileShare]::Read)", self.acceptance)
+        self.assertLess(lease, hash_check)
+        self.assertLess(signature_check, install_start)
+        self.assertLess(product_code_binding, install_start)
+        self.assertLess(clean_target_check, install_start)
+        self.assertLess(install_start, payload_check)
+        self.assertLess(payload_check, host_load)
+        self.assertLess(host_load, uninstall)
+        self.assertLess(uninstall, lease_release)
 
     def test_versions_and_release_candidates_are_canonical_and_non_overwriting(self) -> None:
         self.assertIn(

@@ -84,6 +84,9 @@
 #ifndef WK_WINDOWS_UPDATER_SIGNER_SHA256
 #define WK_WINDOWS_UPDATER_SIGNER_SHA256 ""
 #endif
+#ifndef WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256
+#define WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256 ""
+#endif
 
 #if defined(_M_ARM64EC)
 #define WK_WINDOWS_UPDATER_ARCHITECTURE_ARM64EC 1
@@ -123,24 +126,45 @@ constexpr std::string_view kOwner = WK_WINDOWS_UPDATER_GITHUB_OWNER;
 constexpr std::string_view kRepository = WK_WINDOWS_UPDATER_GITHUB_REPOSITORY;
 constexpr std::string_view kUpgradeCode = WK_WINDOWS_UPDATER_UPGRADE_CODE;
 constexpr std::string_view kOtherUpgradeCode = WK_WINDOWS_UPDATER_OTHER_UPGRADE_CODE;
-constexpr std::string_view kSignerSha256 = WK_WINDOWS_UPDATER_SIGNER_SHA256;
+constexpr std::string_view kCurrentSignerSha256 = WK_WINDOWS_UPDATER_SIGNER_SHA256;
+constexpr std::string_view kNextSignerSha256 = WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256;
 
 constexpr bool isHex(char c)
 {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 
-constexpr bool compileTimePinIsValid()
+constexpr bool pinsEqualInsensitive(std::string_view left, std::string_view right)
 {
-    if (kSignerSha256.size() != 64)
+    if (left.size() != right.size())
         return false;
-    for (const auto c : kSignerSha256)
-        if (! isHex(c)) return false;
+    for (std::size_t index = 0; index < left.size(); ++index)
+    {
+        const auto upper = [] (char c) constexpr
+        {
+            return c >= 'a' && c <= 'f' ? static_cast<char>(c - ('a' - 'A')) : c;
+        };
+        if (upper(left[index]) != upper(right[index])) return false;
+    }
     return true;
 }
 
-static_assert(kTestMode || compileTimePinIsValid(),
-              "WK_WINDOWS_UPDATER_SIGNER_SHA256 must be exactly 64 hexadecimal characters");
+constexpr bool compileTimePinsAreValid()
+{
+    if ((! kTestMode || ! kCurrentSignerSha256.empty())
+        && (kCurrentSignerSha256.size() != 64
+            || ! std::all_of(kCurrentSignerSha256.begin(), kCurrentSignerSha256.end(), isHex)))
+        return false;
+    if (! kNextSignerSha256.empty()
+        && (kNextSignerSha256.size() != 64
+            || ! std::all_of(kNextSignerSha256.begin(), kNextSignerSha256.end(), isHex)))
+        return false;
+    return kNextSignerSha256.empty()
+        || ! pinsEqualInsensitive(kCurrentSignerSha256, kNextSignerSha256);
+}
+
+static_assert(compileTimePinsAreValid(),
+              "Updater signer pins must be one or two distinct 64-character hexadecimal values");
 
 class Failure final : public std::runtime_error
 {
@@ -621,6 +645,7 @@ std::optional<Phase> parsePhase(std::string_view text)
 struct Journal
 {
     std::string operationId;
+    std::string writerVersion;
     Phase phase = Phase::created;
     std::string targetVersion;
     std::string assetUrl;
@@ -668,7 +693,10 @@ void writeJournal(const Path& operation, const Journal& journal)
     atomicWrite(operation / L"journal.json", std::string(json.toRawUTF8(), json.getNumBytesAsUTF8()));
 }
 
-Journal readJournal(const Path& operation, std::string_view expectedId)
+enum class JournalReadPurpose { resume, cleanup };
+
+Journal readJournal(const Path& operation, std::string_view expectedId,
+                    JournalReadPurpose purpose)
 {
     ensureNotReparsePoint(operation / L"journal.json", "Updater journal");
     const auto text = fileUtf8(operation / L"journal.json", 64u * 1024u);
@@ -683,10 +711,19 @@ Journal readJournal(const Path& operation, std::string_view expectedId)
             "Journal repository mismatch");
     require(requiredString(*object, "architecture")
                 == architectureAssetSuffix(kArchitecture), "Journal architecture mismatch");
-    require(requiredString(*object, "installedVersion") == kInstalledVersion,
-            "Journal installed-version mismatch");
+    const auto writerVersion = requiredString(*object, "installedVersion");
+    const auto parsedWriterVersion = parseVersion(writerVersion);
+    const auto currentVersion = parseVersion(kInstalledVersion);
+    require(parsedWriterVersion.has_value() && currentVersion.has_value(),
+            "Journal installed-version is invalid");
+    if (purpose == JournalReadPurpose::resume)
+        require(writerVersion == kInstalledVersion, "Journal installed-version mismatch");
+    else
+        require(! isStrictlyNewer(*parsedWriterVersion, *currentVersion),
+                "Journal belongs to a newer updater version");
     Journal result;
     result.operationId = requiredString(*object, "operationId");
+    result.writerVersion = writerVersion;
     require(result.operationId == expectedId && isOperationId(result.operationId), "Journal operation mismatch");
     const auto phase = parsePhase(requiredString(*object, "phase"));
     require(phase.has_value(), "Journal phase is invalid");
@@ -710,6 +747,219 @@ Journal readJournal(const Path& operation, std::string_view expectedId)
         require(isSha256Hex(result.digest) && result.size > 0, "Journal digest or size is invalid");
     }
     return result;
+}
+
+bool markForDeletion(HANDLE handle)
+{
+    FILE_DISPOSITION_INFO disposition{};
+    disposition.DeleteFile = TRUE;
+    return SetFileInformationByHandle(handle, FileDispositionInfo,
+                                      &disposition, sizeof(disposition)) != FALSE;
+}
+
+bool safeChildName(std::wstring_view name)
+{
+    return ! name.empty() && name != L"." && name != L".."
+        && name.find_first_of(L"\\/:") == std::wstring_view::npos
+        && name.back() != L'.' && name.back() != L' ';
+}
+
+bool deleteDirectoryContents(const Path& directory);
+
+// `directory` is pinned by the caller. Only a single enumerated leaf is ever
+// appended, and OPEN_REPARSE_POINT makes links deletion leaves, never paths.
+bool deleteChild(const Path& directory, std::wstring_view name)
+{
+    if (! safeChildName(name)) return false;
+    const auto path = directory / std::wstring(name);
+    Handle lease(CreateFileW(path.c_str(), DELETE | FILE_READ_ATTRIBUTES,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    if (! lease.valid())
+    {
+        const auto error = GetLastError();
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+    }
+    FILE_ATTRIBUTE_TAG_INFO attributes{};
+    if (! GetFileInformationByHandleEx(lease.get(), FileAttributeTagInfo,
+                                       &attributes, sizeof(attributes)))
+        return false;
+    if ((attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+        && (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0
+        && ! deleteDirectoryContents(path))
+        return false;
+    return markForDeletion(lease.get());
+}
+
+bool deleteDirectoryContents(const Path& directory)
+{
+    WIN32_FIND_DATAW data{};
+    FindHandle search(FindFirstFileW((directory / L"*").c_str(), &data));
+    if (search.get() == INVALID_HANDLE_VALUE)
+        return GetLastError() == ERROR_FILE_NOT_FOUND;
+    do
+    {
+        const std::wstring_view name(data.cFileName);
+        if (name != L"." && name != L".." && ! deleteChild(directory, name)) return false;
+    }
+    while (FindNextFileW(search.get(), &data));
+    return GetLastError() == ERROR_NO_MORE_FILES;
+}
+
+bool isTerminal(Phase phase)
+{
+    return phase == Phase::verified || phase == Phase::noUpdate;
+}
+
+bool cleanupPayloadFiles(const Path& operation, const Journal& journal)
+{
+    bool removed = true;
+    if (const auto target = parseVersion(journal.targetVersion))
+        removed = deleteChild(operation,
+            widen(expectedAssetName(kProduct, *target, kArchitecture))) && removed;
+    removed = deleteChild(operation, L"download.part") && removed;
+    removed = deleteChild(operation, L"private-temp") && removed;
+    return removed;
+}
+
+bool deleteOperationContents(const Path& operation, const Journal& journal)
+{
+    if (! cleanupPayloadFiles(operation, journal)) return false;
+    const auto updaterName = widen(kProduct) + L"Updater.exe";
+    std::vector<std::wstring> ordinaryChildren;
+    std::optional<std::wstring> journalName;
+    std::optional<std::wstring> lockName;
+    std::optional<std::wstring> copiedUpdaterName;
+    {
+        WIN32_FIND_DATAW data{};
+        FindHandle search(FindFirstFileW((operation / L"*").c_str(), &data));
+        if (search.get() == INVALID_HANDLE_VALUE) return false;
+        do
+        {
+            const std::wstring_view name(data.cFileName);
+            if (name == L"." || name == L"..") continue;
+            if (equalInsensitive(name, L"journal.json"))
+            {
+                if (journalName) return false;
+                journalName = name;
+            }
+            else if (equalInsensitive(name, L"operation.lock"))
+            {
+                if (lockName) return false;
+                lockName = name;
+            }
+            else if (equalInsensitive(name, updaterName))
+            {
+                if (copiedUpdaterName) return false;
+                copiedUpdaterName = name;
+            }
+            else
+                ordinaryChildren.emplace_back(name);
+        }
+        while (FindNextFileW(search.get(), &data));
+        if (GetLastError() != ERROR_NO_MORE_FILES) return false;
+    }
+    if (! journalName) return false;
+    for (const auto& name : ordinaryChildren)
+        if (! deleteChild(operation, name)) return false;
+    // Recovery state is removed strictly after every other observed child.
+    return (! lockName || deleteChild(operation, *lockName))
+        && (! copiedUpdaterName || deleteChild(operation, *copiedUpdaterName))
+        && deleteChild(operation, *journalName);
+}
+
+std::optional<std::string> cleanupOldOperations(
+    const Path& root, bool preserveNewestIncomplete) noexcept
+{
+    try
+    {
+        auto rootLease = lockDirectoryAgainstReplacement(root, "Updater operations root");
+        struct Record
+        {
+            Path path;
+            std::string id;
+            std::string writerVersion;
+            Phase phase;
+            std::filesystem::file_time_type time;
+        };
+        std::vector<Record> records;
+        std::set<std::string> ids;
+        std::error_code error;
+        for (std::filesystem::directory_iterator iterator(root,
+                 std::filesystem::directory_options::skip_permission_denied, error), end;
+             ! error && iterator != end; iterator.increment(error))
+        {
+            try
+            {
+                const auto path = iterator->path();
+                const auto id = upperAscii(narrow(path.filename().wstring()));
+                const auto attributes = GetFileAttributesW(path.c_str());
+                if (! isOperationId(id) || attributes == INVALID_FILE_ATTRIBUTES
+                    || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+                    || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+                    continue;
+                const auto journal = readJournal(path, id, JournalReadPurpose::cleanup);
+                const auto time = std::filesystem::last_write_time(path / L"journal.json", error);
+                if (error || ! ids.insert(id).second) return std::nullopt;
+                records.push_back({ path, id, journal.writerVersion, journal.phase, time });
+            }
+            catch (...) {}
+        }
+        if (error) return std::nullopt;
+        std::optional<std::size_t> newest;
+        for (std::size_t index{}; index < records.size(); ++index)
+            if (records[index].writerVersion == kInstalledVersion
+                && ! isTerminal(records[index].phase)
+                && (! newest || records[index].time > records[*newest].time
+                    || (records[index].time == records[*newest].time
+                        && records[index].id > records[*newest].id)))
+                newest = index;
+
+        for (std::size_t index{}; index < records.size(); ++index)
+        {
+            const auto& record = records[index];
+            if (preserveNewestIncomplete && newest == index) continue;
+            Handle lease(CreateFileW(record.path.c_str(), DELETE | FILE_READ_ATTRIBUTES,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                                     FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+            FILE_ATTRIBUTE_TAG_INFO attributes{};
+            if (! lease.valid()
+                || ! GetFileInformationByHandleEx(lease.get(), FileAttributeTagInfo,
+                                                   &attributes, sizeof(attributes))
+                || (attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+                || (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+                continue;
+            try
+            {
+                // Revalidate while DELETE-without-delete-sharing proves that
+                // no running updater holds this exact operation directory.
+                const auto journal = readJournal(record.path, record.id, JournalReadPurpose::cleanup);
+                if (journal.writerVersion != record.writerVersion || journal.phase != record.phase) continue;
+                if (deleteOperationContents(record.path, journal))
+                    (void) markForDeletion(lease.get());
+            }
+            catch (...) {}
+        }
+        return newest ? std::optional<std::string>(records[*newest].id) : std::nullopt;
+    }
+    catch (...)
+    {
+        return std::nullopt;
+    }
+}
+
+void cleanupVerifiedPayload(const Path& operation, const Journal& journal) noexcept
+{
+    try
+    {
+        // Terminal journal state is committed first by the caller. These
+        // potentially large artifacts are then best-effort only: failure must
+        // neither turn a verified installation into an error nor remove the
+        // copied updater, lock, or recovery journal.
+        auto operationLease = lockDirectoryAgainstReplacement(operation, "Verified operation");
+        (void) cleanupPayloadFiles(operation, journal);
+    }
+    catch (...) {}
 }
 
 int taskDialog(const std::wstring& title, const std::wstring& instruction,
@@ -896,30 +1146,17 @@ struct Release
     std::uint64_t size{};
 };
 
-bool strictBool(const juce::var& value, bool expected)
+Release parsePublishedRelease(juce::DynamicObject& object, const SemVersion& version,
+                              std::string_view canonicalTag)
 {
-    return value.isBool() && static_cast<bool>(value) == expected;
-}
-
-Release parseRelease(const std::string& json)
-{
-    const auto parsed = juce::JSON::parse(juce::String::fromUTF8(json.data(), static_cast<int>(json.size())));
-    auto* object = parsed.getDynamicObject();
-    require(object != nullptr, "GitHub release metadata is not an object");
-    require(strictBool(object->getProperty("draft"), false)
-                && strictBool(object->getProperty("prerelease"), false),
-            "Only a published stable GitHub release is accepted");
-    const auto tagText = object->getProperty("tag_name").toString().toStdString();
-    const auto version = parseStableTag(tagText);
-    require(version.has_value() && tagText == "v" + toString(*version), "Release tag is not canonical");
     const auto expectedHtml = "https://github.com/" + std::string(kOwner) + "/" + std::string(kRepository)
-                            + "/releases/tag/" + tagText;
-    require(object->getProperty("html_url").toString().toStdString() == expectedHtml,
+                            + "/releases/tag/" + std::string(canonicalTag);
+    require(object.getProperty("html_url").toString().toStdString() == expectedHtml,
             "Release metadata does not belong to the configured repository/tag");
-    auto* assets = object->getProperty("assets").getArray();
+    auto* assets = object.getProperty("assets").getArray();
     require(assets != nullptr, "Release assets are missing");
-    const auto expectedName = expectedAssetName(kProduct, *version, kArchitecture);
-    const auto expectedUrl = expectedAssetUrl(kOwner, kRepository, kProduct, *version, kArchitecture);
+    const auto expectedName = expectedAssetName(kProduct, version, kArchitecture);
+    const auto expectedUrl = expectedAssetUrl(kOwner, kRepository, kProduct, version, kArchitecture);
     std::optional<Release> found;
     for (const auto& assetValue : *assets)
     {
@@ -937,10 +1174,43 @@ Release parseRelease(const std::string& json)
         const auto signedSize = static_cast<juce::int64>(sizeValue);
         require(signedSize > 0 && static_cast<std::uint64_t>(signedSize) <= kMaximumMsiBytes,
                 "GitHub release asset size is outside policy");
-        found = Release { *version, assetUrl, *digest, static_cast<std::uint64_t>(signedSize) };
+        found = Release { version, assetUrl, *digest, static_cast<std::uint64_t>(signedSize) };
     }
     require(found.has_value(), "Release does not contain exactly the expected MSI asset");
     return *found;
+}
+
+std::optional<Release> parseNextRelease(const std::string& json, const SemVersion& baseline)
+{
+    const auto parsed = juce::JSON::parse(juce::String::fromUTF8(json.data(), static_cast<int>(json.size())));
+    auto* releases = parsed.getArray();
+    require(releases != nullptr, "GitHub releases metadata is not an array");
+    require(releases->size() < 100,
+            "GitHub releases page is full; refusing a potentially truncated rotation history");
+    std::set<std::string> stableTags;
+    std::optional<Release> selected;
+    for (auto& releaseValue : *releases)
+    {
+        auto* object = releaseValue.getDynamicObject();
+        require(object != nullptr, "GitHub releases metadata contains a non-object record");
+        const auto draft = object->getProperty("draft");
+        const auto prerelease = object->getProperty("prerelease");
+        require(draft.isBool() && prerelease.isBool(),
+                "GitHub release publication flags are not booleans");
+        if (static_cast<bool>(draft) || static_cast<bool>(prerelease))
+            continue;
+        const auto tagText = object->getProperty("tag_name").toString().toStdString();
+        const auto version = parseStableTag(tagText);
+        require(version.has_value() && tagText == "v" + toString(*version),
+                "Published release tag is not canonical");
+        require(stableTags.insert(tagText).second, "GitHub releases metadata contains a duplicate stable tag");
+        if (! isStrictlyNewer(*version, baseline))
+            continue;
+        const auto candidate = parsePublishedRelease(*object, *version, tagText);
+        if (! selected || isStrictlyNewer(selected->version, candidate.version))
+            selected = candidate;
+    }
+    return selected;
 }
 
 void downloadMsi(const Release& release, const Path& finalPath)
@@ -1017,7 +1287,7 @@ std::string certificateThumbprint(const Path& path)
     return result;
 }
 
-void verifyAuthenticode(const Path& path)
+std::string trustedAuthenticodeSigner(const Path& path)
 {
     WINTRUST_FILE_INFO fileInfo{};
     fileInfo.cbStruct = sizeof(fileInfo);
@@ -1037,8 +1307,38 @@ void verifyAuthenticode(const Path& path)
     require(status == ERROR_SUCCESS, "WinVerifyTrust rejected " + narrow(path.wstring())
                                       + " with status " + std::to_string(status));
     require(! kTestMode, "Test-mode binaries are never trusted for installation");
-    require(constantTimeEqual(upperAscii(certificateThumbprint(path)), upperAscii(std::string(kSignerSha256))),
-            "Authenticode signer does not match the pinned SHA-256 certificate thumbprint");
+    return upperAscii(certificateThumbprint(path));
+}
+
+bool isAllowedPayloadSigner(std::string_view signer)
+{
+    return constantTimeEqual(upperAscii(std::string(signer)),
+                             upperAscii(std::string(kCurrentSignerSha256)))
+        || (! kNextSignerSha256.empty()
+            && constantTimeEqual(upperAscii(std::string(signer)),
+                                 upperAscii(std::string(kNextSignerSha256))));
+}
+
+void verifyAuthenticodeCurrentSigner(const Path& path)
+{
+    require(constantTimeEqual(trustedAuthenticodeSigner(path),
+                              upperAscii(std::string(kCurrentSignerSha256))),
+            "Authenticode signer does not match the current updater certificate pin");
+}
+
+std::string verifyAuthenticodeAllowedPayload(const Path& path)
+{
+    const auto signer = trustedAuthenticodeSigner(path);
+    require(isAllowedPayloadSigner(signer),
+            "Authenticode signer is outside the updater payload certificate allowlist");
+    return signer;
+}
+
+void verifyAuthenticodePackageSigner(const Path& path, std::string_view packageSigner)
+{
+    require(isAllowedPayloadSigner(packageSigner), "Package signer is outside the updater allowlist");
+    require(constantTimeEqual(trustedAuthenticodeSigner(path), upperAscii(std::string(packageSigner))),
+            "PE payload signer differs from the MSI package signer");
 }
 
 std::string msiString(MSIHANDLE record, UINT field)
@@ -1333,7 +1633,7 @@ std::size_t msiPayloadFileCount(const Path& path)
     return rows.size();
 }
 
-void verifyDownloadedMsi(const Path& msi, const Journal& journal)
+std::string verifyDownloadedMsi(const Path& msi, const Journal& journal)
 {
     ensureNotReparsePoint(msi, "Downloaded MSI");
     Handle locked(CreateFileW(msi.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
@@ -1342,10 +1642,11 @@ void verifyDownloadedMsi(const Path& msi, const Journal& journal)
     const auto [size, digest] = hashFile(msi);
     require(size == journal.size && constantTimeEqual(digest, journal.digest),
             "Persisted MSI no longer matches GitHub size/digest");
-    verifyAuthenticode(msi);
+    const auto packageSigner = verifyAuthenticodeAllowedPayload(msi);
     const auto version = parseVersion(journal.targetVersion);
     require(version.has_value(), "Journal version is invalid");
     verifyMsiDatabase(msi, *version);
+    return packageSigner;
 }
 
 struct PeInfo { WORD machine{}; bool chpe{}; };
@@ -1510,7 +1811,8 @@ void validateModuleInfo(const Path& bundle, const SemVersion& version)
             "moduleinfo.json class categories are not the exact VST3 component/controller pair");
 }
 
-BundleFingerprint fingerprintBundle(const Path& bundle, const SemVersion& version)
+BundleFingerprint fingerprintBundle(const Path& bundle, const SemVersion& version,
+                                    std::string_view packageSigner)
 {
     require(std::filesystem::is_directory(bundle), "VST3 payload is not a directory");
     ensureNotReparsePoint(bundle, "VST3 payload root");
@@ -1563,7 +1865,7 @@ BundleFingerprint fingerprintBundle(const Path& bundle, const SemVersion& versio
                 : ((pe.machine == IMAGE_FILE_MACHINE_AMD64 && pe.chpe)
                     || pe.machine == 0xA641 || pe.machine == 0xA64E);
             require(correct, "VST3 contains a PE image for the wrong architecture");
-            verifyAuthenticode(iterator->path());
+            verifyAuthenticodePackageSigner(iterator->path(), packageSigner);
             ++peCount;
         }
         const auto [size, digest] = hashFile(iterator->path());
@@ -1763,6 +2065,19 @@ Path currentExecutable()
     return executable;
 }
 
+std::optional<std::string> copiedUpdaterOperationId(const Path& root, const Path& executable)
+{
+    if (! equalInsensitive(executable.filename().wstring(),
+                           widen(kProduct) + L"Updater.exe"))
+        return std::nullopt;
+    const auto operation = executable.parent_path();
+    if (! equalInsensitive(operation.parent_path().lexically_normal().wstring(),
+                           root.lexically_normal().wstring()))
+        return std::nullopt;
+    const auto id = upperAscii(narrow(operation.filename().wstring()));
+    return isOperationId(id) ? std::optional<std::string>(id) : std::nullopt;
+}
+
 void launchCopiedUpdater(const Path& executable, const Path& source,
                          std::string_view operationId)
 {
@@ -1777,7 +2092,7 @@ void launchCopiedUpdater(const Path& executable, const Path& source,
     require((information.dwFileAttributes
                 & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0,
             "Copied updater is not a regular non-reparse file");
-    verifyAuthenticode(executable);
+    verifyAuthenticodeCurrentSigner(executable);
     require(hashFile(source) == hashFile(executable),
             "Copied updater differs from its source executable");
 
@@ -1865,7 +2180,8 @@ bool compiledBuildIdentityMatches(std::string_view product,
                                   std::string_view architecture,
                                   std::string_view upgradeCode,
                                   std::string_view otherUpgradeCode,
-                                  std::string_view signerSha256)
+                                  std::string_view currentSignerSha256,
+                                  std::string_view nextSignerSha256)
 {
     const auto parsedVersion = parseVersion(kInstalledVersion);
     const auto configured = isSafeRepositoryComponent(kProduct)
@@ -1875,8 +2191,12 @@ bool compiledBuildIdentityMatches(std::string_view product,
         && toString(*parsedVersion) == kInstalledVersion
         && isCanonicalGuid(kUpgradeCode) && isCanonicalGuid(kOtherUpgradeCode)
         && kUpgradeCode != kOtherUpgradeCode
-        && (kTestMode ? kSignerSha256.empty() || isSha256Hex(kSignerSha256)
-                      : isSha256Hex(kSignerSha256));
+        && (kTestMode ? kCurrentSignerSha256.empty() || isSha256Hex(kCurrentSignerSha256)
+                      : isSha256Hex(kCurrentSignerSha256))
+        && (kNextSignerSha256.empty() || isSha256Hex(kNextSignerSha256))
+        && (kNextSignerSha256.empty()
+            || ! constantTimeEqual(upperAscii(std::string(kCurrentSignerSha256)),
+                                   upperAscii(std::string(kNextSignerSha256))));
     return configured
         && product == kProduct
         && version == kInstalledVersion
@@ -1886,7 +2206,10 @@ bool compiledBuildIdentityMatches(std::string_view product,
         && architecture == architectureAssetSuffix(kArchitecture)
         && upgradeCode == kUpgradeCode
         && otherUpgradeCode == kOtherUpgradeCode
-        && upperAscii(std::string(signerSha256)) == upperAscii(std::string(kSignerSha256));
+        && upperAscii(std::string(currentSignerSha256))
+            == upperAscii(std::string(kCurrentSignerSha256))
+        && upperAscii(std::string(nextSignerSha256))
+            == upperAscii(std::string(kNextSignerSha256));
 }
 
 bool buildContractMatches(std::string_view product,
@@ -1897,20 +2220,22 @@ bool buildContractMatches(std::string_view product,
                           std::string_view architecture,
                           std::string_view upgradeCode,
                           std::string_view otherUpgradeCode,
-                          std::string_view signerSha256)
+                          std::string_view currentSignerSha256,
+                          std::string_view nextSignerSha256)
 {
     // A test-mode executable can never certify a distribution build, even if a
     // caller supplies values matching all of its other compile definitions.
     return ! kTestMode && ! kCompileOnly
         && compiledBuildIdentityMatches(product, version, manufacturer, githubOwner,
                                         githubRepository, architecture, upgradeCode,
-                                        otherUpgradeCode, signerSha256);
+                                        otherUpgradeCode, currentSignerSha256,
+                                        nextSignerSha256);
 }
 
 std::string canonicalBuildContractResponse(std::string_view challenge, DWORD serverProcessId)
 {
     return "{\"schema\":\"" + std::string(kBuildContractSchema)
-        + "\",\"schemaVersion\":1,\"challenge\":\"" + upperAscii(std::string(challenge))
+        + "\",\"schemaVersion\":2,\"challenge\":\"" + upperAscii(std::string(challenge))
         + "\",\"serverProcessId\":" + std::to_string(serverProcessId)
         + ",\"buildMode\":\"production\",\"compileOnly\":false,\"product\":\""
         + std::string(kProduct) + "\",\"version\":\"" + std::string(kInstalledVersion)
@@ -1920,7 +2245,8 @@ std::string canonicalBuildContractResponse(std::string_view challenge, DWORD ser
         + "\",\"architecture\":\"" + architectureAssetSuffix(kArchitecture)
         + "\",\"upgradeCode\":\"" + std::string(kUpgradeCode)
         + "\",\"otherUpgradeCode\":\"" + std::string(kOtherUpgradeCode)
-        + "\",\"signerSha256\":\"" + upperAscii(std::string(kSignerSha256)) + "\"}\n";
+        + "\",\"currentSignerSha256\":\"" + upperAscii(std::string(kCurrentSignerSha256))
+        + "\",\"nextSignerSha256\":\"" + upperAscii(std::string(kNextSignerSha256)) + "\"}\n";
 }
 
 void writeBuildContractResponse(std::string_view pipeName,
@@ -1956,11 +2282,11 @@ std::optional<int> validateBuildContractCommandLine() noexcept
         struct Args { wchar_t** value; ~Args() { LocalFree(value); } } arguments { raw };
         if (count < 2 || std::wstring_view(raw[1]) != L"--validate-build-contract")
             return std::nullopt;
-        constexpr std::array<std::wstring_view, 12> flags {
+        constexpr std::array<std::wstring_view, 13> flags {
             L"--challenge", L"--response-pipe", L"--parent-process-id",
             L"--product", L"--version", L"--manufacturer", L"--github-owner",
             L"--github-repository", L"--architecture", L"--upgrade-code",
-            L"--other-upgrade-code", L"--signer-sha256"
+            L"--other-upgrade-code", L"--current-signer-sha256", L"--next-signer-sha256"
         };
         if (count != 2 + static_cast<int>(flags.size()) * 2) return 2;
         std::array<std::string, flags.size()> values;
@@ -1973,7 +2299,7 @@ std::optional<int> validateBuildContractCommandLine() noexcept
         if (! isBuildContractChallenge(values[0]) || ! isBuildContractPipeName(values[1])
             || ! parentProcessId
             || ! buildContractMatches(values[3], values[4], values[5], values[6], values[7],
-                                       values[8], values[9], values[10], values[11]))
+                                       values[8], values[9], values[10], values[11], values[12]))
             return 3;
         writeBuildContractResponse(values[1], values[0], *parentProcessId);
         return 0;
@@ -1998,36 +2324,19 @@ Invocation invocation()
     return { id };
 }
 
-std::optional<std::string> newestIncomplete(const Path& root)
+std::string prepareOperation(const Path& root, const std::optional<std::string>& newest)
 {
-    std::optional<std::pair<std::filesystem::file_time_type, std::string>> newest;
-    for (const auto& entry : std::filesystem::directory_iterator(root))
-    {
-        if (! entry.is_directory()) continue;
-        const auto id = upperAscii(narrow(entry.path().filename().wstring()));
-        if (! isOperationId(id)) continue;
-        try
-        {
-            ensureNotReparsePoint(entry.path(), "Resume operation");
-            const auto journal = readJournal(entry.path(), id);
-            if (journal.phase == Phase::verified || journal.phase == Phase::noUpdate) continue;
-            const auto modified = std::filesystem::last_write_time(entry.path() / L"journal.json");
-            if (! newest || modified > newest->first) newest = { modified, id };
-        }
-        catch (const Failure&) {}
-    }
-    return newest ? std::optional<std::string>(newest->second) : std::nullopt;
-}
-
-std::string prepareOperation(const Path& root)
-{
-    if (const auto existing = newestIncomplete(root))
+    if (newest)
     {
         const auto answer = taskDialog(widen(kProduct) + L" Update", L"Unvollständiges Update gefunden",
             L"Ja: sicher fortsetzen. Nein: einen neuen Vorgang beginnen. Es werden keine DAWs beendet.",
             TDCBF_YES_BUTTON | TDCBF_NO_BUTTON | TDCBF_CANCEL_BUTTON, TD_WARNING_ICON);
         if (answer == IDCANCEL) fail("Update canceled; the saved operation remains available");
-        if (answer == IDYES) return *existing;
+        if (answer == IDYES) return *newest;
+        // Once the user explicitly declines recovery, old valid incomplete
+        // operations are no longer useful. Delete only those for which an
+        // exclusive directory deletion lease can be acquired.
+        (void) cleanupOldOperations(root, false);
     }
     const auto id = newOperationId();
     const auto operation = root / widen(id);
@@ -2048,12 +2357,29 @@ void validateConfiguration()
     require(isCanonicalGuid(kUpgradeCode) && isCanonicalGuid(kOtherUpgradeCode)
                 && kUpgradeCode != kOtherUpgradeCode,
             "Updater UpgradeCodes are missing, malformed or identical");
-    if (! kTestMode) require(isSha256Hex(kSignerSha256), "Production signer pin is invalid");
+    if (! kTestMode)
+        require(isSha256Hex(kCurrentSignerSha256), "Production current signer pin is invalid");
+    require(kNextSignerSha256.empty() || isSha256Hex(kNextSignerSha256),
+            "Optional next signer pin is invalid");
+    require(kNextSignerSha256.empty()
+                || ! constantTimeEqual(upperAscii(std::string(kCurrentSignerSha256)),
+                                       upperAscii(std::string(kNextSignerSha256))),
+            "Current and next signer pins must be distinct");
 }
 
 int worker(const Path& operation, Journal& journal)
 {
     const auto title = widen(kProduct) + L" Update";
+    if (journal.phase == Phase::verified)
+    {
+        cleanupVerifiedPayload(operation, journal);
+        taskDialog(title, L"Update bereits installiert und geprüft",
+                   journal.lastError == "restart-required"
+                       ? L"Die installierte VST3-Nutzlast wurde bereits vollständig geprüft. Windows verlangt einen Neustart."
+                       : L"Die installierte VST3-Nutzlast wurde bereits vollständig geprüft.",
+                   TDCBF_OK_BUTTON);
+        return 0;
+    }
     if (journal.phase == Phase::noUpdate)
     {
         taskDialog(title, L"Kein Update verfügbar",
@@ -2064,10 +2390,12 @@ int worker(const Path& operation, Journal& journal)
     if (journal.phase == Phase::created)
     {
         const auto installed = *parseVersion(kInstalledVersion);
-        const auto release = parseRelease(httpGetText(releasesApiUrl(kOwner, kRepository)));
         const auto system = installedSystemVersion();
-        if (! isStrictlyNewer(release.version, installed)
-            || (system && ! isStrictlyNewer(release.version, *system)))
+        auto baseline = installed;
+        if (system && isStrictlyNewer(*system, baseline)) baseline = *system;
+        const auto release = parseNextRelease(
+            httpGetText(releasesApiUrl(kOwner, kRepository)), baseline);
+        if (! release)
         {
             journal.phase = Phase::noUpdate;
             journal.lastError.clear();
@@ -2078,15 +2406,15 @@ int worker(const Path& operation, Journal& journal)
             return 0;
         }
         const auto answer = taskDialog(title, L"Update verfügbar",
-            widen("Installiert: " + toString(installed) + "\nVerfügbar: " + toString(release.version)
+            widen("Installiert: " + toString(baseline) + "\nVerfügbar: " + toString(release->version)
                 + "\n\nDas MSI wird ausschließlich von der festgelegten GitHub-Release-Adresse geladen. "
                   "Escape bricht den Download ab; der Vorgang kann später fortgesetzt werden."),
             TDCBF_YES_BUTTON | TDCBF_NO_BUTTON);
         if (answer != IDYES) fail("Update canceled before download");
-        journal.targetVersion = toString(release.version);
-        journal.assetUrl = release.url;
-        journal.digest = release.digest;
-        journal.size = release.size;
+        journal.targetVersion = toString(release->version);
+        journal.assetUrl = release->url;
+        journal.digest = release->digest;
+        journal.size = release->size;
         journal.phase = Phase::metadata;
         journal.lastError.clear();
         writeJournal(operation, journal);
@@ -2108,7 +2436,7 @@ int worker(const Path& operation, Journal& journal)
         writeJournal(operation, journal);
     }
 
-    verifyDownloadedMsi(expectedMsi, journal);
+    const auto packageSigner = verifyDownloadedMsi(expectedMsi, journal);
     const auto extraction = operation / L"private-temp" / L"administrative-image";
     if (journal.phase == Phase::downloaded)
     {
@@ -2119,21 +2447,21 @@ int worker(const Path& operation, Journal& journal)
             "Update canceled before administrative extraction");
         administrativeExtract(expectedMsi, journal, extraction);
         const auto extractedBundle = findSingleVst3(extraction);
-        const auto fingerprint = fingerprintBundle(extractedBundle, target);
+        const auto fingerprint = fingerprintBundle(extractedBundle, target, packageSigner);
         validateAdministrativeImage(extraction, extractedBundle, expectedMsi, fingerprint);
         journal.phase = Phase::extracted;
         writeJournal(operation, journal);
     }
 
     const auto extractedBundle = findSingleVst3(extraction);
-    const auto expectedFingerprint = fingerprintBundle(extractedBundle, target);
+    const auto expectedFingerprint = fingerprintBundle(extractedBundle, target, packageSigner);
     validateAdministrativeImage(extraction, extractedBundle, expectedMsi, expectedFingerprint);
     if (journal.phase == Phase::extracted)
     {
         const auto systemVersion = installedSystemVersion();
         if (systemVersion && *systemVersion == target)
         {
-            require(fingerprintBundle(installedBundlePath(), target) == expectedFingerprint,
+            require(fingerprintBundle(installedBundlePath(), target, packageSigner) == expectedFingerprint,
                     "A same-version system VST3 differs from this verified update; overwrite refused");
             // The prior process may have ended after MSI success but before its
             // journal transition.  Exact payload equality makes this recovery
@@ -2159,14 +2487,16 @@ int worker(const Path& operation, Journal& journal)
         }
     }
 
-    verifyDownloadedMsi(expectedMsi, journal);
-    require(fingerprintBundle(extractedBundle, target) == expectedFingerprint,
+    require(constantTimeEqual(verifyDownloadedMsi(expectedMsi, journal), packageSigner),
+            "MSI package signer changed during installation");
+    require(fingerprintBundle(extractedBundle, target, packageSigner) == expectedFingerprint,
             "Administrative image changed during installation");
     const auto installedPath = installedBundlePath();
-    require(fingerprintBundle(installedPath, target) == expectedFingerprint,
+    require(fingerprintBundle(installedPath, target, packageSigner) == expectedFingerprint,
             "Installed system VST3 differs from the fully verified MSI payload");
     journal.phase = Phase::verified;
     writeJournal(operation, journal);
+    cleanupVerifiedPayload(operation, journal);
     taskDialog(title, L"Update installiert und geprüft",
         journal.lastError == "restart-required"
             ? L"Die installierte VST3-Nutzlast stimmt vollständig überein. Windows verlangt einen Neustart."
@@ -2184,22 +2514,32 @@ int runWindowsUpdater()
     {
         validateConfiguration();
         require(! kTestMode, "This development/test updater cannot download, elevate or install");
-        ProductMutex mutex;
         const auto arguments = invocation();
+        const auto self = currentExecutable();
+        verifyAuthenticodeCurrentSigner(self);
         const auto root = localOperationsRoot();
-        const auto id = arguments.resumeId ? *arguments.resumeId : prepareOperation(root);
+        const auto selfOperation = copiedUpdaterOperationId(root, self);
+        require(! selfOperation || ! arguments.resumeId || *selfOperation == *arguments.resumeId,
+                "Copied updater operation does not match --resume");
+        const auto protectedOperation = selfOperation ? selfOperation : arguments.resumeId;
+        std::optional<Handle> protectedOperationLock;
+        if (protectedOperation)
+            protectedOperationLock.emplace(lockDirectoryAgainstReplacement(
+                root / widen(*protectedOperation), "Current updater operation"));
+        ProductMutex mutex;
+        const auto newest = cleanupOldOperations(root, ! arguments.resumeId.has_value());
+        const auto id = arguments.resumeId ? *arguments.resumeId
+                                           : prepareOperation(root, newest);
         const auto operation = root / widen(id);
         ensureNotReparsePoint(operation, "Updater operation");
         auto operationDirectoryLock = lockDirectoryAgainstReplacement(operation, "Updater operation");
         const auto copied = operation / (widen(kProduct) + L"Updater.exe");
-        const auto self = currentExecutable();
         if (std::filesystem::exists(copied))
             ensureNotReparsePoint(copied, "Copied updater executable");
         if (! equalInsensitive(self.wstring(), std::filesystem::weakly_canonical(copied).wstring()))
         {
             if (! std::filesystem::exists(copied))
             {
-                verifyAuthenticode(self);
                 require(CopyFileW(self.c_str(), copied.c_str(), TRUE), winError("Cannot copy updater outside VST3"));
             }
             launchCopiedUpdater(copied, self, id);
@@ -2211,7 +2551,7 @@ int runWindowsUpdater()
                                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
         require(operationLock.valid(), "This saved updater operation is already active");
         ensureNotReparsePoint(operation / L"operation.lock", "Updater operation lock");
-        auto journal = readJournal(operation, id);
+        auto journal = readJournal(operation, id, JournalReadPurpose::resume);
         try
         {
             return worker(operation, journal);
@@ -2244,53 +2584,67 @@ int runWindowsUpdaterSelfTests()
         require(compiledBuildIdentityMatches(kProduct, kInstalledVersion,
                                              kManufacturer, kOwner, kRepository,
                                              architectureAssetSuffix(kArchitecture), kUpgradeCode,
-                                             kOtherUpgradeCode, kSignerSha256),
+                                             kOtherUpgradeCode, kCurrentSignerSha256,
+                                             kNextSignerSha256),
                 "Compiled build-contract identity does not match itself");
         require(! buildContractMatches(kProduct, kInstalledVersion,
                                        kManufacturer, kOwner, kRepository,
                                        architectureAssetSuffix(kArchitecture), kUpgradeCode,
-                                       kOtherUpgradeCode, kSignerSha256),
+                                       kOtherUpgradeCode, kCurrentSignerSha256,
+                                       kNextSignerSha256),
                 "Test-mode executable was allowed to certify a distribution build");
         require(! compiledBuildIdentityMatches("WrongProduct", kInstalledVersion,
                                                kManufacturer, kOwner, kRepository,
                                                architectureAssetSuffix(kArchitecture), kUpgradeCode,
-                                               kOtherUpgradeCode, kSignerSha256),
+                                               kOtherUpgradeCode, kCurrentSignerSha256,
+                                               kNextSignerSha256),
                 "Build-contract product mutation was accepted");
         require(! compiledBuildIdentityMatches(kProduct, kInstalledVersion,
                                                "Wrong Manufacturer", kOwner, kRepository,
                                                architectureAssetSuffix(kArchitecture), kUpgradeCode,
-                                               kOtherUpgradeCode, kSignerSha256),
+                                               kOtherUpgradeCode, kCurrentSignerSha256,
+                                               kNextSignerSha256),
                 "Build-contract manufacturer mutation was accepted");
         require(! compiledBuildIdentityMatches(kProduct, kInstalledVersion,
                                                kManufacturer, "WrongOwner", kRepository,
                                                architectureAssetSuffix(kArchitecture), kUpgradeCode,
-                                               kOtherUpgradeCode, kSignerSha256),
+                                               kOtherUpgradeCode, kCurrentSignerSha256,
+                                               kNextSignerSha256),
                 "Build-contract owner mutation was accepted");
         require(! compiledBuildIdentityMatches(kProduct, kInstalledVersion,
                                                kManufacturer, kOwner, "WrongRepository",
                                                architectureAssetSuffix(kArchitecture), kUpgradeCode,
-                                               kOtherUpgradeCode, kSignerSha256),
+                                               kOtherUpgradeCode, kCurrentSignerSha256,
+                                               kNextSignerSha256),
                 "Build-contract repository mutation was accepted");
         require(! compiledBuildIdentityMatches(kProduct, kInstalledVersion,
                                                kManufacturer, kOwner, kRepository,
                                                architectureAssetSuffix(kArchitecture), kOtherUpgradeCode,
-                                               kUpgradeCode, kSignerSha256),
+                                               kUpgradeCode, kCurrentSignerSha256,
+                                               kNextSignerSha256),
                 "Build-contract UpgradeCode mutation was accepted");
         require(! compiledBuildIdentityMatches(kProduct, "255.255.65535",
                                                kManufacturer, kOwner, kRepository,
                                                architectureAssetSuffix(kArchitecture), kUpgradeCode,
-                                               kOtherUpgradeCode, kSignerSha256),
+                                               kOtherUpgradeCode, kCurrentSignerSha256,
+                                               kNextSignerSha256),
                 "Build-contract version mutation was accepted");
         require(! compiledBuildIdentityMatches(kProduct, kInstalledVersion,
                                                kManufacturer, kOwner, kRepository,
                                                kArchitecture == Architecture::x64 ? "arm64ec" : "x64",
-                                               kUpgradeCode, kOtherUpgradeCode, kSignerSha256),
+                                               kUpgradeCode, kOtherUpgradeCode,
+                                               kCurrentSignerSha256, kNextSignerSha256),
                 "Build-contract architecture mutation was accepted");
         require(! compiledBuildIdentityMatches(kProduct, kInstalledVersion,
                                                kManufacturer, kOwner, kRepository,
                                                architectureAssetSuffix(kArchitecture), kUpgradeCode,
-                                               kOtherUpgradeCode, "00"),
-                "Build-contract signer mutation was accepted");
+                                               kOtherUpgradeCode, "00", kNextSignerSha256),
+                "Build-contract current-signer mutation was accepted");
+        require(! compiledBuildIdentityMatches(kProduct, kInstalledVersion,
+                                               kManufacturer, kOwner, kRepository,
+                                               architectureAssetSuffix(kArchitecture), kUpgradeCode,
+                                               kOtherUpgradeCode, kCurrentSignerSha256, "00"),
+                "Build-contract next-signer mutation was accepted");
         require(isBuildContractChallenge(
                     "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF")
                     && ! isBuildContractChallenge("predictable"),
@@ -2303,6 +2657,54 @@ int runWindowsUpdaterSelfTests()
                     && ! parseBuildContractProcessId("0")
                     && ! parseBuildContractProcessId("01"),
                 "Build-contract process-ID validation failed");
+        const auto releaseJson = [] (const SemVersion& version, bool draft, bool prerelease)
+        {
+            const auto tag = "v" + toString(version);
+            const auto name = expectedAssetName(kProduct, version, kArchitecture);
+            const auto url = expectedAssetUrl(kOwner, kRepository, kProduct, version, kArchitecture);
+            return std::string("{\"draft\":") + (draft ? "true" : "false")
+                + ",\"prerelease\":" + (prerelease ? "true" : "false")
+                + ",\"tag_name\":\"" + tag + "\",\"html_url\":\"https://github.com/"
+                + std::string(kOwner) + "/" + std::string(kRepository) + "/releases/tag/" + tag
+                + "\",\"assets\":[{\"name\":\"" + name
+                + "\",\"state\":\"uploaded\",\"browser_download_url\":\"" + url
+                + "\",\"digest\":\"sha256:" + std::string(64, 'A') + "\",\"size\":42}]}";
+        };
+        const auto baseline = *parseVersion("1.0.0");
+        const auto nextRelease = parseNextRelease(
+            "[" + releaseJson(*parseVersion("3.0.0"), false, false) + ","
+                + releaseJson(*parseVersion("2.0.0"), false, true) + ","
+                + releaseJson(*parseVersion("1.1.0"), false, false) + ","
+                + releaseJson(*parseVersion("1.2.0"), false, false) + "]",
+            baseline);
+        require(nextRelease && nextRelease->version == *parseVersion("1.1.0"),
+                "Bounded release history did not select the smallest stable newer version");
+        require(! parseNextRelease(
+                    "[" + releaseJson(baseline, false, false) + ","
+                        + releaseJson(*parseVersion("9.0.0"), true, false) + "]",
+                    baseline),
+                "Old, draft, or prerelease records produced an update candidate");
+        bool duplicateTagDenied{};
+        try
+        {
+            (void) parseNextRelease(
+                "[" + releaseJson(*parseVersion("1.1.0"), false, false) + ","
+                    + releaseJson(*parseVersion("1.1.0"), false, false) + "]",
+                baseline);
+        }
+        catch (const Failure&) { duplicateTagDenied = true; }
+        require(duplicateTagDenied, "Duplicate stable release tags were accepted");
+        std::string fullPage = "[";
+        for (int index = 0; index < 100; ++index)
+        {
+            if (index != 0) fullPage += ',';
+            fullPage += releaseJson(*parseVersion("9.0.0"), true, false);
+        }
+        fullPage += ']';
+        bool truncatedHistoryDenied{};
+        try { (void) parseNextRelease(fullPage, baseline); }
+        catch (const Failure&) { truncatedHistoryDenied = true; }
+        require(truncatedHistoryDenied, "A full, potentially truncated release-history page was accepted");
         bool installationDenied{};
         try
         {
@@ -2315,7 +2717,8 @@ int runWindowsUpdaterSelfTests()
             installationDenied = std::string_view(error.what()).find("Test mode") != std::string_view::npos;
         }
         require(installationDenied, "Test mode did not deny elevation before touching an MSI");
-        const auto approvedUrl = parseHttpsUrl(L"https://api.github.com/repos/TheWhykiki/Test/releases/latest");
+        const auto approvedUrl = parseHttpsUrl(
+            L"https://api.github.com/repos/TheWhykiki/Test/releases?per_page=100");
         require(approvedUrl.host == L"api.github.com" && approvedUrl.port == INTERNET_DEFAULT_HTTPS_PORT,
                 "Approved HTTPS URL parsing failed");
         bool maliciousHostDenied{};
@@ -2338,6 +2741,164 @@ int runWindowsUpdaterSelfTests()
                     == std::string(kProduct) + "-2.3.4-Windows-"
                        + architectureAssetSuffix(kArchitecture) + ".msi",
                 "Architecture asset contract failed");
+
+        wchar_t temporaryBuffer[MAX_PATH + 1]{};
+        const auto length = GetTempPathW(static_cast<DWORD>(std::size(temporaryBuffer)), temporaryBuffer);
+        require(length > 0 && length < std::size(temporaryBuffer), "Cannot resolve cleanup test root");
+        const Path temporaryRoot(temporaryBuffer);
+        auto temporaryRootLock = lockDirectoryAgainstReplacement(temporaryRoot, "Cleanup test root");
+        const auto cleanupRoot = temporaryRoot / (L"WhykikiUpdaterCleanupTest-" + widen(newOperationId()));
+        createPrivateDirectory(cleanupRoot, true);
+        const juce::ScopeGuard removeFixture { [&]
+        {
+            (void) deleteChild(temporaryRoot, cleanupRoot.filename().wstring());
+        } };
+
+        const auto makeOperation = [&] (Phase phase, int ageMinutes)
+        {
+            const auto id = newOperationId();
+            const auto operation = cleanupRoot / widen(id);
+            createPrivateDirectory(operation, true);
+            Journal journal;
+            journal.operationId = id;
+            journal.phase = phase;
+            if (phase != Phase::created && phase != Phase::noUpdate)
+            {
+                const auto target = *parseVersion("2.3.4");
+                journal.targetVersion = toString(target);
+                journal.assetUrl = expectedAssetUrl(kOwner, kRepository, kProduct,
+                                                    target, kArchitecture);
+                journal.digest = std::string(64, 'A');
+                journal.size = 1;
+            }
+            writeJournal(operation, journal);
+            std::error_code timeError;
+            std::filesystem::last_write_time(operation / L"journal.json",
+                std::filesystem::file_time_type::clock::now()
+                    - std::chrono::minutes(ageMinutes), timeError);
+            require(! timeError, "Cannot timestamp updater-cleanup fixture");
+            return std::pair<std::string, Path>{ id, operation };
+        };
+        const auto rewriteWriterVersion = [&] (const Path& operation,
+                                               std::string_view writerVersion,
+                                               int ageMinutes)
+        {
+            require(parseVersion(writerVersion).has_value(),
+                    "Historical cleanup fixture version is invalid");
+            const auto text = fileUtf8(operation / L"journal.json", 64u * 1024u);
+            auto parsed = juce::JSON::parse(
+                juce::String::fromUTF8(text.data(), static_cast<int>(text.size())));
+            auto* object = parsed.getDynamicObject();
+            require(object != nullptr, "Cannot parse historical cleanup fixture");
+            object->setProperty("installedVersion", juceString(writerVersion));
+            const auto json = juce::JSON::toString(parsed, true);
+            atomicWrite(operation / L"journal.json",
+                        std::string(json.toRawUTF8(), json.getNumBytesAsUTF8()));
+            std::error_code timeError;
+            std::filesystem::last_write_time(operation / L"journal.json",
+                std::filesystem::file_time_type::clock::now()
+                    - std::chrono::minutes(ageMinutes), timeError);
+            require(! timeError, "Cannot timestamp historical cleanup fixture");
+        };
+
+        const auto terminal = makeOperation(Phase::noUpdate, 40).second;
+        const auto old = makeOperation(Phase::metadata, 30).second;
+        const auto [newestId, newest] = makeOperation(Phase::downloaded, 10);
+        const auto active = makeOperation(Phase::metadata, 20).second;
+        const auto invalidOperation = cleanupRoot / widen(newOperationId());
+        createPrivateDirectory(invalidOperation, true);
+        atomicWrite(invalidOperation / L"journal.json", "not-json");
+        auto activeLease = lockDirectoryAgainstReplacement(active, "Active cleanup fixture");
+        const auto retained = cleanupOldOperations(cleanupRoot, true);
+        require(retained == newestId && ! std::filesystem::exists(terminal)
+                    && ! std::filesystem::exists(old) && std::filesystem::exists(newest)
+                    && std::filesystem::exists(active) && std::filesystem::exists(invalidOperation),
+                "Cleanup retention, terminal removal, or fail-closed validation failed");
+        activeLease.reset();
+        (void) cleanupOldOperations(cleanupRoot, true);
+        require(! std::filesystem::exists(active), "Inactive old operation was retained");
+
+        const auto historicalVersion = kInstalledVersion == "0.0.0" ? "0.0.1" : "0.0.0";
+        const auto [historicalIncompleteId, historicalIncomplete] =
+            makeOperation(Phase::metadata, 1);
+        const auto historicalTerminal = makeOperation(Phase::verified, 2).second;
+        const auto futureOperation = makeOperation(Phase::verified, 3).second;
+        rewriteWriterVersion(historicalIncomplete, historicalVersion, 1);
+        rewriteWriterVersion(historicalTerminal, historicalVersion, 2);
+        rewriteWriterVersion(futureOperation, "255.255.65535", 3);
+        bool historicalResumeDenied{};
+        try
+        {
+            (void) readJournal(historicalIncomplete, historicalIncompleteId,
+                               JournalReadPurpose::resume);
+        }
+        catch (const Failure&) { historicalResumeDenied = true; }
+        require(historicalResumeDenied,
+                "A journal from another helper version was accepted for recovery");
+        const auto retainedAfterHistoricalCleanup = cleanupOldOperations(cleanupRoot, true);
+        require(retainedAfterHistoricalCleanup == newestId
+                    && ! std::filesystem::exists(historicalIncomplete)
+                    && ! std::filesystem::exists(historicalTerminal)
+                    && std::filesystem::exists(futureOperation),
+                "Historical cleanup or future-version fail-closed retention failed");
+
+        const auto [payloadId, payloadOperation] = makeOperation(Phase::verified, 5);
+        const auto target = *parseVersion("2.3.4");
+        const auto msi = payloadOperation
+            / widen(expectedAssetName(kProduct, target, kArchitecture));
+        atomicWrite(msi, "m");
+        atomicWrite(payloadOperation / L"download.part", "p");
+        createPrivateDirectory(payloadOperation / L"private-temp", true);
+        createPrivateDirectory(payloadOperation / L"private-temp" / L"administrative-image", true);
+        atomicWrite(payloadOperation / L"private-temp" / L"administrative-image" / L"payload.bin", "x");
+        const auto copiedUpdater = payloadOperation / (widen(kProduct) + L"Updater.exe");
+        atomicWrite(copiedUpdater, "u");
+        const auto outside = cleanupRoot / L"outside";
+        createPrivateDirectory(outside, true);
+        atomicWrite(outside / L"sentinel.bin", "safe");
+        require(CreateSymbolicLinkW((payloadOperation / L"private-temp" / L"escape").c_str(),
+                                    outside.c_str(), SYMBOLIC_LINK_FLAG_DIRECTORY
+                                        | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE),
+                winError("Cannot create cleanup reparse fixture"));
+        const auto unexpected = payloadOperation / L"unexpected.bin";
+        atomicWrite(unexpected, "hold");
+        const auto journalCaseTemporary = payloadOperation / L"journal-case.tmp";
+        require(MoveFileExW((payloadOperation / L"journal.json").c_str(),
+                            journalCaseTemporary.c_str(), MOVEFILE_WRITE_THROUGH)
+                    && MoveFileExW(journalCaseTemporary.c_str(),
+                                   (payloadOperation / L"JOURNAL.JSON").c_str(),
+                                   MOVEFILE_WRITE_THROUGH),
+                winError("Cannot create case-variant cleanup journal fixture"));
+        Handle heldMsi(CreateFileW(msi.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+        Handle heldUnexpected(CreateFileW(unexpected.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+        require(heldMsi.valid(), "Cannot lock cleanup MSI fixture");
+        require(heldUnexpected.valid(), "Cannot lock unexpected cleanup fixture");
+        const auto payloadJournal = readJournal(payloadOperation, payloadId, JournalReadPurpose::resume);
+        cleanupVerifiedPayload(payloadOperation, payloadJournal);
+        require(std::filesystem::exists(msi)
+                    && ! std::filesystem::exists(payloadOperation / L"download.part")
+                    && ! std::filesystem::exists(payloadOperation / L"private-temp")
+                    && std::filesystem::exists(payloadOperation / L"journal.json")
+                    && std::filesystem::exists(copiedUpdater)
+                    && std::filesystem::exists(outside / L"sentinel.bin"),
+                "Best-effort payload cleanup escaped containment or removed recovery state");
+        (void) cleanupOldOperations(cleanupRoot, true);
+        require(readJournal(payloadOperation, payloadId, JournalReadPurpose::resume).phase == Phase::verified
+                    && std::filesystem::exists(copiedUpdater),
+                "Locked MSI cleanup destroyed its valid recovery state");
+        heldMsi.reset();
+        (void) cleanupOldOperations(cleanupRoot, true);
+        require(readJournal(payloadOperation, payloadId, JournalReadPurpose::resume).phase == Phase::verified
+                    && std::filesystem::exists(copiedUpdater)
+                    && std::filesystem::exists(unexpected),
+                "Locked unexpected child destroyed its valid recovery state");
+        heldUnexpected.reset();
+        (void) cleanupOldOperations(cleanupRoot, true);
+        require(! std::filesystem::exists(payloadOperation)
+                    && std::filesystem::exists(outside / L"sentinel.bin"),
+                "Unlocked operation was not fully removed or cleanup escaped containment");
         return 0;
     }
     catch (...)

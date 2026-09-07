@@ -17,6 +17,7 @@ param(
     [string] $OutputDirectory = (Join-Path $PSScriptRoot '..\dist\windows'),
     [string[]] $UpdaterPath = @(),
     [string] $ExpectedSignerSha256,
+    [string] $ExpectedNextSignerSha256,
     [string] $HostTestPath,
     [string] $DumpbinPath,
     [string] $SignToolPath,
@@ -674,7 +675,7 @@ function Invoke-Wix {
         $exitCode = $LASTEXITCODE
         $output | ForEach-Object { Write-Host $_ }
         if ($exitCode -ne 0) {
-            throw "WiX failed with exit code $exitCode: $($Arguments -join ' ')"
+            throw "WiX failed with exit code ${exitCode}: $($Arguments -join ' ')"
         }
         return $output
     }
@@ -1282,13 +1283,14 @@ function Invoke-UpdaterBuildContract {
         [string] $PayloadArchitecture,
         [string] $CurrentUpgradeCode,
         [string] $OtherUpgradeCode,
-        [string] $SignerSha256
+        [string] $CurrentSignerSha256,
+        [string] $NextSignerSha256
     )
     $challenge = New-CryptographicHex 32
     $pipeName = 'WhykikiAudio.UpdaterBuildContract.' + (New-CryptographicHex 16)
     $parentProcessId = [Convert]::ToString($PID, 10)
     $expectedResponse = '{"schema":"whykiki.windows-updater-build-contract",' +
-        '"schemaVersion":1,"challenge":"' + $challenge + '",' +
+        '"schemaVersion":2,"challenge":"' + $challenge + '",' +
         '"serverProcessId":' + $parentProcessId + ',' +
         '"buildMode":"production","compileOnly":false,' +
         '"product":"' + $Product + '","version":"' + $ProductVersion + '",' +
@@ -1298,7 +1300,8 @@ function Invoke-UpdaterBuildContract {
         '"architecture":"' + $PayloadArchitecture + '",' +
         '"upgradeCode":"' + $CurrentUpgradeCode + '",' +
         '"otherUpgradeCode":"' + $OtherUpgradeCode + '",' +
-        '"signerSha256":"' + $SignerSha256 + '"}' + "`n"
+        '"currentSignerSha256":"' + $CurrentSignerSha256 + '",' +
+        '"nextSignerSha256":"' + $NextSignerSha256 + '"}' + "`n"
     [byte[]] $expectedBytes = [System.Text.UTF8Encoding]::new($false).GetBytes($expectedResponse)
     Assert-Condition ($expectedBytes.Length -le 4096) `
         'Expected updater build-contract response exceeds the fixed transport bound.'
@@ -1334,7 +1337,8 @@ function Invoke-UpdaterBuildContract {
             '--architecture', $PayloadArchitecture,
             '--upgrade-code', $CurrentUpgradeCode,
             '--other-upgrade-code', $OtherUpgradeCode,
-            '--signer-sha256', $SignerSha256
+            '--current-signer-sha256', $CurrentSignerSha256,
+            '--next-signer-sha256', $NextSignerSha256
         )) {
             $startInfo.ArgumentList.Add($argument)
         }
@@ -1498,7 +1502,7 @@ $updaterRelativePaths = @($updaterRelativePaths.ToArray() | Sort-Object -Unique)
 if ($AllowUnsigned) {
     Assert-Condition (-not $CertificateThumbprint -and -not $CertificateSubject -and -not $TimestampUrl -and
                       -not $SignToolPath -and -not $UseMachineCertificateStore -and
-                      -not $ExpectedSignerSha256) `
+                      -not $ExpectedSignerSha256 -and -not $ExpectedNextSignerSha256) `
         'Do not pass signing options together with -AllowUnsigned.'
 } else {
     Assert-Condition ($SourceCommit -cmatch '^[0-9a-f]{40}$') `
@@ -1513,6 +1517,13 @@ if ($AllowUnsigned) {
     $ExpectedSignerSha256 = $ExpectedSignerSha256.Replace(' ', '').ToUpperInvariant()
     Assert-Condition ($ExpectedSignerSha256 -match '^[0-9A-F]{64}$') `
         'Production mode requires the exact 64-hex -ExpectedSignerSha256 compiled into the updater.'
+    $ExpectedNextSignerSha256 = ([string]$ExpectedNextSignerSha256).Replace(' ', '').ToUpperInvariant()
+    Assert-Condition ([string]::IsNullOrEmpty($ExpectedNextSignerSha256) -or
+                      $ExpectedNextSignerSha256 -cmatch '^[0-9A-F]{64}$') `
+        'ExpectedNextSignerSha256 must be empty or exactly 64 hexadecimal characters.'
+    Assert-Condition ([string]::IsNullOrEmpty($ExpectedNextSignerSha256) -or
+                      $ExpectedNextSignerSha256 -cne $ExpectedSignerSha256) `
+        'ExpectedNextSignerSha256 must differ from the current ExpectedSignerSha256.'
     Assert-Condition ($UpdaterPath.Count -eq 1 -and $updaterRelativePaths.Count -eq 1 -and
                       $updaterRelativePaths[0] -ceq "Contents\Helpers\$($productName)Updater.exe") `
         'Production packages require exactly the product updater at Contents\Helpers\<Product>Updater.exe.'
@@ -1625,7 +1636,7 @@ try {
     if (-not $AllowUnsigned) {
         Invoke-UpdaterBuildContract (Join-Path $stagedBundle $updaterRelativePaths[0]) `
             $productName $Version $manufacturer $githubOwner $githubRepository $Architecture `
-            $upgradeCode $otherUpgradeCode $ExpectedSignerSha256
+            $upgradeCode $otherUpgradeCode $ExpectedSignerSha256 $ExpectedNextSignerSha256
     }
 
     [string[]] $signableRelativePaths = @($payloadContract.PortableExecutablePaths)
@@ -1802,7 +1813,7 @@ try {
             [System.Security.Cryptography.SHA256]::HashData($timestampBytes))
     }
     $evidence = [ordered]@{
-        schemaVersion = 2
+        schemaVersion = 3
         artifactStatus = if ($AllowUnsigned) { 'UNSIGNED-NOT-FOR-DISTRIBUTION' } else { 'SIGNED' }
         product = $productName
         version = $Version
@@ -1819,7 +1830,19 @@ try {
         msiSha256 = (Get-FileHash -LiteralPath $candidateMsi -Algorithm SHA256).Hash.ToUpperInvariant()
         signed = -not $AllowUnsigned
         signerCertificateSha256 = $signerCertificateSha256
-        updaterSignerPinSha256 = if ($AllowUnsigned) { $null } else { $ExpectedSignerSha256 }
+        updaterCurrentSignerSha256 = if ($AllowUnsigned) { $null } else { $ExpectedSignerSha256 }
+        updaterNextSignerSha256 = if ($AllowUnsigned -or [string]::IsNullOrEmpty($ExpectedNextSignerSha256)) {
+            $null
+        } else {
+            $ExpectedNextSignerSha256
+        }
+        payloadSignerAllowlistSha256 = if ($AllowUnsigned) {
+            @()
+        } elseif ([string]::IsNullOrEmpty($ExpectedNextSignerSha256)) {
+            @($ExpectedSignerSha256)
+        } else {
+            @($ExpectedSignerSha256, $ExpectedNextSignerSha256)
+        }
         signingDigest = if ($AllowUnsigned) { $null } else { 'SHA256' }
         timestampProtocol = if ($AllowUnsigned) { $null } else { 'RFC3161-SHA256' }
         timestampUrlSha256 = $timestampUrlHash

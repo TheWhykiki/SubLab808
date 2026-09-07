@@ -16,6 +16,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 PRODUCT = ROOT.name
 CI_WORKFLOW = "build.yml" if PRODUCT == "SubLab808" else "ci.yml"
 SIGNER = "A1" * 32
+NEXT_SIGNER = "D5" * 32
 APPLICATION_SIGNER = "B2" * 32
 INSTALLER_SIGNER = "C3" * 32
 TAG_COMMIT = "1" * 40
@@ -39,6 +40,11 @@ class WindowsReleaseContractTests(unittest.TestCase):
         )
         cls.ci = (ROOT / ".github" / "workflows" / CI_WORKFLOW).read_text(encoding="utf-8")
         cls.docs = (ROOT / "WINDOWS_RELEASE.md").read_text(encoding="utf-8")
+        cls.package_config = json.loads(
+            (ROOT / "Installer" / "Windows" / "package-config.json").read_text(
+                encoding="utf-8"
+            )
+        )
         cls.validator = load_module(
             "windows_release_validator", "validate-windows-release-assets.py"
         )
@@ -75,6 +81,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "artifact_arch: x64",
             "artifact_arch: arm64ec",
             f"-D{PRODUCT.upper()}_WINDOWS_UPDATER_SIGNER_SHA256:STRING=$env:WK_SIGNER_SHA256",
+            f"-D{PRODUCT.upper()}_WINDOWS_UPDATER_NEXT_SIGNER_SHA256:STRING=$env:WK_NEXT_SIGNER_SHA256",
             f"{PRODUCT}_VST3 {PRODUCT}WindowsUpdater",
             f"Contents/Helpers/{PRODUCT}Updater.exe",
             "WindowsUpdaterPolicyTests",
@@ -89,12 +96,14 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "secrets.WINDOWS_CODE_SIGNING_PFX_BASE64",
             "secrets.WINDOWS_CODE_SIGNING_PFX_PASSWORD",
             "vars.WINDOWS_CODE_SIGNING_CERT_SHA256",
+            "vars.WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256",
             "vars.WINDOWS_RFC3161_TIMESTAMP_URL",
             "Import-PfxCertificate",
             "X509EnhancedKeyUsageExtension",
             "1.3.6.1.5.5.7.3.3",
             "HashAlgorithmName]::SHA256",
             "$actualPin -cne $env:WK_SIGNER_SHA256",
+            "$nextPin -and $nextPin -ceq $pin",
             "PFX must contain exactly one private-key leaf certificate",
             "SetAccessRuleProtection($true, $false)",
             "FileSystemRights]::FullControl",
@@ -110,19 +119,70 @@ class WindowsReleaseContractTests(unittest.TestCase):
     def test_packager_receives_complete_signed_production_contract(self) -> None:
         for token in (
             "scripts/build-windows-installer.ps1",
-            "-UpdaterPath $updater",
-            "-SourceCommit $env:WK_TAG_COMMIT",
-            "-ExpectedSignerSha256 $env:WK_SIGNER_SHA256",
-            "-HostTestPath $hostTest",
-            "-SignToolPath $signTool",
-            "-CertificateThumbprint $env:WK_CERT_THUMBPRINT",
-            "-CertificateStoreName $env:WK_CERT_STORE_NAME",
-            "-TimestampUrl $env:TIMESTAMP_URL",
+            "UpdaterPath = $updater",
+            "SourceCommit = $env:WK_TAG_COMMIT",
+            "ExpectedSignerSha256 = $env:WK_SIGNER_SHA256",
+            "$buildArguments['ExpectedNextSignerSha256'] = $env:WK_NEXT_SIGNER_SHA256",
+            "HostTestPath = $hostTest",
+            "SignToolPath = $signTool",
+            "CertificateThumbprint = $env:WK_CERT_THUMBPRINT",
+            "CertificateStoreName = $env:WK_CERT_STORE_NAME",
+            "TimestampUrl = $env:TIMESTAMP_URL",
             "scripts/validate-windows-release-assets.py",
-            "--source-commit $env:WK_TAG_COMMIT",
+            "'--source-commit', $env:WK_TAG_COMMIT",
+            "@('--expected-next-signer-sha256', $env:WK_NEXT_SIGNER_SHA256)",
         ):
             self.assertIn(token, self.release)
         self.assertNotIn("-AllowUnsigned", self.release)
+
+    def test_empty_next_pin_is_omitted_from_native_argument_lists(self) -> None:
+        guard = "if (-not [string]::IsNullOrEmpty($env:WK_NEXT_SIGNER_SHA256))"
+        self.assertEqual(self.release.count(guard), 3)
+        for token in (
+            "& ./scripts/build-windows-installer.ps1 @buildArguments",
+            "& python @validatorArguments",
+            "& ./scripts/test-windows-installer.ps1 @acceptanceArguments",
+        ):
+            self.assertIn(token, self.release)
+        self.assertNotIn("-ExpectedNextSignerSha256 $env:WK_NEXT_SIGNER_SHA256", self.release)
+        self.assertNotIn("--expected-next-signer-sha256 $env:WK_NEXT_SIGNER_SHA256", self.release)
+
+    def test_signed_msi_is_installed_loaded_and_removed_before_upload(self) -> None:
+        for token in (
+            "Install, load and uninstall signed Windows MSI",
+            "scripts/test-windows-installer.ps1",
+            "MsiPath = $msi",
+            "EvidencePath = $evidence",
+            "HostTestPath = $hostTest",
+            f"Product = '{PRODUCT}'",
+            "Architecture = '${{ matrix.artifact_arch }}'",
+            "ExpectedMsiArchitecture = '${{ matrix.msi_architecture }}'",
+            "ExpectedVersion = $env:WK_RELEASE_VERSION",
+            "ExpectedManufacturer = 'Whykiki Audio'",
+            "ExpectedUpgradeCode = '${{ matrix.upgrade_code }}'",
+            "ExpectedOtherArchitectureUpgradeCode = '${{ matrix.other_architecture_upgrade_code }}'",
+            "ExpectedSignerSha256 = $env:WK_SIGNER_SHA256",
+            "$acceptanceArguments['ExpectedNextSignerSha256'] = $env:WK_NEXT_SIGNER_SHA256",
+        ):
+            self.assertIn(token, self.release)
+        validator = self.release.index("scripts/validate-windows-release-assets.py")
+        acceptance = self.release.index("scripts/test-windows-installer.ps1")
+        upload = self.release.index("- name: Upload signed release candidate")
+        self.assertLess(validator, acceptance)
+        self.assertLess(acceptance, upload)
+        self.assertIn("msi_architecture: x64", self.release)
+        self.assertIn("msi_architecture: arm64", self.release)
+        for architecture, msi_architecture in (("x64", "x64"), ("arm64ec", "arm64")):
+            other = "arm64ec" if architecture == "x64" else "x64"
+            self.assertRegex(
+                self.release,
+                rf"- artifact_arch: {architecture}\n"
+                rf"\s+msi_architecture: {msi_architecture}\n"
+                rf"\s+upgrade_code: {self.package_config['upgradeCodes'][architecture]}\n"
+                rf"\s+other_architecture_upgrade_code: {self.package_config['upgradeCodes'][other]}\n",
+            )
+        for limitation in ("N-1→N", "Downgrade", "x64↔ARM64EC", "separate Release-Gates"):
+            self.assertIn(limitation, self.docs)
 
     def test_release_is_staged_complete_then_published_once(self) -> None:
         self.assertEqual(self.release.count("contents: write"), 1)
@@ -222,6 +282,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
         self.assertEqual(self.release.count("retention-days: 1"), 2)
         self.assertEqual(self.release.count("APPLICATION_SIGNER_SHA256:"), 2)
         self.assertEqual(self.release.count("INSTALLER_SIGNER_SHA256:"), 2)
+        self.assertEqual(self.release.count("\n      NEXT_SIGNER_SHA256:"), 2)
         self.assertNotIn(f"{PRODUCT}-$version-Windows-SHA256SUMS.txt", self.release)
         self.assertLess(
             self.release.index("unset APPLICATION_P12_BASE64"),
@@ -241,7 +302,9 @@ class WindowsReleaseContractTests(unittest.TestCase):
         self.assertGreaterEqual(self.ci.count(expected), 2)
         self.assertNotIn(f"{PRODUCT}-VST3-Windows-", self.ci)
 
-    def _write_candidate(self, directory: pathlib.Path, architecture: str) -> pathlib.Path:
+    def _write_candidate(
+        self, directory: pathlib.Path, architecture: str, next_signer: str = NEXT_SIGNER
+    ) -> pathlib.Path:
         version = "1.2.3"
         base = f"{PRODUCT}-{version}-Windows-{architecture}"
         msi = directory / f"{base}.msi"
@@ -251,7 +314,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
         )
         other_architecture = "arm64ec" if architecture == "x64" else "x64"
         evidence = {
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "artifactStatus": "SIGNED",
             "product": PRODUCT,
             "version": version,
@@ -268,7 +331,9 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "msiSha256": hashlib.sha256(msi.read_bytes()).hexdigest().upper(),
             "signed": True,
             "signerCertificateSha256": SIGNER,
-            "updaterSignerPinSha256": SIGNER,
+            "updaterCurrentSignerSha256": SIGNER,
+            "updaterNextSignerSha256": next_signer or None,
+            "payloadSignerAllowlistSha256": [SIGNER] + ([next_signer] if next_signer else []),
             "signingDigest": "SHA256",
             "timestampProtocol": "RFC3161-SHA256",
             "timestampUrlSha256": "A7" * 32,
@@ -378,14 +443,14 @@ class WindowsReleaseContractTests(unittest.TestCase):
             directory = pathlib.Path(temporary)
             evidence_path = self._write_candidate(directory, "x64")
             self.validator.validate_assets(
-                directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, ("x64",)
+                directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, NEXT_SIGNER, ("x64",)
             )
             evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
             evidence["msiSha256"] = "00" * 32
             evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
             with self.assertRaises(self.validator.ContractError):
                 self.validator.validate_assets(
-                    directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, ("x64",)
+                    directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, NEXT_SIGNER, ("x64",)
                 )
 
     def test_asset_validator_rejects_missing_other_architecture(self) -> None:
@@ -394,7 +459,8 @@ class WindowsReleaseContractTests(unittest.TestCase):
             self._write_candidate(directory, "x64")
             with self.assertRaises(self.validator.ContractError):
                 self.validator.validate_assets(
-                    directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, ("x64", "arm64ec")
+                    directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, NEXT_SIGNER,
+                    ("x64", "arm64ec")
                 )
 
     def test_asset_validator_rejects_a_different_source_commit(self) -> None:
@@ -403,14 +469,15 @@ class WindowsReleaseContractTests(unittest.TestCase):
             self._write_candidate(directory, "x64")
             with self.assertRaises(self.validator.ContractError):
                 self.validator.validate_assets(
-                    directory, PRODUCT, "1.2.3", "0" * 40, SIGNER, ("x64",)
+                    directory, PRODUCT, "1.2.3", "0" * 40, SIGNER, NEXT_SIGNER, ("x64",)
                 )
 
     def test_asset_validator_rejects_out_of_range_msi_version(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaises(self.validator.ContractError):
                 self.validator.validate_assets(
-                    pathlib.Path(temporary), PRODUCT, "256.0.0", TAG_COMMIT, SIGNER, ("x64",)
+                    pathlib.Path(temporary), PRODUCT, "256.0.0", TAG_COMMIT, SIGNER,
+                    NEXT_SIGNER, ("x64",)
                 )
 
     def test_asset_validator_rejects_incomplete_updater_and_msi_policy_evidence(self) -> None:
@@ -429,8 +496,33 @@ class WindowsReleaseContractTests(unittest.TestCase):
                 evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
                 with self.assertRaises(self.validator.ContractError):
                     self.validator.validate_assets(
-                        directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, ("x64",)
+                        directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, NEXT_SIGNER,
+                        ("x64",)
                     )
+
+    def test_asset_validator_binds_one_or_two_unique_ordered_signer_pins(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            self._write_candidate(directory, "x64", "")
+            self.validator.validate_assets(
+                directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, "", ("x64",)
+            )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            evidence_path = self._write_candidate(directory, "x64")
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            evidence["payloadSignerAllowlistSha256"] = [NEXT_SIGNER, SIGNER]
+            evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+            with self.assertRaises(self.validator.ContractError):
+                self.validator.validate_assets(
+                    directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, NEXT_SIGNER, ("x64",)
+                )
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(self.validator.ContractError):
+                self.validator.validate_assets(
+                    pathlib.Path(temporary), PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, SIGNER,
+                    ("x64",)
+                )
 
     def _write_macos_pipeline_candidate(self, candidate: pathlib.Path) -> None:
         version = "1.2.3"

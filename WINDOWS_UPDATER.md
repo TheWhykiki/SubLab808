@@ -17,14 +17,18 @@ byte-identical between repositories.
 | SubLab808 | `TheWhykiki/SubLab808` | CMake project version | `SubLab808-VERSION-Windows-x64.msi`, `SubLab808-VERSION-Windows-arm64ec.msi` |
 | ReverseLab | `TheWhykiki/ReverseLab` | CMake project version | `ReverseLab-VERSION-Windows-x64.msi`, `ReverseLab-VERSION-Windows-arm64ec.msi` |
 
-Only `/repos/OWNER/REPOSITORY/releases/latest` is queried. A release must be
-published, non-draft and non-prerelease; its tag must be exactly
-`vMAJOR.MINOR.PATCH`. Versions use Windows Installer's bounds (major/minor
-0–255, patch 0–65535) and must be strictly newer than both the invoking build
-and any system VST3 already present. Exactly one architecture-specific asset is
-accepted. Its browser URL must be the exact repository/tag/name URL, its size
-must be positive and at most 256 MiB, and GitHub must publish a valid
-`sha256:` digest.
+Only the bounded first page
+`/repos/OWNER/REPOSITORY/releases?per_page=100` is queried. Drafts and
+prereleases are ignored. Every published release tag must be exactly
+`vMAJOR.MINOR.PATCH`; duplicate stable tags are rejected. Versions use Windows
+Installer's bounds (major/minor 0–255, patch 0–65535). The updater selects the
+smallest stable version strictly newer than both the invoking build and any
+system VST3 already present, so a certificate-rotation bridge is not skipped in
+favour of the newest release. A page containing all 100 requested records is
+rejected as potentially truncated. For the selected release, exactly one
+architecture-specific asset is accepted. Its browser URL must be the exact
+repository/tag/name URL, its size must be positive and at most 256 MiB, and
+GitHub must publish a valid `sha256:` digest.
 
 WinHTTP follows at most five redirects, manually, over HTTPS port 443. Only the
 exact hosts `api.github.com`, `github.com`, `objects.githubusercontent.com`,
@@ -38,16 +42,18 @@ The plugin-side launcher verifies the bundled helper before `CreateProcessW`
 while holding its non-reparse file handle against replacement. `WinVerifyTrust`
 checks the signed bytes, timestamp and locally available certificate chain with
 revocation disabled for this one UI-thread gate; URL retrieval is cache-only.
-Any local trust error or mismatch with the plugin's exact SHA-256 leaf pin blocks
+Any local trust error or mismatch with the plugin's exact current SHA-256 leaf pin blocks
 launch. This avoids rejecting a valid first-run/offline system merely because it
 has no cached CRL/OCSP response. The standalone updater then performs online
-whole-chain revocation checking for the helper before handoff and for the MSI
-before installation, so unknown or revoked distribution trust still fails closed
-outside the DAW process.
+whole-chain revocation checking. Its running image and every copied image must
+match the exact current pin before any ordinary update work. The downloaded MSI
+may match either that current pin or one optional, distinct next pin. There is no
+certificate subject/issuer-name fallback.
 
 Before elevation, the complete MSI is size/hash checked, held against write or
-replacement, accepted by `WinVerifyTrust`, and bound to the distribution
-certificate's pinned SHA-256 thumbprint. The updater then opens the MSI database
+replacement, accepted by `WinVerifyTrust`, and bound to the one- or two-entry
+payload signer allowlist. Its actual leaf fingerprint becomes the package signer.
+The updater then opens the MSI database
 read-only and verifies exact product, manufacturer, version, architecture,
 ProductCode/UpgradeCodes, per-machine scope and downgrade/other-architecture
 rules. The WiX 6.0.2 Upgrade table must contain exactly the three reviewed rows,
@@ -64,8 +70,17 @@ The verified MSI is administratively extracted through the trusted System32
 alternate data streams, case-colliding paths, executable scripts and foreign
 files outside the one VST3 payload are rejected. `moduleinfo.json` must identify
 the exact product, vendor and version. Every PE inside the bundle must have the
-expected x64 or ARM64EC/ARM64X form and the pinned Authenticode signer. The
-updater records a complete path/size/SHA-256 tree fingerprint.
+expected x64 or ARM64EC/ARM64X form and must use exactly the MSI's actual package
+signer—not merely either allowlisted certificate. The same exact leaf check is
+repeated on the installed payload. The updater records a complete
+path/size/SHA-256 tree fingerprint.
+
+For a rotation from certificate A to B, first publish and retain a bridge release
+whose helper is compiled with current A plus next B and whose complete package is
+still signed by A. Only a later release may switch the helper's current pin and
+package signer to B. Do not delete the bridge release. If it falls outside the
+bounded history or the API page is full, automatic updating fails closed and a
+manually downloaded, independently verified installer is required.
 
 After an explicit reminder to save work and close Cubase, REAPER and all other
 plugin hosts, the updater starts a normal visible `msiexec /i` with UAC. It does
@@ -82,6 +97,31 @@ treated as verified; every resumed phase repeats the relevant hash, signature,
 MSI and payload checks. A current/older release is recorded as the terminal
 `no-update` phase, so it is reported as an informational result and is not later
 offered as a resumable failed installation.
+
+At startup, only the newest valid incomplete journal written by the exact current
+helper version is offered as the recovery candidate. Journals with a strictly
+older canonical helper version are cleanup-only: they can never be resumed by a
+different binary. Journals from a newer helper version fail closed and remain
+untouched. Cleanup attempts to remove historical operations, older
+valid current-version incomplete operations and terminal `verified`/`no-update`
+operations only after an exclusive delete lease proves that no updater process
+has their exact directory pinned. Older active or locked operations may therefore
+remain on disk and are retried on the next run, but are not offered instead of
+the newest current-version candidate. The running copied updater pins its own
+operation before waiting for the product mutex. Invalid, ambiguous, inaccessible
+or reparse-point operations are left untouched. Cleanup appends only enumerated
+single path components and opens every entry with `OPEN_REPARSE_POINT`, so a link
+is deleted as a leaf and is never followed outside the private operation.
+Reserved journal, lock and updater leaf names are classified case-insensitively;
+ambiguous duplicates fail closed. The copied updater and valid journal are
+deleted strictly after every other observed child, preserving cleanup retry
+state when a payload or unexpected child is still locked.
+
+After the installed VST3 has been fully verified, the terminal journal is written
+before best-effort removal of the downloaded MSI, partial download and private
+administrative image. A sharing or cleanup failure cannot turn a verified install
+into a reported failure; the next run retries cleanup. The copied updater, lock
+and journal are deliberately retained until a later inactive-operation cleanup.
 
 ## Build integration contract
 
@@ -106,6 +146,7 @@ target_compile_definitions(${PROJECT_NAME}WindowsUpdater PRIVATE
     WK_WINDOWS_UPDATER_UPGRADE_CODE="${CURRENT_ARCH_UPGRADE_CODE}"
     WK_WINDOWS_UPDATER_OTHER_UPGRADE_CODE="${OTHER_ARCH_UPGRADE_CODE}"
     WK_WINDOWS_UPDATER_SIGNER_SHA256="${DISTRIBUTION_SIGNER_SHA256}"
+    WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256="${OPTIONAL_NEXT_DISTRIBUTION_SIGNER_SHA256}"
     _WIN32_WINNT=0x0A00 WINVER=0x0A00)
 target_link_libraries(${PROJECT_NAME}WindowsUpdater PRIVATE juce::juce_core
     bcrypt comctl32 crypt32 msi shell32 winhttp wintrust advapi32 ole32
@@ -118,11 +159,14 @@ target_link_libraries(${PROJECT_NAME}WindowsUpdater PRIVATE juce::juce_core
 Visual Studio `-A x64` or `-A ARM64EC` as its VST3 and MSI. With an empty
 `SUBLAB808_WINDOWS_UPDATER_SIGNER_SHA256` or
 `REVERSELAB_WINDOWS_UPDATER_SIGNER_SHA256`, CMake deliberately omits the
-production helper and leaves the editor button disabled. A supplied value must
-be exactly 64 hexadecimal characters; the production source independently
-fails compilation without the matching macro. This is the SHA-256 certificate
-fingerprint, not a file digest. The MSI pipeline must Authenticode-sign the
-embedded EXE with that certificate before signing the enclosing MSI.
+production helper and leaves the editor button disabled. This required current
+value must be exactly 64 hexadecimal characters. The corresponding optional
+`*_WINDOWS_UPDATER_NEXT_SIGNER_SHA256` must be empty or a different 64-hex
+fingerprint. The production source independently enforces the same one- or
+two-pin contract. These are SHA-256 certificate fingerprints, not file digests.
+The MSI pipeline signs the bridge's embedded PEs and enclosing MSI with the
+current certificate; the next certificate is only an acceptance pin for the
+following rotation step.
 
 Before signing or packaging a staged production helper, the MSI packager executes
 its pure build-contract gate. The argument order and spellings are intentionally
@@ -130,17 +174,17 @@ fixed; the packager creates a cryptographically random 32-byte challenge and a
 separate random private named-pipe endpoint for every invocation:
 
 ```text
-ProductUpdater.exe --validate-build-contract --challenge 64-HEX --response-pipe WhykikiAudio.UpdaterBuildContract.32-HEX --parent-process-id DECIMAL-PID --product Product --version 1.2.3 --manufacturer "Whykiki Audio" --github-owner TheWhykiki --github-repository Product --architecture x64 --upgrade-code CURRENT-GUID --other-upgrade-code OTHER-GUID --signer-sha256 64-HEX-SHA256
+ProductUpdater.exe --validate-build-contract --challenge 64-HEX --response-pipe WhykikiAudio.UpdaterBuildContract.32-HEX --parent-process-id DECIMAL-PID --product Product --version 1.2.3 --manufacturer "Whykiki Audio" --github-owner TheWhykiki --github-repository Product --architecture x64 --upgrade-code CURRENT-GUID --other-upgrade-code OTHER-GUID --current-signer-sha256 64-HEX-SHA256 --next-signer-sha256 EMPTY-OR-64-HEX-SHA256
 ```
 
 Use `arm64ec` (lowercase) for Windows on Arm. The WIN32-subsystem helper does not
 depend on a console or stdout. It connects only to the supplied pipe, verifies
 that its server is the named parent process, and writes one canonical ASCII/UTF-8
-JSON record ending in a single LF. The record contains schema and schema version,
+JSON record ending in a single LF. Schema version 2 contains
 the exact fresh challenge, server PID, `buildMode=production`,
 `compileOnly=false`, and every compiled identity field: product, version,
 manufacturer, GitHub owner/repository, architecture, both UpgradeCodes and the
-certificate SHA-256 pin.
+exact current and optional-next certificate SHA-256 pins.
 
 The packager owns a one-instance `CurrentUserOnly` byte-mode pipe and uses the OS
 pipe metadata to require that the connected client PID is exactly the updater

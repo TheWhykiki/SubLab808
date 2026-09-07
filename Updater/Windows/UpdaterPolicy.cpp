@@ -170,7 +170,7 @@ std::string expectedAssetUrl(std::string_view owner,
 std::string releasesApiUrl(std::string_view owner, std::string_view repository)
 {
     return "https://api.github.com/repos/" + std::string(owner) + "/"
-         + std::string(repository) + "/releases/latest";
+         + std::string(repository) + "/releases?per_page=100";
 }
 
 bool isForbiddenMsiSideEffectTable(std::string_view table)

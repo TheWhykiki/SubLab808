@@ -101,6 +101,8 @@ Veröffentlichungsweg ist in [WINDOWS_RELEASE.md](WINDOWS_RELEASE.md) beschriebe
 CI baut, extrahiert und lädt beide
 MSI-Nutzlasten nativ; seine Ausgaben tragen zwingend
 `UNSIGNED-NOT-FOR-DISTRIBUTION`. Ein veröffentlichbarer Updater wird erst mit dem
-echten SHA-256-Fingerprint des Distributionszertifikats aktiviert. Zertifikat,
+echten aktuellen SHA-256-Fingerprint des Distributionszertifikats aktiviert; ein
+optionaler, abweichender Next-Pin ermöglicht nur den dokumentierten
+Zwei-Release-Zertifikatswechsel. Zertifikat,
 RFC-3161-Zeitstempel und eine reale Cubase-/REAPER-Abnahme auf Windows bleiben
 verpflichtende Release-Gates.

@@ -3,6 +3,7 @@ import pathlib
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -33,11 +34,24 @@ class WindowsUpdaterContractTests(unittest.TestCase):
                                     timeout=10, check=False)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("PASS: Windows updater portable policy", result.stdout)
+            if os.name == "nt":
+                # Native Windows-on-Arm runners can retain a short-lived loader or
+                # antivirus handle after the process has exited. Keep cleanup
+                # fail-closed, but allow that bounded OS race to settle.
+                for attempt in range(20):
+                    try:
+                        executable.unlink()
+                        break
+                    except PermissionError:
+                        if attempt == 19:
+                            raise
+                        time.sleep(0.1)
 
     def test_production_build_requires_real_signer_pin(self):
         self.assertIn("#if ! WK_WINDOWS_UPDATER_TEST_MODE && ! defined(WK_WINDOWS_UPDATER_SIGNER_SHA256)",
                       self.source)
-        self.assertIn("static_assert(kTestMode || compileTimePinIsValid()", self.source)
+        self.assertIn("static_assert(compileTimePinsAreValid()", self.source)
+        self.assertIn("WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256", self.source)
         self.assertIn("Test mode cannot launch Windows Installer or request elevation", self.source)
         self.assertLess(
             self.source.index('require(! kTestMode, "Test mode cannot launch Windows Installer'),
@@ -50,6 +64,8 @@ class WindowsUpdaterContractTests(unittest.TestCase):
             "kMaximumMsiBytes", "std::chrono::minutes(10)", "isAllowedHttpsHost",
             "browser_download_url", 'getProperty("digest")', "constantTimeEqual",
             "expectedAssetUrl(kOwner, kRepository, kProduct", "releasesApiUrl(kOwner, kRepository)",
+            "releases?per_page=100", "releases->size() < 100",
+            "smallest stable newer version", "potentially truncated release-history page",
         ]
         for token in required:
             self.assertIn(token, self.source)
@@ -124,22 +140,38 @@ class WindowsUpdaterContractTests(unittest.TestCase):
             "FILE_FLAG_OPEN_REPARSE_POINT",
             "FILE_SHARE_READ",
             "GetFileInformationByHandle",
-            "verifyAuthenticode(executable)",
+            "verifyAuthenticodeCurrentSigner(executable)",
             "hashFile(source) == hashFile(executable)",
             "ShellExecuteExW(&launch)",
         ):
             self.assertIn(token, launch)
         self.assertNotIn("FILE_SHARE_WRITE", launch)
         self.assertNotIn("FILE_SHARE_DELETE", launch)
-        self.assertLess(launch.index("verifyAuthenticode(executable)"),
+        self.assertLess(launch.index("verifyAuthenticodeCurrentSigner(executable)"),
                         launch.index("ShellExecuteExW(&launch)"))
+
+    def test_current_self_pin_and_rotating_payload_leaf_are_separate(self):
+        self.assertIn("verifyAuthenticodeCurrentSigner(self);", self.source)
+        self.assertIn("verifyAuthenticodeAllowedPayload(msi)", self.source)
+        self.assertIn("verifyAuthenticodePackageSigner(iterator->path(), packageSigner)", self.source)
+        self.assertIn("const auto packageSigner = verifyDownloadedMsi(expectedMsi, journal);", self.source)
+        self.assertIn("MSI package signer changed during installation", self.source)
+        self.assertIn("PE payload signer differs from the MSI package signer", self.source)
+        self.assertIn("certificateInfo.Issuer = signer->Issuer", self.source)
+        self.assertIn("certificateInfo.SerialNumber = signer->SerialNumber", self.source)
+        self.assertNotIn("CertGetNameString", self.source)
+        normal_start = self.source.index("int runWindowsUpdater()")
+        self_check = self.source.index("verifyAuthenticodeCurrentSigner(self);", normal_start)
+        operations_root = self.source.index("const auto root = localOperationsRoot();", normal_start)
+        self.assertLess(self_check, operations_root)
 
     def test_build_contract_validation_is_side_effect_free_and_compile_only_is_closed(self):
         required = [
             "--validate-build-contract", "--challenge", "--response-pipe",
             "--parent-process-id", "--product", "--version", "--manufacturer",
             "--github-owner", "--github-repository", "--architecture",
-            "--upgrade-code", "--other-upgrade-code", "--signer-sha256",
+            "--upgrade-code", "--other-upgrade-code", "--current-signer-sha256",
+            "--next-signer-sha256", r'\"schemaVersion\":2',
             "buildContractMatches", "WK_WINDOWS_UPDATER_COMPILE_ONLY",
             "whykiki.windows-updater-build-contract", "canonicalBuildContractResponse",
             "GetNamedPipeServerProcessId", "SECURITY_SQOS_PRESENT",
@@ -151,6 +183,8 @@ class WindowsUpdaterContractTests(unittest.TestCase):
         self.assertIn("Build-contract manufacturer mutation was accepted", self.source)
         self.assertIn("Build-contract owner mutation was accepted", self.source)
         self.assertIn("Build-contract repository mutation was accepted", self.source)
+        self.assertIn("Build-contract current-signer mutation was accepted", self.source)
+        self.assertIn("Build-contract next-signer mutation was accepted", self.source)
         self.assertIn("Build-contract challenge validation failed", self.source)
         self.assertIn("Build-contract pipe-name validation failed", self.source)
         dispatch = self.source.index(

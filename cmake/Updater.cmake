@@ -94,6 +94,8 @@ function(wk_add_updater product)
         WK_WINDOWS_UPDATER_OTHER_UPGRADE_CODE="${updater_other_upgrade_code}"
         UNICODE _UNICODE _WIN32_WINNT=0x0A00 WINVER=0x0A00)
     set(updater_libraries juce::juce_core bcrypt comctl32 crypt32 msi ole32 shell32 winhttp wintrust advapi32)
+    set(non_distribution_current_signer "1111111111111111111111111111111111111111111111111111111111111111")
+    set(non_distribution_next_signer "2222222222222222222222222222222222222222222222222222222222222222")
 
     # This target compiles the complete native implementation but is prevented
     # in source from opening files, networking, elevating or installing.
@@ -102,7 +104,10 @@ function(wk_add_updater product)
         Updater/Windows/Updater.manifest ${updater_sources})
     target_include_directories(${product}WindowsUpdaterSelfTests PRIVATE Updater/Windows)
     target_compile_definitions(${product}WindowsUpdaterSelfTests PRIVATE
-        ${updater_definitions} WK_WINDOWS_UPDATER_TEST_MODE=1)
+        ${updater_definitions}
+        WK_WINDOWS_UPDATER_SIGNER_SHA256="${non_distribution_current_signer}"
+        WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256="${non_distribution_next_signer}"
+        WK_WINDOWS_UPDATER_TEST_MODE=1)
     target_link_libraries(${product}WindowsUpdaterSelfTests PRIVATE ${updater_libraries}
         juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
     target_compile_options(${product}WindowsUpdaterSelfTests PRIVATE /W4 /permissive- /utf-8)
@@ -112,13 +117,14 @@ function(wk_add_updater product)
     # Compile the exact production entry point, subsystem and manifest in normal
     # CI even when release credentials are unavailable. This unmistakably named
     # dummy-pin binary is never embedded, packaged, uploaded or executed.
-    set(non_distribution_signer "1111111111111111111111111111111111111111111111111111111111111111")
     add_executable(${product}WindowsUpdaterProductionShape WIN32
         Updater/Windows/main.cpp Updater/Windows/Updater.manifest
         "${updater_version_resource}" ${updater_sources})
     target_include_directories(${product}WindowsUpdaterProductionShape PRIVATE Updater/Windows)
     target_compile_definitions(${product}WindowsUpdaterProductionShape PRIVATE
-        ${updater_definitions} WK_WINDOWS_UPDATER_SIGNER_SHA256="${non_distribution_signer}"
+        ${updater_definitions}
+        WK_WINDOWS_UPDATER_SIGNER_SHA256="${non_distribution_current_signer}"
+        WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256="${non_distribution_next_signer}"
         WK_WINDOWS_UPDATER_COMPILE_ONLY=1)
     target_link_libraries(${product}WindowsUpdaterProductionShape PRIVATE ${updater_libraries}
         juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
@@ -135,7 +141,8 @@ function(wk_add_updater product)
         Tests/WindowsUpdater/LauncherLinkShape.cpp
         Source/UpdaterLauncher.cpp)
     target_compile_definitions(${product}WindowsUpdaterLauncherShape PRIVATE
-        WK_UPDATER_ENABLED=1 WK_WINDOWS_UPDATER_SIGNER_SHA256="${non_distribution_signer}")
+        WK_UPDATER_ENABLED=1
+        WK_WINDOWS_UPDATER_SIGNER_SHA256="${non_distribution_current_signer}")
     target_link_libraries(${product}WindowsUpdaterLauncherShape PRIVATE juce::juce_gui_basics
         crypt32 wintrust
         juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
@@ -156,13 +163,30 @@ function(wk_add_updater product)
     if(NOT updater_signer_length EQUAL 64 OR NOT updater_signer MATCHES "^[0-9A-Fa-f]+$")
         message(FATAL_ERROR "${signer_variable} must be exactly 64 hexadecimal characters")
     endif()
+    string(TOUPPER "${updater_signer}" updater_signer)
+    set(next_signer_variable "${product_upper}_WINDOWS_UPDATER_NEXT_SIGNER_SHA256")
+    set(${next_signer_variable} "" CACHE STRING
+        "Optional next SHA-256 distribution certificate fingerprint accepted for Windows payload rotation")
+    set(updater_next_signer "${${next_signer_variable}}")
+    if(NOT updater_next_signer STREQUAL "")
+        string(LENGTH "${updater_next_signer}" updater_next_signer_length)
+        if(NOT updater_next_signer_length EQUAL 64 OR NOT updater_next_signer MATCHES "^[0-9A-Fa-f]+$")
+            message(FATAL_ERROR "${next_signer_variable} must be empty or exactly 64 hexadecimal characters")
+        endif()
+        string(TOUPPER "${updater_next_signer}" updater_next_signer)
+        if("${updater_next_signer}" STREQUAL "${updater_signer}")
+            message(FATAL_ERROR "${next_signer_variable} must differ from ${signer_variable}")
+        endif()
+    endif()
 
     add_executable(${product}WindowsUpdater WIN32
         Updater/Windows/main.cpp Updater/Windows/Updater.manifest
         "${updater_version_resource}" ${updater_sources})
     target_include_directories(${product}WindowsUpdater PRIVATE Updater/Windows)
     target_compile_definitions(${product}WindowsUpdater PRIVATE
-        ${updater_definitions} WK_WINDOWS_UPDATER_SIGNER_SHA256="${updater_signer}")
+        ${updater_definitions}
+        WK_WINDOWS_UPDATER_SIGNER_SHA256="${updater_signer}"
+        WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256="${updater_next_signer}")
     target_link_libraries(${product}WindowsUpdater PRIVATE ${updater_libraries}
         juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
     target_compile_options(${product}WindowsUpdater PRIVATE /W4 /permissive- /utf-8)
