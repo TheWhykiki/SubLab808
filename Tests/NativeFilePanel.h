@@ -12,9 +12,9 @@ public:
     // The short-lived synthetic host window must not leave an AppKit display-
     // link animation running after the console test exits.
     static void disableAutomaticHostWindowAnimations(void* nativeView);
-    // Drive the real NSApplication loop for a short, explicitly stopped slice.
-    // This keeps AppKit in charge of event ordering between sequential panels.
-    static void runApplicationLoopFor(int millisecondsToRunFor);
+    // Dispatch the relevant AppKit and JUCE modes without re-entering
+    // NSApplication's unbounded top-level run loop.
+    static void dispatchEventsFor(int millisecondsToRunFor);
     static std::unique_ptr<NativeFilePanel> findVisible(bool importing, const char* title);
     static int visibleCount();
     ~NativeFilePanel();

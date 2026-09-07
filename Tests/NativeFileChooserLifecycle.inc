@@ -118,8 +118,9 @@ std::string runNativeFileChooserLifecycle(const juce::File& root, bool importing
     }
     // NSSavePanel visibility and delegate teardown happen before AppKit has
     // necessarily removed the panel and retired beginWithCompletionHandler.
-    // One queue barrier after disappearance ensures the completion event from
-    // that native session cannot race the reopened editor or the next case.
+    // Give pending completion work another full dispatcher turn. Cross-mode
+    // FIFO is not assumed: reopen assertions and the next same-process case
+    // (including the wrap-around sentinel) detect leaked session state.
     pump();
     requireNoModals();
     require(! panel->isAlive() && NativeFilePanel::visibleCount() == 0,
@@ -152,7 +153,7 @@ void checkNativeFileChooserLifecycles(const juce::File& root, const juce::String
             "native chooser tests require an active macOS desktop session");
     require(juce::FileChooser::isPlatformDialogAvailable(), "native chooser platform implementation is available");
     NativeFilePanel::prepareTestApplication();
-    nativeApplicationLoopEnabled = true;
+    nativeFileChooserHarnessEnabled = true;
     int executed = 0;
     for (const bool importing : { true, false })
         for (const auto action : { OwnerAction::hideAncestor, OwnerAction::detach,

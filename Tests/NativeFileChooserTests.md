@@ -8,9 +8,11 @@ with a fake or call an artificial successful import/export callback.
 Each case requires a visible, correctly typed native panel and a live JUCE modal
 before the owner transition. Afterwards the native panel must be hidden, its JUCE
 delegate cleared, removed from `NSApp.windows`, and the JUCE modal destroyed. A
-message-queue barrier then retires the native completion event before the editor
-is reopened. Exact processor state, preset selection, and every file/directory in
-the temporary fixture must remain unchanged.
+full dispatcher turn then gives pending completion work another opportunity to
+run before the editor is reopened; it does not assume FIFO ordering across
+run-loop modes. The next same-process case and wrap-around sentinel detect leaked
+session state. Exact processor state, preset selection, and every file/directory
+in the temporary fixture must remain unchanged.
 The reopened editor must accept a real Save As/Cancel interaction and parameter
 button clicks.
 
@@ -36,18 +38,19 @@ temporary directory containing an input preset and an initially nonexistent expo
 destination; it never confirms a file operation. No DAW, installed bundle, or user
 preset library is modified.
 
-The console harness drives short slices of the real `NSApplication` main event
-loop. JUCE 8.0.15's `runDispatchLoopUntil()` manually combines CFRunLoop and
-AppKit event dispatch; JUCE issue #1574 documents delayed event delivery around
-that boundary, and CI observed those dispatch calls outliving the surrounding
-lifecycle deadlines. Each test-only slice uses an `NSTimer` plus an application
-event to stop the main loop through AppKit's documented path, and invalidates
-the timer when the slice returns. Before its first order-in, the synthetic
-`Preset UI Tests` host window also disables AppKit's automatic order animation;
-otherwise that short-lived console-only window can leave a display-link worker
-running after `main()` exits. Native file-panel animations remain enabled.
-CTest remains the hard watchdog for an event callback itself. This changes no
-product code and relaxes none of the lifecycle assertions above.
+The console harness completes `NSApplication` launch once, then dispatches JUCE
+run-loop sources and only AppKit events that are already available. It never
+re-enters the unbounded top-level `[NSApp run]` for a short slice: an asynchronous
+native-panel completion can outlive that slice's one-shot stop event and strand
+the test outside its C++ deadline. Each bounded iteration waits in the default,
+modal-panel and event-tracking modes for at most one millisecond each and uses
+`distantPast` for non-waiting AppKit dequeue. Before its first order-in, the
+synthetic `Preset UI Tests` host window also disables AppKit's automatic order
+animation; otherwise that short-lived console-only
+window can leave a display-link worker running after `main()` exits. Native
+file-panel animations remain enabled. A callback itself can still block inside
+AppKit, so CTest remains the hard process watchdog. This changes no product code
+and relaxes none of the lifecycle assertions above.
 
 ## Running
 

@@ -443,14 +443,14 @@ juce::Button* findButton(juce::Component& parent, const juce::String& title)
     return nullptr;
 }
 #if JUCE_MAC
-bool nativeApplicationLoopEnabled = false;
+bool nativeFileChooserHarnessEnabled = false;
 #endif
 struct TestWindow final : juce::DocumentWindow
 {
     explicit TestWindow(juce::AudioProcessorEditor& editor)
 #if JUCE_MAC
         : DocumentWindow("Preset UI Tests", juce::Colour(0xff101820), DocumentWindow::closeButton,
-                         ! nativeApplicationLoopEnabled)
+                         ! nativeFileChooserHarnessEnabled)
 #else
         : DocumentWindow("Preset UI Tests", juce::Colour(0xff101820), DocumentWindow::closeButton)
 #endif
@@ -458,7 +458,7 @@ struct TestWindow final : juce::DocumentWindow
         setUsingNativeTitleBar(true); setContentNonOwned(&editor, true);
         centreWithSize(getWidth(), getHeight());
 #if JUCE_MAC
-        if (nativeApplicationLoopEnabled)
+        if (nativeFileChooserHarnessEnabled)
         {
             // Create the native peer without ordering it on screen, then turn
             // off only this short-lived test host's automatic AppKit animation.
@@ -476,9 +476,9 @@ struct TestWindow final : juce::DocumentWindow
 bool dispatchUiEventsFor(int millisecondsToRunFor)
 {
 #if JUCE_MAC
-    if (nativeApplicationLoopEnabled)
+    if (nativeFileChooserHarnessEnabled)
     {
-        NativeFilePanel::runApplicationLoopFor(millisecondsToRunFor);
+        NativeFilePanel::dispatchEventsFor(millisecondsToRunFor);
         return true;
     }
 #endif
