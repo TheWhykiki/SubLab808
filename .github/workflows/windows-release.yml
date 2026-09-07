@@ -61,6 +61,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       PRODUCT: SubLab808
+      WK_INPUT_TAG: ${{ inputs.tag }}
       SIGNER_SHA256: ${{ vars.WINDOWS_CODE_SIGNING_CERT_SHA256 }}
       NEXT_SIGNER_SHA256: ${{ vars.WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256 }}
       TIMESTAMP_URL: ${{ vars.WINDOWS_RFC3161_TIMESTAMP_URL }}
@@ -74,7 +75,7 @@ jobs:
       - name: Verify immutable tag, runner and public release configuration
         shell: pwsh
         run: |
-          $tag = '${{ inputs.tag }}'
+          $tag = $env:WK_INPUT_TAG
           if ($tag -cnotmatch '^v(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,4})$') {
             throw 'Release tag must be exactly vMAJOR.MINOR.PATCH within MSI version bounds.'
           }
@@ -370,6 +371,7 @@ jobs:
       contents: read
     env:
       PRODUCT: SubLab808
+      WK_INPUT_TAG: ${{ inputs.tag }}
       APPLICATION_IDENTITY: ${{ vars.MACOS_DEVELOPER_ID_APPLICATION_IDENTITY }}
       INSTALLER_IDENTITY: ${{ vars.MACOS_DEVELOPER_ID_INSTALLER_IDENTITY }}
       APPLICATION_SIGNER_SHA256: ${{ vars.MACOS_DEVELOPER_ID_APPLICATION_CERT_SHA256 }}
@@ -387,7 +389,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag='${{ inputs.tag }}'
+          tag="$WK_INPUT_TAG"
           [[ "$tag" =~ ^v(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,4})$ ]]
           version="${tag#v}"
           python3 -c 'import sys; p=tuple(map(int,sys.argv[1].split("."))); assert p[0] <= 255 and p[1] <= 255 and p[2] <= 65535' "$version"
@@ -583,6 +585,7 @@ jobs:
       contents: write
     env:
       PRODUCT: SubLab808
+      WK_INPUT_TAG: ${{ inputs.tag }}
       SIGNER_SHA256: ${{ vars.WINDOWS_CODE_SIGNING_CERT_SHA256 }}
       NEXT_SIGNER_SHA256: ${{ vars.WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256 }}
       APPLICATION_IDENTITY: ${{ vars.MACOS_DEVELOPER_ID_APPLICATION_IDENTITY }}
@@ -614,7 +617,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag='${{ inputs.tag }}'
+          tag="$WK_INPUT_TAG"
           [[ "$tag" =~ ^v(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,4})$ ]]
           version="${tag#v}"
           tag_commit="$(git rev-parse "refs/tags/$tag^{commit}")"
@@ -712,7 +715,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag='${{ inputs.tag }}'
+          tag="$WK_INPUT_TAG"
           version="${tag#v}"
           tag_commit="$(git rev-parse "refs/tags/$tag^{commit}")"
           published=false

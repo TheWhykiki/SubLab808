@@ -72,6 +72,19 @@ class WindowsReleaseContractTests(unittest.TestCase):
         self.assertIn(f"group: {PRODUCT}-windows-release\n", self.release)
         self.assertNotIn("windows-release-${{ inputs.tag }}", self.release)
 
+    def test_dispatch_tag_is_never_interpolated_into_shell_source(self) -> None:
+        self.assertEqual(self.release.count("WK_INPUT_TAG: ${{ inputs.tag }}"), 3)
+        self.assertEqual(self.release.count("$tag = $env:WK_INPUT_TAG"), 1)
+        self.assertEqual(self.release.count('tag="$WK_INPUT_TAG"'), 3)
+        allowed_prefixes = ("run-name:", "ref:", "WK_INPUT_TAG:")
+        unsafe_lines = [
+            line
+            for line in self.release.splitlines()
+            if "${{ inputs.tag }}" in line
+            and not line.strip().startswith(allowed_prefixes)
+        ]
+        self.assertEqual(unsafe_lines, [])
+
     def test_native_architectures_and_production_build_are_separate(self) -> None:
         for token in (
             "runner: windows-2022",
