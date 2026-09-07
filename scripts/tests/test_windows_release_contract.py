@@ -10,6 +10,7 @@ import pathlib
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -128,6 +129,10 @@ class WindowsReleaseContractTests(unittest.TestCase):
         for token in ("Bootstrap", "N→N+1", "blockiert", "Vorversion"):
             self.assertIn(token, self.docs)
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "GitHub-hosted Windows resolves bash through optional WSL; POSIX jobs exercise this shell path",
+    )
     def test_nested_post_publish_baseline_failures_propagate_in_bash(self) -> None:
         gate_start = self.release.index("          verify_no_public_windows_release()")
         gate_end = self.release.index("          read_latest_state()", gate_start)
