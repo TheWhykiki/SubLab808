@@ -75,11 +75,15 @@ void NativeFilePanel::dispatchEventsFor(int millisecondsToRunFor)
             const auto remaining = std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count();
             if (remaining <= 0.0) break;
             // JUCE presents this panel asynchronously with a completion handler,
-            // not with an AppKit modal or event-tracking loop. Entering those
-            // specialised modes manually can run a callback past this bounded
-            // slice after the modeless panel has already closed.
+            // not with an AppKit modal or event-tracking loop. The test invokes
+            // controls directly, so it only needs queued run-loop sources plus
+            // AppKit/application-defined lifecycle events. Manually sending an
+            // arbitrary pending NSEvent can enter AppKit's mouse/key tracking
+            // synchronously and outlive this bounded slice.
             CFRunLoopRunInMode(kCFRunLoopDefaultMode, std::min(remaining, 0.001), true);
-            if (NSEvent* event = [NSApp nextEventMatchingMask:NSEventMaskAny
+            constexpr auto lifecycleEventMask = NSEventMaskAppKitDefined
+                                              | NSEventMaskApplicationDefined;
+            if (NSEvent* event = [NSApp nextEventMatchingMask:lifecycleEventMask
                                                      untilDate:[NSDate distantPast]
                                                         inMode:NSDefaultRunLoopMode
                                                        dequeue:YES])

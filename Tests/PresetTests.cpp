@@ -448,21 +448,18 @@ bool nativeFileChooserHarnessEnabled = false;
 struct TestWindow final : juce::DocumentWindow
 {
     explicit TestWindow(juce::AudioProcessorEditor& editor)
-#if JUCE_MAC
-        : DocumentWindow("Preset UI Tests", juce::Colour(0xff101820), DocumentWindow::closeButton,
-                         ! nativeFileChooserHarnessEnabled)
-#else
-        : DocumentWindow("Preset UI Tests", juce::Colour(0xff101820), DocumentWindow::closeButton)
-#endif
+        : DocumentWindow("Preset UI Tests", juce::Colour(0xff101820), DocumentWindow::closeButton, false)
     {
         setUsingNativeTitleBar(true); setContentNonOwned(&editor, true);
         centreWithSize(getWidth(), getHeight());
+        // Configure the title bar, content and initial bounds before creating
+        // the native peer. In particular, X11 window-manager ConfigureNotify
+        // must not race a second peer created by setUsingNativeTitleBar().
+        addToDesktop();
 #if JUCE_MAC
         if (nativeFileChooserHarnessEnabled)
         {
-            // Create the native peer without ordering it on screen, then turn
-            // off only this short-lived test host's automatic AppKit animation.
-            addToDesktop();
+            // Turn off only this short-lived test host's AppKit animation.
             auto* peer = getPeer();
             require(peer != nullptr, "native chooser test host has a desktop peer");
             NativeFilePanel::disableAutomaticHostWindowAnimations(peer->getNativeHandle());
@@ -604,7 +601,10 @@ struct LifecycleEditor
     Processor& processor;
     std::unique_ptr<juce::AudioProcessorEditor> editor;
     std::unique_ptr<TestWindow> window;
-    explicit LifecycleEditor(Processor& p) : processor(p), editor(p.createEditor()), window(std::make_unique<TestWindow>(*editor))
+    explicit LifecycleEditor(Processor& p)
+        : LifecycleEditor(p, std::unique_ptr<juce::AudioProcessorEditor>(p.createEditor())) {}
+    LifecycleEditor(Processor& p, std::unique_ptr<juce::AudioProcessorEditor> preparedEditor)
+        : processor(p), editor(std::move(preparedEditor)), window(std::make_unique<TestWindow>(*editor))
     {
         pump();
         require(editor->isShowing(), "lifecycle owner must initially be showing");
@@ -690,9 +690,12 @@ juce::Button& lifecycleButton(juce::Component& editor, const char* title)
 juce::Component* openManagement(juce::Component& editor)
 {
     lifecycleButton(editor, "Manage presets").onClick();
-    pump();
     auto* menu = juce::Component::getCurrentlyModalComponent();
-    require(menu != nullptr && dynamic_cast<juce::AlertWindow*>(menu) == nullptr
+    // PopupMenu::showMenuAsync creates and enters the menu modally before it
+    // returns. Pumping here can instead service its dismissal timer before the
+    // test captures it when a newly mounted native window is still activating.
+    require(menu != nullptr && menu->isCurrentlyModal()
+            && dynamic_cast<juce::AlertWindow*>(menu) == nullptr
             && dynamic_cast<juce::CallOutBox*>(menu) == nullptr, "real management popup opened");
     return menu;
 }
@@ -809,6 +812,9 @@ void checkOwnerLifecycle(const juce::File& root, LifecycleDialog kind, OwnerActi
     require(dialog.component->isCurrentlyModal() && juce::Component::getNumCurrentlyModalComponents() == 1,
             "one real owned dialog is modal before lifecycle action");
     owner.apply(action);
+    if (kind == LifecycleDialog::management)
+        require(dialog.component == nullptr || ! dialog.component->isCurrentlyModal(),
+                "management popup leaves modal state synchronously with its private owner");
     waitForDeletion(dialog.component, dialogName(kind));
     requireNoModals();
     before.unchanged(processor);

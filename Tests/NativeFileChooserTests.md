@@ -38,18 +38,18 @@ temporary directory containing an input preset and an initially nonexistent expo
 destination; it never confirms a file operation. No DAW, installed bundle, or user
 preset library is modified.
 
-The console harness completes `NSApplication` launch once, then dispatches JUCE
-run-loop sources and only AppKit events that are already available. It never
-re-enters the unbounded top-level `[NSApp run]` for a short slice: an asynchronous
-native-panel completion can outlive that slice's one-shot stop event and strand
-the test outside its C++ deadline. JUCE presents these panels asynchronously with
-a completion handler, so each bounded iteration processes only the default run-loop
-mode for at most one millisecond and uses `distantPast` for non-waiting AppKit
-dequeue. Modal-panel and event-tracking modes remain under AppKit's control instead
-of being entered manually after the modeless panel has closed. Before its first
-order-in, the synthetic `Preset UI Tests` host window also disables AppKit's
-automatic order animation; otherwise that short-lived console-only
-window can leave a display-link worker running after `main()` exits. Native
+The console harness completes `NSApplication` launch once, then dispatches only
+the default JUCE/AppKit run-loop sources. It never re-enters the unbounded top-level
+`[NSApp run]` for a short slice: an asynchronous native-panel completion can outlive
+that slice's one-shot stop event and strand the test outside its C++ deadline. It
+also sends only AppKit/application-defined lifecycle events, never pending user
+input. The tests invoke controls directly, while sending a mouse or key event may
+synchronously enter AppKit tracking and exceed the C++ slice deadline. Modal-panel
+and event-tracking modes remain under AppKit's control instead of being entered
+manually after the modeless panel has closed. Before its first order-in, the
+synthetic `Preset UI Tests` host window also disables AppKit's automatic order
+animation; otherwise that short-lived console-only window can leave a display-link
+worker running after `main()` exits. Native
 file-panel animations remain enabled. A callback itself can still block inside
 AppKit, so CTest remains the hard process watchdog. This changes no product code
 and relaxes none of the lifecycle assertions above.
