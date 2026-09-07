@@ -9,10 +9,10 @@ Each case requires a visible, correctly typed native panel and a live JUCE modal
 before the owner transition. Afterwards the native panel must be hidden, its JUCE
 delegate cleared, removed from `NSApp.windows`, and the JUCE modal destroyed. A
 full dispatcher turn then gives pending completion work another opportunity to
-run before the editor is reopened; it does not assume FIFO ordering across
-run-loop modes. The next same-process case and wrap-around sentinel detect leaked
-session state. Exact processor state, preset selection, and every file/directory
-in the temporary fixture must remain unchanged.
+run before the editor is reopened; one disappearance observation alone is not
+treated as completed teardown. The next same-process case and wrap-around
+sentinel detect leaked session state. Exact processor state, preset selection,
+and every file/directory in the temporary fixture must remain unchanged.
 The reopened editor must accept a real Save As/Cancel interaction and parameter
 button clicks.
 
@@ -42,11 +42,13 @@ The console harness completes `NSApplication` launch once, then dispatches JUCE
 run-loop sources and only AppKit events that are already available. It never
 re-enters the unbounded top-level `[NSApp run]` for a short slice: an asynchronous
 native-panel completion can outlive that slice's one-shot stop event and strand
-the test outside its C++ deadline. Each bounded iteration waits in the default,
-modal-panel and event-tracking modes for at most one millisecond each and uses
-`distantPast` for non-waiting AppKit dequeue. Before its first order-in, the
-synthetic `Preset UI Tests` host window also disables AppKit's automatic order
-animation; otherwise that short-lived console-only
+the test outside its C++ deadline. JUCE presents these panels asynchronously with
+a completion handler, so each bounded iteration processes only the default run-loop
+mode for at most one millisecond and uses `distantPast` for non-waiting AppKit
+dequeue. Modal-panel and event-tracking modes remain under AppKit's control instead
+of being entered manually after the modeless panel has closed. Before its first
+order-in, the synthetic `Preset UI Tests` host window also disables AppKit's
+automatic order animation; otherwise that short-lived console-only
 window can leave a display-link worker running after `main()` exits. Native
 file-panel animations remain enabled. A callback itself can still block inside
 AppKit, so CTest remains the hard process watchdog. This changes no product code

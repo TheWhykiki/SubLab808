@@ -118,9 +118,10 @@ std::string runNativeFileChooserLifecycle(const juce::File& root, bool importing
     }
     // NSSavePanel visibility and delegate teardown happen before AppKit has
     // necessarily removed the panel and retired beginWithCompletionHandler.
-    // Give pending completion work another full dispatcher turn. Cross-mode
-    // FIFO is not assumed: reopen assertions and the next same-process case
-    // (including the wrap-around sentinel) detect leaked session state.
+    // Give pending completion work another full dispatcher turn. One panel
+    // disappearance observation is not treated as completed teardown: reopen
+    // assertions and the next same-process case (including the wrap-around
+    // sentinel) detect leaked session state.
     pump();
     requireNoModals();
     require(! panel->isAlive() && NativeFilePanel::visibleCount() == 0,
