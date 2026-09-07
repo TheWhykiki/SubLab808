@@ -442,13 +442,33 @@ juce::Button* findButton(juce::Component& parent, const juce::String& title)
     for (auto* child : parent.getChildren()) if (auto* result = findButton(*child, title)) return result;
     return nullptr;
 }
+#if JUCE_MAC
+bool nativeApplicationLoopEnabled = false;
+#endif
 struct TestWindow final : juce::DocumentWindow
 {
     explicit TestWindow(juce::AudioProcessorEditor& editor)
+#if JUCE_MAC
+        : DocumentWindow("Preset UI Tests", juce::Colour(0xff101820), DocumentWindow::closeButton,
+                         ! nativeApplicationLoopEnabled)
+#else
         : DocumentWindow("Preset UI Tests", juce::Colour(0xff101820), DocumentWindow::closeButton)
+#endif
     {
         setUsingNativeTitleBar(true); setContentNonOwned(&editor, true);
-        centreWithSize(getWidth(), getHeight()); setVisible(true); toFront(true);
+        centreWithSize(getWidth(), getHeight());
+#if JUCE_MAC
+        if (nativeApplicationLoopEnabled)
+        {
+            // Create the native peer without ordering it on screen, then turn
+            // off only this short-lived test host's automatic AppKit animation.
+            addToDesktop();
+            auto* peer = getPeer();
+            require(peer != nullptr, "native chooser test host has a desktop peer");
+            NativeFilePanel::disableAutomaticHostWindowAnimations(peer->getNativeHandle());
+        }
+#endif
+        setVisible(true); toFront(true);
     }
     ~TestWindow() override { clearContentComponent(); }
     void closeButtonPressed() override { setVisible(false); }
@@ -456,11 +476,13 @@ struct TestWindow final : juce::DocumentWindow
 bool dispatchUiEventsFor(int millisecondsToRunFor)
 {
 #if JUCE_MAC
-    NativeFilePanel::dispatchEventsFor(millisecondsToRunFor);
-    return true;
-#else
-    return juce::MessageManager::getInstance()->runDispatchLoopUntil(millisecondsToRunFor);
+    if (nativeApplicationLoopEnabled)
+    {
+        NativeFilePanel::runApplicationLoopFor(millisecondsToRunFor);
+        return true;
+    }
 #endif
+    return juce::MessageManager::getInstance()->runDispatchLoopUntil(millisecondsToRunFor);
 }
 void pump()
 {

@@ -1,5 +1,4 @@
 #include "NativeFilePanel.h"
-#include <chrono>
 #include <stdexcept>
 #import <AppKit/AppKit.h>
 
@@ -34,45 +33,68 @@ bool NativeFilePanel::isAlive() const
 }
 void NativeFilePanel::prepareTestApplication()
 {
-    // ScopedJuceInitialiser_GUI in a console test does not run NSApplication's
-    // normal launch sequence. Native panels need a genuine activatable app.
+    // ScopedJuceInitialiser_GUI in a console test does not provide an active
+    // regular app. The first controlled NSApplication run slice completes the
+    // launch sequence exactly once; calling finishLaunching here would make
+    // AppKit send its launch notifications again when run starts.
     @autoreleasepool
     {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         if ([NSApp activationPolicy] != NSApplicationActivationPolicyRegular)
             throw std::runtime_error("NATIVE_PANEL_SETUP: test application cannot become a regular GUI process");
-        [NSApp finishLaunching];
     }
 }
-void NativeFilePanel::dispatchEventsFor(int millisecondsToRunFor)
+void NativeFilePanel::disableAutomaticHostWindowAnimations(void* nativeView)
+{
+    @autoreleasepool
+    {
+        auto* view = (NSView*) nativeView;
+        NSWindow* window = view == nil || ! [view isKindOfClass:[NSView class]] ? nil : [view window];
+        if (window == nil || ! [[window title] isEqualToString:@"Preset UI Tests"])
+            throw std::runtime_error("Native panel tests could not resolve their synthetic host window");
+        [window setAnimationBehavior:NSWindowAnimationBehaviorNone];
+    }
+}
+void NativeFilePanel::runApplicationLoopFor(int millisecondsToRunFor)
 {
     if (millisecondsToRunFor < 0)
-        throw std::runtime_error("Native panel event dispatch received a negative duration");
+        throw std::runtime_error("Native panel event loop received a negative duration");
 
-    // This mirrors JUCE's macOS runDispatchLoopUntil() closely, except that
-    // AppKit event retrieval is deliberately non-blocking. JUCE 8.0.15 asks
-    // nextEventMatchingMask() to wait until a date in the future, and JUCE issue
-    // #1574 documents delayed event delivery around that boundary. CI observed
-    // dispatch calls outliving the surrounding lifecycle deadlines. distantPast
-    // removes that avoidable wait and only dequeues an event already available;
-    // CTest remains the hard watchdog for code executed by an event callback.
-    const auto deadline = std::chrono::steady_clock::now()
-                        + std::chrono::milliseconds(millisecondsToRunFor);
-    while (std::chrono::steady_clock::now() < deadline)
+    @autoreleasepool
     {
-        @autoreleasepool
-        {
-            const auto remaining = std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count();
-            if (remaining <= 0.0) break;
-            CFRunLoopRunInMode(kCFRunLoopDefaultMode, remaining < 0.001 ? remaining : 0.001, true);
+        if (![NSThread isMainThread] || [NSApp isRunning])
+            throw std::runtime_error("Native panel tests require a non-nested main NSApplication loop");
 
-            if (NSEvent* event = [NSApp nextEventMatchingMask:NSEventMaskAny
-                                                     untilDate:[NSDate distantPast]
-                                                        inMode:NSDefaultRunLoopMode
-                                                       dequeue:YES])
-                [NSApp sendEvent:event];
-        }
+        // A real NSApplication loop, rather than a private CFRunLoop/sendEvent
+        // approximation, lets AppKit retire one panel session before the next
+        // starts. stop: called by a timer needs an NSEvent to wake the loop, as
+        // documented by AppKit. Invalidating the timer after run returns also
+        // prevents a prematurely ended slice from stopping a later slice.
+        __block bool stopRequested = false;
+        auto* stopTimer = [NSTimer timerWithTimeInterval:millisecondsToRunFor * 0.001
+                                                 repeats:NO
+                                                   block:^(NSTimer*) {
+            stopRequested = true;
+            [NSApp stop:nil];
+            auto* wakeEvent = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
+                                                  location:NSZeroPoint
+                                             modifierFlags:0
+                                                 timestamp:0
+                                              windowNumber:0
+                                                   context:nil
+                                                   subtype:0
+                                                     data1:0
+                                                     data2:0];
+            [NSApp postEvent:wakeEvent atStart:YES];
+        }];
+        [[NSRunLoop mainRunLoop] addTimer:stopTimer forMode:NSRunLoopCommonModes];
+        [NSApp run];
+        [stopTimer invalidate];
+        if (!stopRequested)
+            throw std::runtime_error("Native panel NSApplication loop stopped outside its test slice");
+        if ([NSApp isRunning])
+            throw std::runtime_error("Native panel NSApplication loop remained active after its test slice");
     }
 }
 std::unique_ptr<NativeFilePanel> NativeFilePanel::findVisible(bool importing, const char* title)

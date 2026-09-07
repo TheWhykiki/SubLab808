@@ -9,10 +9,12 @@ class NativeFilePanel final
 {
 public:
     static void prepareTestApplication();
-    // JUCE 8.0.15's macOS runDispatchLoopUntil() includes a potentially waiting
-    // AppKit event-dequeue call. Console tests use non-waiting dequeue here so
-    // their own timeout assertions remain live.
-    static void dispatchEventsFor(int millisecondsToRunFor);
+    // The short-lived synthetic host window must not leave an AppKit display-
+    // link animation running after the console test exits.
+    static void disableAutomaticHostWindowAnimations(void* nativeView);
+    // Drive the real NSApplication loop for a short, explicitly stopped slice.
+    // This keeps AppKit in charge of event ordering between sequential panels.
+    static void runApplicationLoopFor(int millisecondsToRunFor);
     static std::unique_ptr<NativeFilePanel> findVisible(bool importing, const char* title);
     static int visibleCount();
     ~NativeFilePanel();

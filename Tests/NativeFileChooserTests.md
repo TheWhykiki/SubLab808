@@ -36,15 +36,18 @@ temporary directory containing an input preset and an initially nonexistent expo
 destination; it never confirms a file operation. No DAW, installed bundle, or user
 preset library is modified.
 
-The console harness also supplies its own deadline-aware macOS event-pump turn.
-JUCE 8.0.15's `runDispatchLoopUntil()` asks AppKit's
-`nextEventMatchingMask()` to wait until a future date; JUCE issue #1574
-documents delayed event delivery at that boundary, and CI observed dispatch
-calls outliving the surrounding lifecycle deadlines. The test-only bridge keeps
-the bounded CFRunLoop slice but polls AppKit with `distantPast`, removing the
-avoidable wait for nonexistent input. CTest remains the hard watchdog for an
-event callback itself. This changes no product code and relaxes none of the
-lifecycle assertions above.
+The console harness drives short slices of the real `NSApplication` main event
+loop. JUCE 8.0.15's `runDispatchLoopUntil()` manually combines CFRunLoop and
+AppKit event dispatch; JUCE issue #1574 documents delayed event delivery around
+that boundary, and CI observed those dispatch calls outliving the surrounding
+lifecycle deadlines. Each test-only slice uses an `NSTimer` plus an application
+event to stop the main loop through AppKit's documented path, and invalidates
+the timer when the slice returns. Before its first order-in, the synthetic
+`Preset UI Tests` host window also disables AppKit's automatic order animation;
+otherwise that short-lived console-only window can leave a display-link worker
+running after `main()` exits. Native file-panel animations remain enabled.
+CTest remains the hard watchdog for an event callback itself. This changes no
+product code and relaxes none of the lifecycle assertions above.
 
 ## Running
 
@@ -59,11 +62,13 @@ env WHYKIKI_PRESET_TEST_NATIVE_ONLY=1 \
 
 For ReverseLab, use the equivalent `ReverseLabPresetTests` target/executable and
 its configured build directory. CTest registers all eight cases separately for
-precise diagnostics and also runs all eight sequentially in one process. The
-sequential test is required: it detects stale AppKit modal state that process
-isolation would hide. Native UI is kept out of the normal unfiltered PresetTests
-invocation; the existing reentrancy-only and lifecycle-only modes remain
-unchanged.
+precise diagnostics and also runs all eight sequentially in one process. That
+run then repeats the first import/ancestor-hide case as a wrap-around sentinel,
+proving that the final export/hide-then-destroy transition cannot poison the
+next native session. The sequential test is required: it detects stale AppKit
+modal state that process isolation would hide. Native UI is kept out of the
+normal unfiltered PresetTests invocation; the existing reentrancy-only and
+lifecycle-only modes remain unchanged.
 
 To reproduce one isolated case manually, also set
 `WHYKIKI_PRESET_TEST_NATIVE_CASE` to an operation (`import` or `export`) plus

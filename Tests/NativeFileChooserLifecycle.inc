@@ -40,7 +40,7 @@ std::unique_ptr<NativeFilePanel> waitForNativeFilePanel(bool importing)
     }
     throw std::runtime_error("NATIVE_PANEL_SETUP_TIMEOUT: real NSSavePanel/NSOpenPanel did not become visible");
 }
-void checkNativeFileChooserLifecycle(const juce::File& root, bool importing, OwnerAction action)
+std::string runNativeFileChooserLifecycle(const juce::File& root, bool importing, OwnerAction action)
 {
     std::printf("NATIVE_CHOOSER_BEGIN: %s / %s\n", importing ? "Import" : "Export", actionName(action));
     requireNoModals();
@@ -131,6 +131,17 @@ void checkNativeFileChooserLifecycle(const juce::File& root, bool importing, Own
     stateBefore.unchanged(processor);
     checkReopenedControls(owner);
     filesBefore.unchanged(root);
+    return nativeClass;
+}
+void checkNativeFileChooserLifecycle(const juce::File& root, bool importing, OwnerAction action)
+{
+    const auto nativeClass = runNativeFileChooserLifecycle(root, importing, action);
+    // The case-local window, editor and processor are destroyed only when the
+    // helper above returns. Drain teardown queued by those destructors while JUCE
+    // and AppKit are still fully alive, then make PASS cover that boundary too.
+    requireNoModals();
+    require(NativeFilePanel::visibleCount() == 0,
+            "case destruction leaves no visible native file panel");
     std::printf("PASS: native %s / %s [%s]: real panel closed, delegate cleared, modal deleted, state/files unchanged, editor interactive.\n",
                 importing ? "Import" : "Export", actionName(action), nativeClass.c_str());
 }
@@ -141,6 +152,7 @@ void checkNativeFileChooserLifecycles(const juce::File& root, const juce::String
             "native chooser tests require an active macOS desktop session");
     require(juce::FileChooser::isPlatformDialogAvailable(), "native chooser platform implementation is available");
     NativeFilePanel::prepareTestApplication();
+    nativeApplicationLoopEnabled = true;
     int executed = 0;
     for (const bool importing : { true, false })
         for (const auto action : { OwnerAction::hideAncestor, OwnerAction::detach,
@@ -152,6 +164,15 @@ void checkNativeFileChooserLifecycles(const juce::File& root, const juce::String
                                             importing, action);
             ++executed;
         }
+    if (requestedCase.isEmpty())
+    {
+        // Close the cycle: the final export/hide-then-destroy case must not
+        // poison another native session. This sentinel's own transition was
+        // already followed by import/detach at the start of the same process.
+        checkNativeFileChooserLifecycle(root.getChildFile("Wraparound-Import-ancestor-hide"),
+                                        true, OwnerAction::hideAncestor);
+        ++executed;
+    }
     require(executed > 0, "WHYKIKI_PRESET_TEST_NATIVE_CASE names a supported native chooser case");
     std::printf("PASS: %d real native file-chooser lifecycle regression%s.\n",
                 executed, executed == 1 ? "" : "s");
