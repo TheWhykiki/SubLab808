@@ -24,6 +24,13 @@ NSSavePanel* resolvePanel(void* identity)
 
 NativeFilePanel::NativeFilePanel(void* nativePanel) : panel(nativePanel) {}
 NativeFilePanel::~NativeFilePanel() = default;
+bool NativeFilePanel::isAlive() const
+{
+    @autoreleasepool
+    {
+        return resolvePanel(panel) != nil;
+    }
+}
 void NativeFilePanel::prepareTestApplication()
 {
     // ScopedJuceInitialiser_GUI in a console test does not run NSApplication's

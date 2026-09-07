@@ -14,6 +14,7 @@ public:
     ~NativeFilePanel();
     NativeFilePanel(const NativeFilePanel&) = delete;
     NativeFilePanel& operator=(const NativeFilePanel&) = delete;
+    bool isAlive() const;
     bool isVisible() const;
     bool hasDelegate() const;
     std::string className() const;

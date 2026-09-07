@@ -7,8 +7,10 @@ with a fake or call an artificial successful import/export callback.
 
 Each case requires a visible, correctly typed native panel and a live JUCE modal
 before the owner transition. Afterwards the native panel must be hidden, its JUCE
-delegate cleared, and the JUCE modal destroyed. Exact processor state, preset
-selection, and every file/directory in the temporary fixture must remain unchanged.
+delegate cleared, removed from `NSApp.windows`, and the JUCE modal destroyed. A
+message-queue barrier then retires the native completion event before the editor
+is reopened. Exact processor state, preset selection, and every file/directory in
+the temporary fixture must remain unchanged.
 The reopened editor must accept a real Save As/Cancel interaction and parameter
 button clicks.
 

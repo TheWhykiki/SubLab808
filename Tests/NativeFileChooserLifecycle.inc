@@ -105,16 +105,21 @@ void checkNativeFileChooserLifecycle(const juce::File& root, bool importing, Own
     }
     waitForDeletion(nativeModal.component, "native file-chooser modal");
     const auto started = juce::Time::getMillisecondCounterHiRes();
-    while (panel->isVisible() || panel->hasDelegate())
+    while (panel->isVisible() || panel->hasDelegate() || panel->isAlive())
     {
         if (juce::Time::getMillisecondCounterHiRes() - started >= 10000.0)
-            throw std::runtime_error("NATIVE_PANEL_TEARDOWN_TIMEOUT: panel remains visible or retains its JUCE delegate");
+            throw std::runtime_error("NATIVE_PANEL_TEARDOWN_TIMEOUT: panel remains visible, retains its JUCE delegate, or remains in NSApp.windows");
         require(juce::MessageManager::getInstance()->runDispatchLoopUntil(10),
                 "message dispatch stopped before native panel teardown");
     }
+    // NSSavePanel visibility and delegate teardown happen before AppKit has
+    // necessarily removed the panel and retired beginWithCompletionHandler.
+    // One queue barrier after disappearance ensures the completion event from
+    // that native session cannot race the reopened editor or the next case.
     pump();
     requireNoModals();
-    require(NativeFilePanel::visibleCount() == 0, "no native file panel remains visible after owner transition");
+    require(! panel->isAlive() && NativeFilePanel::visibleCount() == 0,
+            "no native file panel remains alive after owner transition");
     stateBefore.unchanged(processor);
     filesBefore.unchanged(root);
     require(! output.exists(), "cancelled export never creates its target");
