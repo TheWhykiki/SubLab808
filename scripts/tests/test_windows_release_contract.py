@@ -8,6 +8,7 @@ import importlib.util
 import json
 import pathlib
 import re
+import shlex
 import subprocess
 import tempfile
 import textwrap
@@ -138,19 +139,20 @@ class WindowsReleaseContractTests(unittest.TestCase):
         )
         for gh_body, python_body, expected in cases:
             with self.subTest(gh=gh_body, python=python_body, expected=expected), tempfile.TemporaryDirectory() as temporary:
+                runner_temp = pathlib.Path(temporary).as_posix()
                 script = f"""
                     set -euo pipefail
-                    RUNNER_TEMP={temporary!r}
+                    RUNNER_TEMP={shlex.quote(runner_temp)}
                     GITHUB_REPOSITORY=TheWhykiki/{PRODUCT}
                     trusted_gate_directory="$RUNNER_TEMP"
-                    PRODUCT={PRODUCT!r}
-                    tag={BOOTSTRAP_TAG!r}
+                    PRODUCT={shlex.quote(PRODUCT)}
+                    tag={shlex.quote(BOOTSTRAP_TAG)}
                     gh() {{ {gh_body}; }}
                     python3() {{ {python_body}; }}
                     {gate}
                     nested() {{ verify_no_public_windows_release 41 || return 1; }}
                     if nested; then actual=success; else actual=failure; fi
-                    test "$actual" = {expected!r}
+                    test "$actual" = {shlex.quote(expected)}
                 """
                 completed = subprocess.run(
                     ["bash", "-c", textwrap.dedent(script)],
