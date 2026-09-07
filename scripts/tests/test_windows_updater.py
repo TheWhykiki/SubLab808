@@ -132,6 +132,28 @@ class WindowsUpdaterContractTests(unittest.TestCase):
         for token in forbidden:
             self.assertNotIn(token, self.source)
 
+    def test_cleanup_uses_handle_pinned_modern_disposition_and_reports_failures(self):
+        start = self.source.index("bool markForDeletion(HANDLE handle)")
+        end = self.source.index("bool safeChildName", start)
+        deletion = self.source[start:end]
+        for token in (
+            "FILE_DISPOSITION_INFO_EX",
+            "FILE_DISPOSITION_FLAG_DELETE",
+            "FILE_DISPOSITION_FLAG_POSIX_SEMANTICS",
+            "FileDispositionInfoEx",
+            "ERROR_INVALID_PARAMETER",
+            "ERROR_INVALID_FUNCTION",
+            "ERROR_NOT_SUPPORTED",
+            "FileDispositionInfo",
+        ):
+            self.assertIn(token, deletion)
+        self.assertLess(deletion.index("FileDispositionInfoEx"),
+                        deletion.rindex("FileDispositionInfo"))
+        self.assertIn("disposition.DeleteFile = TRUE", deletion)
+        self.assertNotIn("DeleteFileW", deletion)
+        self.assertIn("FILE_FLAG_OPEN_REPARSE_POINT", self.source)
+        self.assertIn("Windows updater self-test failed: %s", self.source)
+
     def test_copied_updater_is_locked_and_reverified_until_process_start(self):
         start = self.source.index("void launchCopiedUpdater(")
         end = self.source.index("class ProductMutex", start)

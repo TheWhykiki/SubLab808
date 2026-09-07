@@ -2,8 +2,9 @@
 #include <memory>
 #include <string>
 
-// Test-only observer for panels owned by this process. Retaining a panel keeps
-// observation safe after JUCE closes/releases it; no other app is inspected.
+// Test-only observer for panels owned by this process. The opaque identity is
+// re-resolved through NSApp's live windows; no panel is retained or dereferenced
+// after removal, and no other app is inspected.
 class NativeFilePanel final
 {
 public:

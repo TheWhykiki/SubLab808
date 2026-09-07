@@ -23,12 +23,13 @@ timer is stopped and member ordering unregisters the watcher before active or
 deferred choosers are destroyed. Thus no callback or native object survives
 into a possible VST3 module unload.
 
-The bridge observes only the test process's own NSApp windows. Panel retention is
-test-only: it permits safe observation after JUCE closes/releases the panel. The
-retained Cocoa object itself is not a deallocation or leak-freedom test. The
-fixture redirects the panel to an isolated temporary directory containing an input
-preset and an initially nonexistent export destination; it never confirms a file
-operation. No DAW, installed bundle, or user preset library is modified.
+The bridge observes only the test process's own NSApp windows. It stores the
+panel's opaque identity and re-resolves it through the live window list on every
+inspection; it deliberately does not retain the panel because JUCE's close-release
+is part of the lifecycle under test. The fixture redirects the panel to an isolated
+temporary directory containing an input preset and an initially nonexistent export
+destination; it never confirms a file operation. No DAW, installed bundle, or user
+preset library is modified.
 
 ## Running
 

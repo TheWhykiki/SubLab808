@@ -177,7 +177,7 @@ function Get-ExpectedPayloadContract {
             "Payload evidence contains a non-canonical SHA-256: $relative"
         try { $length = [long]$entry.size }
         catch { throw "Payload evidence contains an invalid size: $relative" }
-        Assert-Condition ($length -ge 0 -and ([string]$length -ceq ([string]$entry.size)) `
+        Assert-Condition ($length -ge 0 -and ([string]$length -ceq ([string]$entry.size))) `
             "Payload evidence contains a non-canonical size: $relative"
 
         $files.Add($relative, [pscustomobject]@{
@@ -715,4 +715,4 @@ if ($null -ne $primaryError) { $failures.Add("Acceptance failed: $($primaryError
 foreach ($cleanupError in $cleanupErrors) { $failures.Add("Cleanup failed: $cleanupError") }
 if ($failures.Count -gt 0) { throw ($failures -join "`n") }
 
-Write-Host "Installed-MSI acceptance passed for $Product $Architecture: install, exact payload, host load and uninstall."
+Write-Host "Installed-MSI acceptance passed for $Product ${Architecture}: install, exact payload, host load and uninstall."

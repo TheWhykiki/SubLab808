@@ -10,16 +10,20 @@ NSString* checkedUTF8(const char* text)
     if (result == nil) throw std::runtime_error("Native panel test received invalid UTF-8");
     return result;
 }
+
+NSSavePanel* resolvePanel(void* identity)
+{
+    // JUCE uses releasedWhenClosed for these panels, so retaining one here
+    // would change the lifecycle that this bridge is meant to observe.
+    for (NSWindow* window in [NSApp windows])
+        if ((void*) window == identity && [window isKindOfClass:[NSSavePanel class]])
+            return (NSSavePanel*) window;
+    return nil;
+}
 }
 
-NativeFilePanel::NativeFilePanel(void* nativePanel) : panel(nativePanel)
-{
-    [(NSSavePanel*) panel retain];
-}
-NativeFilePanel::~NativeFilePanel()
-{
-    [(NSSavePanel*) panel release];
-}
+NativeFilePanel::NativeFilePanel(void* nativePanel) : panel(nativePanel) {}
+NativeFilePanel::~NativeFilePanel() = default;
 void NativeFilePanel::prepareTestApplication()
 {
     // ScopedJuceInitialiser_GUI in a console test does not run NSApplication's
@@ -59,17 +63,37 @@ int NativeFilePanel::visibleCount()
         return count;
     }
 }
-bool NativeFilePanel::isVisible() const { return [(NSSavePanel*) panel isVisible]; }
-bool NativeFilePanel::hasDelegate() const { return [(NSSavePanel*) panel delegate] != nil; }
+bool NativeFilePanel::isVisible() const
+{
+    @autoreleasepool
+    {
+        auto* candidate = resolvePanel(panel);
+        return candidate != nil && [candidate isVisible];
+    }
+}
+bool NativeFilePanel::hasDelegate() const
+{
+    @autoreleasepool
+    {
+        auto* candidate = resolvePanel(panel);
+        return candidate != nil && [candidate delegate] != nil;
+    }
+}
 std::string NativeFilePanel::className() const
 {
-    @autoreleasepool { return NSStringFromClass([(NSSavePanel*) panel class]).UTF8String; }
+    @autoreleasepool
+    {
+        auto* candidate = resolvePanel(panel);
+        if (candidate == nil) throw std::runtime_error("Native panel disappeared before inspection");
+        return NSStringFromClass([candidate class]).UTF8String;
+    }
 }
 void NativeFilePanel::useFixtureLocation(const std::string& directory, const std::string& filename)
 {
     @autoreleasepool
     {
-        auto* candidate = (NSSavePanel*) panel;
+        auto* candidate = resolvePanel(panel);
+        if (candidate == nil) throw std::runtime_error("Native panel disappeared before fixture setup");
         [candidate setDirectoryURL:[NSURL fileURLWithPath:checkedUTF8(directory.c_str())
                                              isDirectory:YES]];
         [candidate setNameFieldStringValue:checkedUTF8(filename.c_str())];

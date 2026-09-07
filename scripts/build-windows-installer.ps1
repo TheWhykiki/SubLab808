@@ -1679,8 +1679,8 @@ try {
     }
     $signedPayloadContract = Get-PayloadExecutableContract $signedSnapshot $productName `
         $expectedBinaryRelative $AllowUnsigned.IsPresent
-    Assert-Condition (($signedPayloadContract.PortableExecutablePaths -cjoin "`n") -ceq
-                      ($payloadContract.PortableExecutablePaths -cjoin "`n")) `
+    Assert-Condition (($signedPayloadContract.PortableExecutablePaths -join "`n") -ceq
+                      ($payloadContract.PortableExecutablePaths -join "`n")) `
         'Signing changed the classified PE payload set.'
     foreach ($relativePe in $signedPayloadContract.PortableExecutablePaths) {
         Assert-PeArchitecture (Join-Path $stagedBundle $relativePe) $Architecture $dumpbin

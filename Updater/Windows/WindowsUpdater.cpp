@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -751,6 +752,20 @@ Journal readJournal(const Path& operation, std::string_view expectedId,
 
 bool markForDeletion(HANDLE handle)
 {
+    FILE_DISPOSITION_INFO_EX extended{};
+    extended.Flags = FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
+    if (SetFileInformationByHandle(handle, FileDispositionInfoEx,
+                                   &extended, sizeof(extended)) != FALSE)
+        return true;
+    const auto extendedError = GetLastError();
+    if (extendedError != ERROR_INVALID_PARAMETER
+        && extendedError != ERROR_INVALID_FUNCTION
+        && extendedError != ERROR_NOT_SUPPORTED)
+        return false;
+
+    // Older Windows 10 builds may not implement FileDispositionInfoEx. Keep
+    // the handle-based legacy path for those systems without weakening real
+    // sharing/access failures into a pathname-based retry.
     FILE_DISPOSITION_INFO disposition{};
     disposition.DeleteFile = TRUE;
     return SetFileInformationByHandle(handle, FileDispositionInfo,
@@ -2901,8 +2916,14 @@ int runWindowsUpdaterSelfTests()
                 "Unlocked operation was not fully removed or cleanup escaped containment");
         return 0;
     }
+    catch (const std::exception& error)
+    {
+        std::fprintf(stderr, "Windows updater self-test failed: %s\n", error.what());
+        return 1;
+    }
     catch (...)
     {
+        std::fputs("Windows updater self-test failed with an unknown exception\n", stderr);
         return 1;
     }
 }
