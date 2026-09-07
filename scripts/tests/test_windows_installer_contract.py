@@ -79,6 +79,44 @@ if ($errors.Count -ne 0) {
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    @unittest.skipUnless(os.name == "nt", "PowerShell XML adapter requires Windows")
+    def test_nuget_trusted_signer_xml_adapter_contract_on_windows(self) -> None:
+        pwsh = shutil.which("pwsh")
+        self.assertIsNotNone(pwsh, "pwsh is required by the Windows workflows")
+        verifier = r"""
+$ErrorActionPreference = 'Stop'
+[xml] $nuget = Get-Content -LiteralPath $env:WK_NUGET_CONFIG -Raw
+$trustedSigners = @($nuget.SelectNodes('/configuration/trustedSigners/*'))
+$certificates = @($nuget.SelectNodes('/configuration/trustedSigners/author/certificate'))
+if ($trustedSigners.Count -ne 1) { throw 'Expected exactly one trusted signer.' }
+if ($trustedSigners[0].LocalName -cne 'author') { throw 'Trusted signer is not an author.' }
+if ($trustedSigners[0].GetAttribute('name') -cne 'firegiant') { throw 'Wrong author.' }
+if ($certificates.Count -ne 1) { throw 'Expected exactly one trusted certificate.' }
+if ($certificates[0].GetAttribute('fingerprint') -cne $env:WK_NUGET_FINGERPRINT) {
+    throw 'Wrong trusted certificate fingerprint.'
+}
+if ($certificates[0].GetAttribute('hashAlgorithm') -cne 'SHA256') {
+    throw 'Wrong trusted certificate hash algorithm.'
+}
+if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
+    throw 'Trusted certificate permits an untrusted root.'
+}
+"""
+        environment = os.environ.copy()
+        environment["WK_NUGET_CONFIG"] = str(ROOT / "Installer" / "Windows" / "NuGet.Config")
+        environment["WK_NUGET_FINGERPRINT"] = (
+            "D95336DD2022934D80E3F3A4F938DD66EC7076BBBA680F76C11F2B54B346D61D"
+        )
+        result = subprocess.run(
+            [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", verifier],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_wix_is_exactly_pinned_and_signature_trusted(self) -> None:
         self.assertEqual(
             self.tool_manifest,
@@ -103,9 +141,11 @@ if ($errors.Count -ne 0) {
             "https://api.nuget.org/v3/index.json",
             "SelectNodes('/configuration/trustedSigners/author/certificate')",
             "SelectNodes('/configuration/packageSources/clear')",
+            "$trustedSigners[0].LocalName -ceq 'author'",
             "Restored WiX reported",
         ):
             self.assertIn(token, self.script)
+        self.assertNotIn("$trustedSigners[0].Name -ceq 'author'", self.script)
         self.assertIn("WiX failed with exit code ${exitCode}:", self.script)
         self.assertNotIn("WiX failed with exit code $exitCode:", self.script)
 

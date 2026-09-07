@@ -710,7 +710,7 @@ function Restore-PinnedWix {
         'NuGet signature validation must be required.'
     $trustedSigners = @($nuget.SelectNodes('/configuration/trustedSigners/*'))
     $trustedCertificates = @($nuget.SelectNodes('/configuration/trustedSigners/author/certificate'))
-    Assert-Condition ($trustedSigners.Count -eq 1 -and $trustedSigners[0].Name -ceq 'author' -and
+    Assert-Condition ($trustedSigners.Count -eq 1 -and $trustedSigners[0].LocalName -ceq 'author' -and
                       $trustedSigners[0].GetAttribute('name') -ceq 'firegiant' -and
                       $trustedCertificates.Count -eq 1 -and
                       $trustedCertificates[0].GetAttribute('fingerprint') -ceq
