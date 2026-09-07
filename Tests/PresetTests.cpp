@@ -496,13 +496,6 @@ struct TestWindow final : juce::DocumentWindow
 };
 bool dispatchUiEventsFor(int millisecondsToRunFor)
 {
-#if JUCE_MAC
-    if (nativeFileChooserHarnessEnabled)
-    {
-        NativeFilePanel::dispatchEventsFor(millisecondsToRunFor);
-        return true;
-    }
-#endif
     return juce::MessageManager::getInstance()->runDispatchLoopUntil(millisecondsToRunFor);
 }
 void pump()
@@ -620,6 +613,8 @@ struct OwnedModalCleanup
     }
 };
 
+struct DeferredInitialPumpTag {};
+
 struct LifecycleEditor
 {
     Processor& processor;
@@ -628,11 +623,16 @@ struct LifecycleEditor
     std::unique_ptr<TestWindow> window;
     explicit LifecycleEditor(Processor& p)
         : LifecycleEditor(p, std::unique_ptr<juce::AudioProcessorEditor>(p.createEditor())) {}
+    LifecycleEditor(Processor& p, DeferredInitialPumpTag)
+        : LifecycleEditor(p, std::unique_ptr<juce::AudioProcessorEditor>(p.createEditor()), false) {}
     LifecycleEditor(Processor& p, std::unique_ptr<juce::AudioProcessorEditor> preparedEditor)
+        : LifecycleEditor(p, std::move(preparedEditor), true) {}
+    LifecycleEditor(Processor& p, std::unique_ptr<juce::AudioProcessorEditor> preparedEditor,
+                    bool settleInitialWindow)
         : processor(p), editor(std::move(preparedEditor)), editorOwner(*editor),
           window(std::make_unique<TestWindow>(editorOwner))
     {
-        pump();
+        if (settleInitialWindow) pump();
         require(editor->isShowing(), "lifecycle owner must initially be showing");
     }
     void apply(OwnerAction action)
@@ -658,7 +658,7 @@ struct LifecycleEditor
         }
         require(editor == nullptr || ! editor->isShowing(), "owner action actually hides/detaches/destroys editor");
     }
-    void reopen(OwnerAction action)
+    void beginReopen(OwnerAction action)
     {
         if (action == OwnerAction::destroy || action == OwnerAction::hideThenDestroy)
         {
@@ -669,6 +669,10 @@ struct LifecycleEditor
         editorOwner.setVisible(true);
         window->setVisible(true);
         window->toFront(true);
+    }
+    void reopen(OwnerAction action)
+    {
+        beginReopen(action);
         pump();
         require(editor->isShowing(), "reopened lifecycle owner is showing");
     }
@@ -1313,8 +1317,7 @@ int main(int argc, char** argv)
         if (nativeOnly)
         {
 #if JUCE_MAC
-            checkNativeFileChooserLifecycles(root.getChildFile("NativeChoosers"), nativeCase);
-            return 0;
+            return runNativeFileChooserLifecycles(root.getChildFile("NativeChoosers"), nativeCase);
 #else
             throw std::runtime_error("Native file-chooser tests require macOS; a non-native fallback is not accepted.");
 #endif

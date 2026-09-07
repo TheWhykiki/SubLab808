@@ -170,8 +170,8 @@ set_tests_properties(SubLab808Presets PROPERTIES TIMEOUT 600)
 if(APPLE)
     # Test-only Cocoa observation proves that native file panels really open and
     # close. Product code and non-macOS tests do not depend on this bridge.
-    # Keep JUCE's existing CXX toolchain for .mm files so CMAKE_CXX_FLAGS
-    # (including sanitizer instrumentation) still apply to every such source.
+    # Updater.cmake enables Objective-C++; sanitizer configurations must pass
+    # matching CMAKE_OBJCXX_FLAGS so this lifecycle bridge is instrumented too.
     target_sources(SubLab808PresetTests PRIVATE Tests/NativeFilePanel.mm)
     # A fresh process per transition gives each real panel a tight,
     # independently reported failure. The sequential test below separately

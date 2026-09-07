@@ -1,6 +1,6 @@
 // Included inside PresetTests.cpp's private test namespace so this focused suite
-// reuses the real editor/state/library/reopen assertions without exposing hooks
-// in product code. Cocoa observation lives in a separate macOS-only .mm file.
+// reuses the real editor/state/library assertions without exposing product hooks.
+// Cocoa observation lives in a separate macOS-only .mm file.
 #if JUCE_MAC
 struct NativeFixtureSnapshot
 {
@@ -24,159 +24,587 @@ struct NativeFixtureSnapshot
                 "native chooser cancellation preserves the complete fixture file tree and bytes");
     }
 };
-std::unique_ptr<NativeFilePanel> waitForNativeFilePanel(bool importing)
+
+struct NativeChooserCase
 {
-    const auto started = juce::Time::getMillisecondCounterHiRes();
-    while (juce::Time::getMillisecondCounterHiRes() - started < 10000.0)
+    juce::File root;
+    bool importing = false;
+    OwnerAction action = OwnerAction::hideAncestor;
+};
+
+struct NativeChooserCaseState
+{
+    explicit NativeChooserCaseState(NativeChooserCase caseToRun)
+        : testCase(std::move(caseToRun)) {}
+
+    NativeChooserCase testCase;
+    juce::File external, input, output;
+    std::unique_ptr<Processor> processor;
+    std::unique_ptr<LifecycleEditor> owner;
+    std::unique_ptr<LifecycleSnapshot> stateBefore;
+    std::unique_ptr<NativeFixtureSnapshot> filesBefore;
+    std::unique_ptr<LifecycleSnapshot> reopenedBeforeInteraction;
+    juce::Component::SafePointer<juce::Component> managementMenu;
+    juce::Component::SafePointer<juce::Component> nativeModal;
+    juce::Component::SafePointer<juce::AlertWindow> reopenedDialog;
+    std::unique_ptr<NativeFilePanel> panel;
+    juce::Button* reopenedToggle = nullptr;
+    juce::RangedAudioParameter* reopenedParameter = nullptr;
+    float reopenedInitialValue = 0.0f;
+    std::string nativeClass;
+};
+
+class NativeChooserCoordinator final : private juce::Timer
+{
+public:
+    NativeChooserCoordinator(juce::File suiteRoot, const juce::String& requestedCase)
     {
-        if (auto panel = NativeFilePanel::findVisible(importing, importing ? "Import preset" : "Export current sound"))
+        for (const bool importing : { true, false })
+            for (const auto action : { OwnerAction::hideAncestor, OwnerAction::detach,
+                                       OwnerAction::destroy, OwnerAction::hideThenDestroy })
+            {
+                const auto name = juce::String(importing ? "import-" : "export-") + actionName(action);
+                if (requestedCase.isNotEmpty() && requestedCase != name) continue;
+                cases.push_back({ suiteRoot.getChildFile(juce::String(importing ? "Import-" : "Export-")
+                                                         + actionName(action)), importing, action });
+            }
+
+        if (requestedCase.isEmpty())
         {
-            require(panel->hasDelegate(), "native file panel has its real JUCE delegate before teardown");
-            require(NativeFilePanel::visibleCount() == 1, "exactly one native file panel belongs to this test process");
-            return panel;
+            // Close the cycle: the final export/hide-then-destroy transition must
+            // not poison the first kind of native session in the same app loop.
+            cases.push_back({ suiteRoot.getChildFile("Wraparound-Import-ancestor-hide"),
+                              true, OwnerAction::hideAncestor });
         }
-        require(dispatchUiEventsFor(10),
-                "message dispatch stopped while waiting for native file panel");
+
+        require(! cases.empty(), "WHYKIKI_PRESET_TEST_NATIVE_CASE names a supported native chooser case");
     }
-    throw std::runtime_error("NATIVE_PANEL_SETUP_TIMEOUT: real NSSavePanel/NSOpenPanel did not become visible");
-}
-std::string runNativeFileChooserLifecycle(const juce::File& root, bool importing, OwnerAction action)
-{
-    std::printf("NATIVE_CHOOSER_BEGIN: %s / %s\n", importing ? "Import" : "Export", actionName(action));
-    requireNoModals();
-    require(NativeFilePanel::visibleCount() == 0, "test process starts without a native file panel");
-    ok(root.createDirectory());
-    const auto external = root.getChildFile("External");
-    ok(external.createDirectory());
-    Processor processor(root.getChildFile("Library"));
-    const auto input = external.getChildFile("Input" + processor.presets.extension());
-    const auto output = external.getChildFile("MustNotBeWritten" + processor.presets.extension());
-    ok(processor.presets.exportCurrent(input));
-    require(input.existsAsFile() && ! output.exists(), "fixture input exists and export destination does not");
-    LifecycleEditor owner(processor);
-    juce::Process::makeForegroundProcess();
-    owner.window->toFront(true);
-    const auto activationStarted = juce::Time::getMillisecondCounterHiRes();
-    while (! juce::Process::isForegroundProcess() || ! owner.window->isActiveWindow())
+
+    void start()
     {
-        if (juce::Time::getMillisecondCounterHiRes() - activationStarted >= 10000.0)
-            throw std::runtime_error("NATIVE_PANEL_SETUP_TIMEOUT: the test process/window did not become active");
-        // Desktop runners may briefly reactivate their controller immediately
-        // after launching this process. Keep requesting focus until AppKit has
-        // delivered activation to our real test window.
+        require(juce::MessageManager::getInstance()->isThisTheMessageThread(),
+                "native chooser coordinator starts on the message thread");
+        // Finish through the coordinator before CTest's 60/480-second hard
+        // process watchdog so failures retain their case and phase diagnostics.
+        runDeadline = now() + (cases.size() == 1 ? 45000.0 : 450000.0);
+        enter(Phase::createCase);
+        startTimer(10);
+    }
+
+    bool completedNormally() const { return completed; }
+    const std::string& failureMessage() const { return failure; }
+
+private:
+    enum class Phase
+    {
+        createCase,
+        awaitHostActive,
+        awaitManagementGone,
+        awaitNativeModal,
+        awaitPanel,
+        fixtureFence,
+        awaitNativeModalGone,
+        awaitPanelRetired,
+        retirementFence,
+        awaitReopenedHost,
+        awaitReopenedDialog,
+        awaitReopenedDialogGone,
+        awaitToggleOn,
+        awaitToggleOff,
+        destroyCase,
+        betweenCases,
+        failureDestroy,
+        failureAwaitRetired,
+        failureDrain
+    };
+
+    static double now() { return juce::Time::getMillisecondCounterHiRes(); }
+
+    void enter(Phase next, double timeoutMs = 0.0)
+    {
+        phase = next;
+        deadline = timeoutMs > 0.0 ? now() + timeoutMs : 0.0;
+        fenceTurns = 0;
+    }
+
+    bool waitUntil(bool ready, const char* timeoutMessage) const
+    {
+        if (ready) return true;
+        if (deadline > 0.0 && now() >= deadline) throw std::runtime_error(timeoutMessage);
+        return false;
+    }
+
+    void timerCallback() override
+    {
+        try
+        {
+            if (failure.empty() && runDeadline > 0.0 && now() >= runDeadline)
+                throw std::runtime_error(
+                    std::string("NATIVE_CHOOSER_RUN_TIMEOUT: overall deadline reached in case ")
+                    + std::to_string(caseIndex + 1) + "/" + std::to_string(cases.size())
+                    + " during " + phaseName(phase));
+            advance();
+        }
+        catch (const std::exception& exception)
+        {
+            fail(exception.what());
+        }
+        catch (...)
+        {
+            fail("unknown exception in native chooser coordinator");
+        }
+    }
+
+    void advance()
+    {
+        require(juce::MessageManager::getInstance()->isThisTheMessageThread(),
+                "native chooser phases run on the message thread");
+
+        switch (phase)
+        {
+            case Phase::createCase: createCase(); return;
+            case Phase::awaitHostActive: awaitHostActive(); return;
+            case Phase::awaitManagementGone: awaitManagementGone(); return;
+            case Phase::awaitNativeModal: awaitNativeModal(); return;
+            case Phase::awaitPanel: awaitPanel(); return;
+            case Phase::fixtureFence: fixtureFence(); return;
+            case Phase::awaitNativeModalGone: awaitNativeModalGone(); return;
+            case Phase::awaitPanelRetired: awaitPanelRetired(); return;
+            case Phase::retirementFence: retirementFence(); return;
+            case Phase::awaitReopenedHost: awaitReopenedHost(); return;
+            case Phase::awaitReopenedDialog: awaitReopenedDialog(); return;
+            case Phase::awaitReopenedDialogGone: awaitReopenedDialogGone(); return;
+            case Phase::awaitToggleOn: awaitToggleOn(); return;
+            case Phase::awaitToggleOff: awaitToggleOff(); return;
+            case Phase::destroyCase: destroyCase(); return;
+            case Phase::betweenCases: betweenCases(); return;
+            case Phase::failureDestroy: failureDestroy(); return;
+            case Phase::failureAwaitRetired: failureAwaitRetired(); return;
+            case Phase::failureDrain: failureDrain(); return;
+        }
+        throw std::runtime_error("unknown native chooser phase");
+    }
+
+    static const char* phaseName(Phase value)
+    {
+        switch (value)
+        {
+            case Phase::createCase: return "createCase";
+            case Phase::awaitHostActive: return "awaitHostActive";
+            case Phase::awaitManagementGone: return "awaitManagementGone";
+            case Phase::awaitNativeModal: return "awaitNativeModal";
+            case Phase::awaitPanel: return "awaitPanel";
+            case Phase::fixtureFence: return "fixtureFence";
+            case Phase::awaitNativeModalGone: return "awaitNativeModalGone";
+            case Phase::awaitPanelRetired: return "awaitPanelRetired";
+            case Phase::retirementFence: return "retirementFence";
+            case Phase::awaitReopenedHost: return "awaitReopenedHost";
+            case Phase::awaitReopenedDialog: return "awaitReopenedDialog";
+            case Phase::awaitReopenedDialogGone: return "awaitReopenedDialogGone";
+            case Phase::awaitToggleOn: return "awaitToggleOn";
+            case Phase::awaitToggleOff: return "awaitToggleOff";
+            case Phase::destroyCase: return "destroyCase";
+            case Phase::betweenCases: return "betweenCases";
+            case Phase::failureDestroy: return "failureDestroy";
+            case Phase::failureAwaitRetired: return "failureAwaitRetired";
+            case Phase::failureDrain: return "failureDrain";
+        }
+        return "unknown";
+    }
+
+    void createCase()
+    {
+        require(current == nullptr && caseIndex < cases.size(), "native chooser case index is valid");
+        require(juce::Component::getNumCurrentlyModalComponents() == 0,
+                "native chooser case starts without a JUCE modal");
+        require(NativeFilePanel::visibleCount() == 0,
+                "native chooser case starts without a native file panel");
+        require(! NativeFilePanel::hasActiveCompletionSession(),
+                "native chooser case starts without an unfinished AppKit completion");
+
+        current = std::make_unique<NativeChooserCaseState>(cases[caseIndex]);
+        const auto& testCase = current->testCase;
+        std::printf("NATIVE_CHOOSER_BEGIN: %s / %s\n",
+                    testCase.importing ? "Import" : "Export", actionName(testCase.action));
+        ok(testCase.root.createDirectory());
+        current->external = testCase.root.getChildFile("External");
+        ok(current->external.createDirectory());
+        current->processor = std::make_unique<Processor>(testCase.root.getChildFile("Library"));
+        current->input = current->external.getChildFile("Input" + current->processor->presets.extension());
+        current->output = current->external.getChildFile("MustNotBeWritten" + current->processor->presets.extension());
+        ok(current->processor->presets.exportCurrent(current->input));
+        require(current->input.existsAsFile() && ! current->output.exists(),
+                "fixture input exists and export destination does not");
+        current->owner = std::make_unique<LifecycleEditor>(*current->processor, DeferredInitialPumpTag {});
         juce::Process::makeForegroundProcess();
-        NativeFilePanel::dispatchActivationEventsFor(10);
+        current->owner->window->toFront(true);
+        enter(Phase::awaitHostActive, 10000.0);
     }
-    const LifecycleSnapshot stateBefore(processor);
-    const NativeFixtureSnapshot filesBefore(root);
 
-    // Execute the product's management-menu result: do not construct a substitute
-    // FileChooser, fake its completion, or accept a non-native fallback as PASS.
-    chooseManagement(*owner.editor, importing ? 3 : 4);
-    OwnedModalCleanup nativeModal { juce::Component::getCurrentlyModalComponent() };
-    require(nativeModal.component != nullptr
-            && dynamic_cast<juce::AlertWindow*>(nativeModal.component.getComponent()) == nullptr
-            && dynamic_cast<juce::CallOutBox*>(nativeModal.component.getComponent()) == nullptr,
-            "the product created a real file-chooser modal");
-    auto panel = waitForNativeFilePanel(importing);
-    const auto nativeClass = panel->className();
-    panel->useFixtureLocation(external.getFullPathName().toStdString(),
-                              (importing ? input : output).getFileName().toStdString());
-    // Let AppKit finish the test-only directory/name synchronization before
-    // exercising product teardown. Otherwise the fixture navigation itself
-    // races panel cancellation and confounds the owner-lifetime contract.
-    pump();
-    require(nativeModal.component->isCurrentlyModal() && panel->isVisible(),
-            "native panel and JUCE modal are both active before owner transition");
-    stateBefore.unchanged(processor);
-    filesBefore.unchanged(root);
+    void awaitHostActive()
+    {
+        auto& state = *current;
+        juce::Process::makeForegroundProcess();
+        state.owner->window->toFront(true);
+        if (! waitUntil(juce::Process::isForegroundProcess() && state.owner->window->isActiveWindow(),
+                        "NATIVE_PANEL_SETUP_TIMEOUT: the test process/window did not become active")) return;
 
-    std::printf("NATIVE_CHOOSER_OWNER_ACTION_BEGIN: %s / %s\n",
-                importing ? "Import" : "Export", actionName(action));
-    owner.apply(action);
-    std::printf("NATIVE_CHOOSER_OWNER_ACTION_END: %s / %s\n",
-                importing ? "Import" : "Export", actionName(action));
-    if (action == OwnerAction::destroy || action == OwnerAction::hideThenDestroy)
-    {
-        require(nativeModal.component == nullptr && ! panel->isVisible() && ! panel->hasDelegate(),
-                "editor destruction synchronously clears the JUCE modal, native visibility and JUCE delegate");
+        state.stateBefore = std::make_unique<LifecycleSnapshot>(*state.processor);
+        state.filesBefore = std::make_unique<NativeFixtureSnapshot>(state.testCase.root);
+        auto* menu = openManagement(*state.owner->editor);
+        state.managementMenu = menu;
+        menu->exitModalState(state.testCase.importing ? 3 : 4);
+        enter(Phase::awaitManagementGone, 2000.0);
     }
-    else
+
+    void awaitManagementGone()
     {
-        require(nativeModal.component != nullptr && nativeModal.component->isCurrentlyModal()
-                    && panel->isVisible() && panel->hasDelegate(),
-                "hide/detach returns before non-reentrant native chooser teardown runs on a later timer event");
+        if (! waitUntil(current->managementMenu == nullptr,
+                        "Modal component was not destroyed: management menu selection")) return;
+        std::puts("UI teardown: management menu selection destroyed");
+        enter(Phase::awaitNativeModal, 10000.0);
     }
-    waitForDeletion(nativeModal.component, "native file-chooser modal");
-    const auto started = juce::Time::getMillisecondCounterHiRes();
-    while (panel->isVisible() || panel->hasDelegate() || panel->isAlive())
+
+    void awaitNativeModal()
     {
-        if (juce::Time::getMillisecondCounterHiRes() - started >= 10000.0)
-            throw std::runtime_error("NATIVE_PANEL_TEARDOWN_TIMEOUT: panel remains visible, retains its JUCE delegate, or remains in NSApp.windows");
-        require(dispatchUiEventsFor(10),
-                "message dispatch stopped before native panel teardown");
+        auto* modal = juce::Component::getCurrentlyModalComponent();
+        if (! waitUntil(modal != nullptr,
+                        "NATIVE_PANEL_SETUP_TIMEOUT: JUCE native file-chooser modal did not appear")) return;
+        require(dynamic_cast<juce::AlertWindow*>(modal) == nullptr
+                    && dynamic_cast<juce::CallOutBox*>(modal) == nullptr,
+                "the product created a real file-chooser modal");
+        current->nativeModal = modal;
+        enter(Phase::awaitPanel, 10000.0);
     }
-    // NSSavePanel visibility and delegate teardown happen before AppKit has
-    // necessarily removed the panel and retired beginWithCompletionHandler.
-    // Give pending completion work another default-run-loop source fence. One
-    // panel disappearance observation is not treated as completed teardown: reopen
-    // assertions and the next same-process case (including the wrap-around
-    // sentinel) detect leaked session state.
-    pump();
-    requireNoModals();
-    require(! panel->isAlive() && NativeFilePanel::visibleCount() == 0,
-            "no native file panel remains alive after owner transition");
-    stateBefore.unchanged(processor);
-    filesBefore.unchanged(root);
-    require(! output.exists(), "cancelled export never creates its target");
-    owner.reopen(action);
-    stateBefore.unchanged(processor);
-    checkReopenedControls(owner);
-    filesBefore.unchanged(root);
-    return nativeClass;
-}
-void checkNativeFileChooserLifecycle(const juce::File& root, bool importing, OwnerAction action)
+
+    void awaitPanel()
+    {
+        auto panel = NativeFilePanel::findVisible(current->testCase.importing,
+            current->testCase.importing ? "Import preset" : "Export current sound");
+        if (! waitUntil(panel != nullptr,
+                        "NATIVE_PANEL_SETUP_TIMEOUT: real NSSavePanel/NSOpenPanel did not become visible")) return;
+        current->panel = std::move(panel);
+        require(current->panel->hasDelegate(), "native file panel has its real JUCE delegate before teardown");
+        require(current->panel->beganExactlyOnce() && current->panel->completionHasNotStarted(),
+                "visible native file panel has one active, not-yet-completed AppKit session");
+        require(NativeFilePanel::visibleCount() == 1,
+                "exactly one native file panel belongs to this test process");
+        current->nativeClass = current->panel->className();
+        current->panel->useFixtureLocation(current->external.getFullPathName().toStdString(),
+                                           (current->testCase.importing ? current->input : current->output)
+                                               .getFileName().toStdString());
+        enter(Phase::fixtureFence);
+    }
+
+    void fixtureFence()
+    {
+        // Two timer turns return control to the one real NSApplication loop so
+        // AppKit can finish directory/name synchronisation without a nested pump.
+        if (++fenceTurns < 2) return;
+        auto& state = *current;
+        require(state.nativeModal != nullptr && state.nativeModal->isCurrentlyModal()
+                    && state.panel->isVisible(),
+                "native panel and JUCE modal are both active before owner transition");
+        require(state.panel->completionHasNotStarted(),
+                "native panel completion has not started before the owner transition");
+        state.stateBefore->unchanged(*state.processor);
+        state.filesBefore->unchanged(state.testCase.root);
+
+        std::printf("NATIVE_CHOOSER_OWNER_ACTION_BEGIN: %s / %s\n",
+                    state.testCase.importing ? "Import" : "Export", actionName(state.testCase.action));
+        state.owner->apply(state.testCase.action);
+        std::printf("NATIVE_CHOOSER_OWNER_ACTION_END: %s / %s\n",
+                    state.testCase.importing ? "Import" : "Export", actionName(state.testCase.action));
+        if (state.testCase.action == OwnerAction::destroy
+            || state.testCase.action == OwnerAction::hideThenDestroy)
+        {
+            require(state.nativeModal == nullptr && ! state.panel->isVisible() && ! state.panel->hasDelegate(),
+                    "editor destruction synchronously clears the JUCE modal, native visibility and JUCE delegate");
+        }
+        else
+        {
+            require(state.nativeModal != nullptr && state.nativeModal->isCurrentlyModal()
+                        && state.panel->isVisible() && state.panel->hasDelegate(),
+                    "hide/detach returns before non-reentrant native chooser teardown runs on a later timer event");
+        }
+        enter(Phase::awaitNativeModalGone, 2000.0);
+    }
+
+    void awaitNativeModalGone()
+    {
+        if (! waitUntil(current->nativeModal == nullptr,
+                        "Modal component was not destroyed: native file-chooser modal")) return;
+        std::puts("UI teardown: native file-chooser modal destroyed");
+        enter(Phase::awaitPanelRetired, 10000.0);
+    }
+
+    void awaitPanelRetired()
+    {
+        require(current->panel->completionProgressIsValid(),
+                "native file panel completion-session counts became invalid");
+        const bool retired = ! current->panel->isVisible() && ! current->panel->hasDelegate()
+                          && ! current->panel->isAlive()
+                          && current->panel->completionReturnedExactlyOnce()
+                          && ! NativeFilePanel::hasActiveCompletionSession();
+        if (! waitUntil(retired,
+                        "NATIVE_PANEL_TEARDOWN_TIMEOUT: panel/delegate/window or AppKit completion remains active")) return;
+        enter(Phase::retirementFence);
+    }
+
+    void retirementFence()
+    {
+        // The observer above proves that JUCE's real AppKit completion returned;
+        // these turns give any unrelated application-loop cleanup a grace fence.
+        if (++fenceTurns < 3) return;
+        auto& state = *current;
+        require(state.nativeModal == nullptr && ! state.panel->isAlive()
+                    && state.panel->completionReturnedExactlyOnce()
+                    && NativeFilePanel::visibleCount() == 0
+                    && ! NativeFilePanel::hasActiveCompletionSession()
+                    && juce::Component::getNumCurrentlyModalComponents() == 0,
+                "no native or JUCE modal remains after owner transition");
+        state.stateBefore->unchanged(*state.processor);
+        state.filesBefore->unchanged(state.testCase.root);
+        require(! state.output.exists(), "cancelled export never creates its target");
+        state.owner->beginReopen(state.testCase.action);
+        enter(Phase::awaitReopenedHost, 10000.0);
+    }
+
+    void awaitReopenedHost()
+    {
+        auto& state = *current;
+        juce::Process::makeForegroundProcess();
+        state.owner->window->toFront(true);
+        if (! waitUntil(state.owner->editor != nullptr && state.owner->editor->isShowing()
+                            && state.owner->window->isActiveWindow(),
+                        "NATIVE_PANEL_REOPEN_TIMEOUT: replacement editor did not become active")) return;
+        require(juce::Component::getNumCurrentlyModalComponents() == 0,
+                "no orphan modal remains before reopened-control probe");
+        state.stateBefore->unchanged(*state.processor);
+        require(! state.owner->editor->isCurrentlyBlockedByAnotherModalComponent(),
+                "reopened editor is not modal-blocked");
+        auto& saveAs = lifecycleButton(*state.owner->editor, "Save preset as");
+        require(! saveAs.isCurrentlyBlockedByAnotherModalComponent(),
+                "reopened Save As is not modal-blocked");
+        auto* accessibility = saveAs.getAccessibilityHandler();
+        require(accessibility != nullptr && accessibility->getCurrentState().isFocusable(),
+                "reopened Save As is accessibility-focusable");
+        state.reopenedBeforeInteraction = std::make_unique<LifecycleSnapshot>(*state.processor);
+        saveAs.triggerClick();
+        enter(Phase::awaitReopenedDialog, 10000.0);
+    }
+
+    void awaitReopenedDialog()
+    {
+        auto* modal = juce::Component::getCurrentlyModalComponent();
+        if (! waitUntil(modal != nullptr,
+                        "NATIVE_PANEL_REOPEN_TIMEOUT: Save As probe did not open")) return;
+        auto* alert = dynamic_cast<juce::AlertWindow*>(modal);
+        require(alert != nullptr && alert->getName() == "Save preset as",
+                "real reopened Save As dialog opened");
+        current->reopenedDialog = alert;
+        alert->exitModalState(0);
+        enter(Phase::awaitReopenedDialogGone, 2000.0);
+    }
+
+    void awaitReopenedDialogGone()
+    {
+        if (! waitUntil(current->reopenedDialog == nullptr,
+                        "Modal component was not destroyed: reopened Save As Cancel")) return;
+        std::puts("UI teardown: reopened Save As Cancel destroyed");
+        auto& state = *current;
+        state.reopenedBeforeInteraction->unchanged(*state.processor);
+#if PRESET_TEST_SUBLAB
+        state.reopenedToggle = &lifecycleButton(*state.owner->editor, "One Shot playback mode");
+        state.reopenedParameter = state.processor->parameters.getParameter("oneshot");
+#else
+        state.reopenedToggle = &lifecycleButton(*state.owner->editor, "FREEZE");
+        state.reopenedParameter = state.processor->parameters.getParameter("freeze");
+#endif
+        require(state.reopenedParameter != nullptr, "reopened toggle parameter exists");
+        require(! state.reopenedToggle->isCurrentlyBlockedByAnotherModalComponent(),
+                "reopened sound control is not modal-blocked");
+        auto* accessibility = state.reopenedToggle->getAccessibilityHandler();
+        require(accessibility != nullptr && accessibility->getCurrentState().isFocusable(),
+                "reopened sound control is accessibility-focusable");
+        state.reopenedInitialValue = state.reopenedParameter->getValue();
+        state.reopenedToggle->triggerClick();
+        enter(Phase::awaitToggleOn, 2000.0);
+    }
+
+    void awaitToggleOn()
+    {
+        auto& state = *current;
+        if (! waitUntil(std::abs(state.reopenedParameter->getValue() - state.reopenedInitialValue) > 0.5f,
+                        "reopened sound-control click did not update its actual parameter")) return;
+        state.reopenedToggle->triggerClick();
+        enter(Phase::awaitToggleOff, 2000.0);
+    }
+
+    void awaitToggleOff()
+    {
+        auto& state = *current;
+        if (! waitUntil(std::abs(state.reopenedParameter->getValue() - state.reopenedInitialValue) <= 0.0f,
+                        "second sound-control click did not restore its actual parameter")) return;
+        require(juce::Component::getNumCurrentlyModalComponents() == 0,
+                "no modal remains after reopened-control probe");
+        state.reopenedBeforeInteraction->libraryUnchanged(*state.processor);
+        state.filesBefore->unchanged(state.testCase.root);
+        enter(Phase::destroyCase);
+    }
+
+    void destroyCase()
+    {
+        lastImporting = current->testCase.importing;
+        lastAction = current->testCase.action;
+        lastNativeClass = current->nativeClass;
+        current.reset();
+        enter(Phase::betweenCases, 10000.0);
+    }
+
+    void betweenCases()
+    {
+        const bool clean = juce::Component::getNumCurrentlyModalComponents() == 0
+                        && NativeFilePanel::visibleCount() == 0
+                        && ! NativeFilePanel::hasActiveCompletionSession();
+        if (! waitUntil(clean,
+                        "NATIVE_PANEL_TEARDOWN_TIMEOUT: case destruction left native or JUCE modal state")) return;
+        if (++fenceTurns < 3) return;
+        std::printf("PASS: native %s / %s [%s]: real panel closed, delegate cleared, modal deleted, state/files unchanged, editor interactive.\n",
+                    lastImporting ? "Import" : "Export", actionName(lastAction), lastNativeClass.c_str());
+        ++caseIndex;
+        if (caseIndex < cases.size())
+        {
+            enter(Phase::createCase);
+            return;
+        }
+
+        std::printf("PASS: %zu real native file-chooser lifecycle regression%s.\n",
+                    cases.size(), cases.size() == 1 ? "" : "s");
+        completed = true;
+        stopTimer();
+        juce::MessageManager::getInstance()->stopDispatchLoop();
+    }
+
+    void fail(const char* message) noexcept
+    {
+        try
+        {
+            if (! failure.empty())
+            {
+                std::fprintf(stderr, "FAILURE_CLEANUP_ERROR: %s\n", message);
+                std::fflush(stderr);
+                completed = true;
+                stopTimer();
+                juce::MessageManager::getInstance()->stopDispatchLoop();
+                return;
+            }
+            failure = message;
+            std::fprintf(stderr, "FAIL: %s\n", failure.c_str());
+            std::fflush(stderr);
+            stopTimer();
+            if (current != nullptr)
+            {
+                if (current->reopenedDialog != nullptr) current->reopenedDialog->exitModalState(0);
+                if (current->nativeModal != nullptr) current->nativeModal->exitModalState(0);
+                if (current->managementMenu != nullptr) current->managementMenu->exitModalState(0);
+            }
+            // Destruction runs only after returning to the top-level application
+            // loop, never re-entrantly in the callback that detected the failure.
+            enter(current != nullptr ? Phase::failureDestroy : Phase::failureAwaitRetired,
+                  current != nullptr ? 0.0 : 3000.0);
+            startTimer(10);
+        }
+        catch (...)
+        {
+            std::fputs("FAILURE_CLEANUP_ERROR: initial cleanup threw; stopping app loop\n", stderr);
+            std::fflush(stderr);
+            completed = true;
+            stopTimer();
+            juce::MessageManager::getInstance()->stopDispatchLoop();
+        }
+    }
+
+    void failureDestroy()
+    {
+        if (++fenceTurns < 2) return;
+        if (current == nullptr)
+        {
+            enter(Phase::failureAwaitRetired, 3000.0);
+            return;
+        }
+        failurePanel = std::move(current->panel);
+        current.reset();
+        enter(Phase::failureAwaitRetired, 3000.0);
+    }
+
+    void failureAwaitRetired()
+    {
+        const bool panelClean = failurePanel == nullptr
+                             || (! failurePanel->isVisible() && ! failurePanel->hasDelegate()
+                                 && ! failurePanel->isAlive()
+                                 && failurePanel->completionReturnedExactlyOnce());
+        const bool globallyClean = juce::Component::getNumCurrentlyModalComponents() == 0
+                                && NativeFilePanel::visibleCount() == 0
+                                && ! NativeFilePanel::hasActiveCompletionSession();
+        if (panelClean && globallyClean)
+        {
+            failurePanel.reset();
+            enter(Phase::failureDrain, 100.0);
+            return;
+        }
+        if (now() < deadline) return;
+
+        std::fprintf(stderr,
+                     "FAILURE_CLEANUP_TIMEOUT: modal=%d visiblePanels=%d activeCompletion=%d completionReturned=%d\n",
+                     juce::Component::getNumCurrentlyModalComponents(), NativeFilePanel::visibleCount(),
+                     NativeFilePanel::hasActiveCompletionSession(),
+                     failurePanel == nullptr || failurePanel->completionReturnedExactlyOnce());
+        std::fflush(stderr);
+        failurePanel.reset();
+        enter(Phase::failureDrain, 100.0);
+    }
+
+    void failureDrain()
+    {
+        if (now() < deadline) return;
+        completed = true;
+        stopTimer();
+        juce::MessageManager::getInstance()->stopDispatchLoop();
+    }
+
+    std::vector<NativeChooserCase> cases;
+    std::unique_ptr<NativeChooserCaseState> current;
+    std::unique_ptr<NativeFilePanel> failurePanel;
+    size_t caseIndex = 0;
+    Phase phase = Phase::createCase;
+    double deadline = 0.0;
+    double runDeadline = 0.0;
+    int fenceTurns = 0;
+    bool lastImporting = false;
+    OwnerAction lastAction = OwnerAction::hideAncestor;
+    std::string lastNativeClass;
+    bool completed = false;
+    std::string failure;
+};
+
+int runNativeFileChooserLifecycles(const juce::File& root, const juce::String& requestedCase = {})
 {
-    const auto nativeClass = runNativeFileChooserLifecycle(root, importing, action);
-    // The case-local window, editor and processor are destroyed only when the
-    // helper above returns. Drain teardown queued by those destructors while JUCE
-    // and AppKit are still fully alive, then make PASS cover that boundary too.
-    requireNoModals();
-    require(NativeFilePanel::visibleCount() == 0,
-            "case destruction leaves no visible native file panel");
-    std::printf("PASS: native %s / %s [%s]: real panel closed, delegate cleared, modal deleted, state/files unchanged, editor interactive.\n",
-                importing ? "Import" : "Export", actionName(action), nativeClass.c_str());
-}
-void checkNativeFileChooserLifecycles(const juce::File& root, const juce::String& requestedCase = {})
-{
-    require(juce::MessageManager::getInstance()->isThisTheMessageThread(), "native chooser tests run on the message thread");
+    require(juce::MessageManager::getInstance()->isThisTheMessageThread(),
+            "native chooser tests start on the message thread");
     require(! juce::Desktop::getInstance().getDisplays().displays.isEmpty(),
             "native chooser tests require an active macOS desktop session");
-    require(juce::FileChooser::isPlatformDialogAvailable(), "native chooser platform implementation is available");
+    require(juce::FileChooser::isPlatformDialogAvailable(),
+            "native chooser platform implementation is available");
     NativeFilePanel::prepareTestApplication();
     nativeFileChooserHarnessEnabled = true;
-    int executed = 0;
-    for (const bool importing : { true, false })
-        for (const auto action : { OwnerAction::hideAncestor, OwnerAction::detach,
-                                   OwnerAction::destroy, OwnerAction::hideThenDestroy })
-        {
-            const auto caseName = juce::String(importing ? "import-" : "export-") + actionName(action);
-            if (requestedCase.isNotEmpty() && requestedCase != caseName) continue;
-            checkNativeFileChooserLifecycle(root.getChildFile(juce::String(importing ? "Import-" : "Export-") + actionName(action)),
-                                            importing, action);
-            ++executed;
-        }
-    if (requestedCase.isEmpty())
-    {
-        // Close the cycle: the final export/hide-then-destroy case must not
-        // poison another native session. This sentinel's own transition was
-        // already followed by import/detach at the start of the same process.
-        checkNativeFileChooserLifecycle(root.getChildFile("Wraparound-Import-ancestor-hide"),
-                                        true, OwnerAction::hideAncestor);
-        ++executed;
-    }
-    require(executed > 0, "WHYKIKI_PRESET_TEST_NATIVE_CASE names a supported native chooser case");
-    std::printf("PASS: %d real native file-chooser lifecycle regression%s.\n",
-                executed, executed == 1 ? "" : "s");
+    NativeChooserCoordinator coordinator(root, requestedCase);
+    coordinator.start();
+    juce::MessageManager::getInstance()->runDispatchLoop();
+    nativeFileChooserHarnessEnabled = false;
+    require(coordinator.completedNormally(), "native chooser application loop stopped before completion");
+    if (! coordinator.failureMessage().empty())
+        throw std::runtime_error(coordinator.failureMessage());
+    return 0;
 }
 #endif

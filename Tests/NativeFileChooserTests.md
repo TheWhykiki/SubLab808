@@ -7,11 +7,11 @@ with a fake or call an artificial successful import/export callback.
 
 Each case requires a visible, correctly typed native panel and a live JUCE modal
 before the owner transition. Afterwards the native panel must be hidden, its JUCE
-delegate cleared, removed from `NSApp.windows`, and the JUCE modal destroyed. A
-JUCE/default-run-loop source fence then gives pending completion work another
-opportunity to run before the editor is reopened; one disappearance observation
+delegate cleared, removed from `NSApp.windows`, and the JUCE modal destroyed. The
+test-only observer also requires JUCE's real `beginWithCompletionHandler` block to
+enter and return exactly once before the editor is reopened; panel disappearance
 alone is not treated as completed teardown. The next same-process case and wrap-around
-sentinel detect leaked session state. Exact processor state, preset selection,
+sentinel additionally detect leaked session state. Exact processor state, preset selection,
 and every file/directory in the temporary fixture must remain unchanged.
 The reopened editor must accept a real Save As/Cancel interaction and parameter
 button clicks.
@@ -25,31 +25,31 @@ caused cancellation without posting a second owner-specific callback object.
 The deferred chooser remains owned by PresetBar. On destruction, its existing
 timer is stopped and member ordering unregisters the watcher before active or
 deferred choosers are destroyed. Before the editor is reopened, the harness
-proves JUCE/default-run-loop source completion plus observed panel, delegate and
+returns repeatedly to the real top-level app loop and proves panel, delegate and
 modal teardown. It deliberately does not claim that every queued AppKit NSEvent
 has been drained, or that a host may dynamically unload the VST3 module in the
 same call stack before AppKit has retired its completion handler; exact-host
 acceptance must cover that stronger boundary.
 
-The bridge observes only the test process's own NSApp windows. It stores the
-panel's opaque identity and re-resolves it through the live window list on every
+The bridge observes only the test process's own NSApp windows. It installs a
+test-process-only observer around `NSSavePanel.beginWithCompletionHandler`, calls
+the original implementation and JUCE handler exactly as supplied, and records
+entry and normal return without closing or confirming the panel itself. It stores
+the panel's opaque identity and re-resolves it through the live window list on every
 inspection; it deliberately does not retain the panel because JUCE's close-release
 is part of the lifecycle under test. The fixture redirects the panel to an isolated
 temporary directory containing an input preset and an initially nonexistent export
 destination; it never confirms a file operation. No DAW, installed bundle, or user
 preset library is modified.
 
-The console harness completes `NSApplication` launch once, then dispatches only
-the default JUCE/AppKit run-loop sources. It never re-enters the unbounded top-level
-`[NSApp run]` for a short slice: an asynchronous native-panel completion can outlive
-that slice's one-shot stop event and strand the test outside its C++ deadline.
-Only while activating the process's first test window may the setup bridge send
-one queued AppKit/application-defined lifecycle event; observing the first native
-panel permanently disables manual NSEvent delivery for the rest of that process.
-The tests invoke controls directly, while sending a mouse or key event may
-synchronously enter AppKit tracking and exceed the C++ slice deadline. Modal-panel
-and event-tracking modes remain under AppKit's control instead of being entered
-manually after the modeless panel has closed. Before its first order-in, the
+The console target completes `NSApplication` launch once and then runs one genuine
+top-level `MessageManager`/`NSApplication` loop for the complete native suite. A
+timer-driven state machine performs at most one bounded action per callback and
+returns after every asynchronous boundary: activation, menu dismissal, panel
+presentation, owner transition, panel retirement, editor reopen and control probe.
+It never calls `CFRunLoopRunInMode`, manually sends an `NSEvent`, or enters a nested
+JUCE dispatch loop. AppKit therefore retires each modeless panel completion in its
+normal application loop before the next session starts. Before its first order-in, the
 synthetic `Preset UI Tests` host window also disables AppKit's automatic order
 animation; otherwise that short-lived console-only window can leave a display-link
 worker running after `main()` exits. Native
@@ -78,6 +78,11 @@ modal state that process isolation would hide. Native UI is kept out of the
 normal unfiltered PresetTests invocation; the existing reentrancy-only and
 lifecycle-only modes remain unchanged.
 
+The coordinator has an absolute 45-second isolated / 450-second sequential
+deadline so a responsive failure reports its case and phase before CTest's
+60-second / 480-second process watchdog. CTest remains the fallback for a callback
+that blocks the message thread completely.
+
 To reproduce one isolated case manually, also set
 `WHYKIKI_PRESET_TEST_NATIVE_CASE` to an operation (`import` or `export`) plus
 one of `ancestor-hide`, `detach`, `destroy`, or `hide-then-destroy`. The last
@@ -90,9 +95,9 @@ own process; missing activation, display, or native-panel availability is a setu
 failure, not evidence of a plugin defect. A requested native-only run on another
 platform fails explicitly instead of accepting a non-native fallback.
 
-The .mm bridge intentionally uses JUCE's existing CXX toolchain. Do not enable a
-separate OBJCXX language just for this file: that can reclassify every JUCE .mm file
-and bypass sanitizer options supplied through CMAKE_CXX_FLAGS.
+The project already enables Objective-C++ for its updater. Sanitizer builds must
+therefore pass matching `CMAKE_OBJCXX_FLAGS`; `CMAKE_CXX_FLAGS` alone does not
+instrument this `.mm` bridge or the MRC/block lifetime that it observes.
 
 ## Limits
 

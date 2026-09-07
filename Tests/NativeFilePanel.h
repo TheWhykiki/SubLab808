@@ -12,13 +12,6 @@ public:
     // The short-lived synthetic host window must not leave an AppKit display-
     // link animation running after the console test exits.
     static void disableAutomaticHostWindowAnimations(void* nativeView);
-    // Dispatch default AppKit/JUCE run-loop sources without manually sending
-    // input events or re-entering NSApplication's unbounded top-level loop.
-    static void dispatchEventsFor(int millisecondsToRunFor);
-    // The console harness has no NSApplication::run loop. Before the first
-    // native panel only, deliver one queued lifecycle event or one source slice;
-    // after a panel is observed this permanently falls back to source-only.
-    static void dispatchActivationEventsFor(int millisecondsToRunFor);
     static std::unique_ptr<NativeFilePanel> findVisible(bool importing, const char* title);
     static int visibleCount();
     ~NativeFilePanel();
@@ -27,9 +20,15 @@ public:
     bool isAlive() const;
     bool isVisible() const;
     bool hasDelegate() const;
+    bool beganExactlyOnce() const;
+    bool completionHasNotStarted() const;
+    bool completionProgressIsValid() const;
+    bool completionReturnedExactlyOnce() const;
+    static bool hasActiveCompletionSession();
     std::string className() const;
     void useFixtureLocation(const std::string& directory, const std::string& filename);
 private:
-    explicit NativeFilePanel(void*);
+    NativeFilePanel(void*, void*);
     void* panel = nullptr;
+    void* observation = nullptr;
 };

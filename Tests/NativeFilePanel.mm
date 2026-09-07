@@ -1,10 +1,84 @@
 #include "NativeFilePanel.h"
 #include <stdexcept>
 #import <AppKit/AppKit.h>
+#import <objc/runtime.h>
+
+@interface WhyKikiNativePanelSessionObservation : NSObject
+{
+@public
+    NSUInteger beginCount;
+    NSUInteger beginReturnCount;
+    NSUInteger completionEntryCount;
+    NSUInteger completionReturnCount;
+}
+@end
+
+@implementation WhyKikiNativePanelSessionObservation
+@end
 
 namespace
 {
-bool activationLifecycleEventsAllowed = true;
+using CompletionHandler = void (^)(NSModalResponse);
+using BeginWithCompletionHandler = void (*)(id, SEL, CompletionHandler);
+
+BeginWithCompletionHandler originalBeginWithCompletionHandler = nullptr;
+NSMutableSet* activeCompletionObservations = nil;
+char completionObservationKey;
+
+bool returnedExactlyOnce(const WhyKikiNativePanelSessionObservation* state)
+{
+    return state != nil && state->beginCount == 1 && state->beginReturnCount == 1
+        && state->completionEntryCount == 1 && state->completionReturnCount == 1;
+}
+
+void retireCompletedObservation(WhyKikiNativePanelSessionObservation* state)
+{
+    if (returnedExactlyOnce(state)) [activeCompletionObservations removeObject:state];
+}
+
+void trackedBeginWithCompletionHandler(id self, SEL selector, CompletionHandler handler)
+{
+    if (handler == nil)
+    {
+        originalBeginWithCompletionHandler(self, selector, handler);
+        return;
+    }
+
+    WhyKikiNativePanelSessionObservation* state = nil;
+    @synchronized ([NSSavePanel class])
+    {
+        state = (WhyKikiNativePanelSessionObservation*)
+            objc_getAssociatedObject(self, &completionObservationKey);
+        if (state == nil || returnedExactlyOnce(state))
+        {
+            state = [[WhyKikiNativePanelSessionObservation alloc] init];
+            objc_setAssociatedObject(self, &completionObservationKey, state,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [state release];
+        }
+        [state retain];
+        ++state->beginCount;
+        [activeCompletionObservations addObject:state];
+    }
+
+    CompletionHandler trackedHandler = ^(NSModalResponse result)
+    {
+        @synchronized ([NSSavePanel class]) { ++state->completionEntryCount; }
+        handler(result);
+        @synchronized ([NSSavePanel class])
+        {
+            ++state->completionReturnCount;
+            retireCompletedObservation(state);
+        }
+    };
+    originalBeginWithCompletionHandler(self, selector, trackedHandler);
+    @synchronized ([NSSavePanel class])
+    {
+        ++state->beginReturnCount;
+        retireCompletedObservation(state);
+    }
+    [state release];
+}
 
 NSString* checkedUTF8(const char* text)
 {
@@ -24,8 +98,12 @@ NSSavePanel* resolvePanel(void* identity)
 }
 }
 
-NativeFilePanel::NativeFilePanel(void* nativePanel) : panel(nativePanel) {}
-NativeFilePanel::~NativeFilePanel() = default;
+NativeFilePanel::NativeFilePanel(void* nativePanel, void* observationToRetain)
+    : panel(nativePanel), observation([(id) observationToRetain retain]) {}
+NativeFilePanel::~NativeFilePanel()
+{
+    [(id) observation release];
+}
 bool NativeFilePanel::isAlive() const
 {
     @autoreleasepool
@@ -36,16 +114,42 @@ bool NativeFilePanel::isAlive() const
 void NativeFilePanel::prepareTestApplication()
 {
     // ScopedJuceInitialiser_GUI in a console test does not provide an active
-    // regular app. Complete the launch sequence once before the bounded event
-    // dispatcher is used. Do not re-enter the unbounded top-level NSApp run
-    // while an asynchronous native-panel completion is still retiring.
+    // regular app. Create one here; the suite's single top-level
+    // MessageManager/NSApplication loop completes the normal launch sequence.
     @autoreleasepool
     {
+        if (![NSThread isMainThread])
+            throw std::runtime_error("NATIVE_PANEL_SETUP: native chooser tests require the main thread");
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         if ([NSApp activationPolicy] != NSApplicationActivationPolicyRegular)
             throw std::runtime_error("NATIVE_PANEL_SETUP: test application cannot become a regular GUI process");
-        [NSApp finishLaunching];
+
+        if (originalBeginWithCompletionHandler == nullptr)
+        {
+            if (activeCompletionObservations == nil)
+                activeCompletionObservations = [[NSMutableSet alloc] init];
+            auto saveMethod = class_getInstanceMethod([NSSavePanel class],
+                                                      @selector(beginWithCompletionHandler:));
+            auto openMethod = class_getInstanceMethod([NSOpenPanel class],
+                                                      @selector(beginWithCompletionHandler:));
+            if (saveMethod == nullptr || openMethod == nullptr || saveMethod != openMethod)
+                throw std::runtime_error("NATIVE_PANEL_SETUP: cannot observe native panel completion");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wnullable-to-nonnull-conversion"
+            auto original = method_getImplementation(saveMethod);
+#pragma clang diagnostic pop
+            const auto replacement = reinterpret_cast<IMP>(trackedBeginWithCompletionHandler);
+            if (original == nullptr || original == replacement)
+                throw std::runtime_error("NATIVE_PANEL_SETUP: cannot install native panel completion observer");
+            originalBeginWithCompletionHandler = reinterpret_cast<BeginWithCompletionHandler>(original);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wnullable-to-nonnull-conversion"
+            auto displaced = method_setImplementation(saveMethod, replacement);
+#pragma clang diagnostic pop
+            if (displaced != original)
+                throw std::runtime_error("NATIVE_PANEL_SETUP: native panel completion observer changed concurrently");
+        }
     }
 }
 void NativeFilePanel::disableAutomaticHostWindowAnimations(void* nativeView)
@@ -59,66 +163,12 @@ void NativeFilePanel::disableAutomaticHostWindowAnimations(void* nativeView)
         [window setAnimationBehavior:NSWindowAnimationBehaviorNone];
     }
 }
-void NativeFilePanel::dispatchEventsFor(int millisecondsToRunFor)
-{
-    if (millisecondsToRunFor < 0)
-        throw std::runtime_error("Native panel event dispatch received a negative duration");
-
-    @autoreleasepool
-    {
-        if (![NSThread isMainThread])
-            throw std::runtime_error("Native panel tests require main-thread event dispatch");
-
-        // Process one run-loop source boundary, then let the caller re-check its
-        // predicate. Sending NSEvents here can enter an unbounded synchronous
-        // AppKit callback after a native panel has closed.
-        if (millisecondsToRunFor > 0)
-            CFRunLoopRunInMode(kCFRunLoopDefaultMode,
-                               static_cast<CFTimeInterval>(millisecondsToRunFor) * 0.001, true);
-    }
-}
-void NativeFilePanel::dispatchActivationEventsFor(int millisecondsToRunFor)
-{
-    if (millisecondsToRunFor < 0)
-        throw std::runtime_error("Native panel activation dispatch received a negative duration");
-
-    @autoreleasepool
-    {
-        if (![NSThread isMainThread])
-            throw std::runtime_error("Native panel tests require main-thread event dispatch");
-
-        // A lifecycle NSEvent is safe only while bootstrapping the process's
-        // first test window. Once any native panel has been observed, never
-        // re-enter AppKit through sendEvent; later windows need source delivery
-        // only and the caller retains its bounded activation predicate.
-        if (! activationLifecycleEventsAllowed)
-        {
-            if (millisecondsToRunFor > 0)
-                CFRunLoopRunInMode(kCFRunLoopDefaultMode,
-                                   static_cast<CFTimeInterval>(millisecondsToRunFor) * 0.001, true);
-            return;
-        }
-
-        constexpr auto lifecycleEventMask = NSEventMaskAppKitDefined
-                                          | NSEventMaskApplicationDefined;
-        if (NSEvent* event = [NSApp nextEventMatchingMask:lifecycleEventMask
-                                                 untilDate:[NSDate distantPast]
-                                                    inMode:NSDefaultRunLoopMode
-                                                   dequeue:YES])
-        {
-            [NSApp sendEvent:event];
-            return;
-        }
-
-        if (millisecondsToRunFor > 0)
-            CFRunLoopRunInMode(kCFRunLoopDefaultMode,
-                               static_cast<CFTimeInterval>(millisecondsToRunFor) * 0.001, true);
-    }
-}
 std::unique_ptr<NativeFilePanel> NativeFilePanel::findVisible(bool importing, const char* title)
 {
     @autoreleasepool
     {
+        if (![NSThread isMainThread])
+            throw std::runtime_error("NATIVE_PANEL_OBSERVER: panel inspection requires the main thread");
         for (NSWindow* window in [NSApp windows])
         {
             if (![window isKindOfClass:[NSSavePanel class]] || ![window isVisible])
@@ -127,8 +177,10 @@ std::unique_ptr<NativeFilePanel> NativeFilePanel::findVisible(bool importing, co
             const bool isOpen = [candidate isKindOfClass:[NSOpenPanel class]];
             if (isOpen == importing && [[candidate title] isEqualToString:checkedUTF8(title)])
             {
-                activationLifecycleEventsAllowed = false;
-                return std::unique_ptr<NativeFilePanel>(new NativeFilePanel(candidate));
+                id tracked = objc_getAssociatedObject(candidate, &completionObservationKey);
+                if (tracked == nil)
+                    throw std::runtime_error("NATIVE_PANEL_OBSERVER: visible panel has no tracked completion session");
+                return std::unique_ptr<NativeFilePanel>(new NativeFilePanel(candidate, (void*) tracked));
             }
         }
         return {};
@@ -158,6 +210,47 @@ bool NativeFilePanel::hasDelegate() const
     {
         auto* candidate = resolvePanel(panel);
         return candidate != nil && [candidate delegate] != nil;
+    }
+}
+bool NativeFilePanel::beganExactlyOnce() const
+{
+    @synchronized ([NSSavePanel class])
+    {
+        auto* state = (WhyKikiNativePanelSessionObservation*) observation;
+        return state != nil && state->beginCount == 1 && state->beginReturnCount == 1;
+    }
+}
+bool NativeFilePanel::completionHasNotStarted() const
+{
+    @synchronized ([NSSavePanel class])
+    {
+        auto* state = (WhyKikiNativePanelSessionObservation*) observation;
+        return state != nil && state->beginCount == 1 && state->beginReturnCount == 1
+            && state->completionEntryCount == 0 && state->completionReturnCount == 0;
+    }
+}
+bool NativeFilePanel::completionProgressIsValid() const
+{
+    @synchronized ([NSSavePanel class])
+    {
+        auto* state = (WhyKikiNativePanelSessionObservation*) observation;
+        return state != nil && state->beginCount == 1 && state->beginReturnCount == 1
+            && state->completionEntryCount <= 1
+            && state->completionReturnCount <= state->completionEntryCount;
+    }
+}
+bool NativeFilePanel::completionReturnedExactlyOnce() const
+{
+    @synchronized ([NSSavePanel class])
+    {
+        return returnedExactlyOnce((WhyKikiNativePanelSessionObservation*) observation);
+    }
+}
+bool NativeFilePanel::hasActiveCompletionSession()
+{
+    @synchronized ([NSSavePanel class])
+    {
+        return activeCompletionObservations != nil && [activeCompletionObservations count] != 0;
     }
 }
 std::string NativeFilePanel::className() const
