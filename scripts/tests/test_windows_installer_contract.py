@@ -542,12 +542,13 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
             "secureCustomProperties = @($msiContract.SecureCustomProperties)",
             "Malformed or duplicate MSI Property row",
             "Duplicate MSI LaunchCondition row",
-            "INSTALLEDORNOTWIX_DOWNGRADE_DETECTED",
+            "$expectedLaunchConditions.Add('NOTWIX_DOWNGRADE_DETECTED')",
             "INSTALLEDORNOTOTHERARCHITECTUREDETECTED",
             "$launchConditions.SetEquals($expectedLaunchConditions)",
             "MSI LaunchCondition table is not the exact downgrade/architecture contract",
         ):
             self.assertIn(token, self.script)
+        self.assertNotIn("INSTALLEDORNOTWIX_DOWNGRADE_DETECTED", self.script)
 
     def test_production_updater_version_resource_is_identity_bound(self) -> None:
         for token in (

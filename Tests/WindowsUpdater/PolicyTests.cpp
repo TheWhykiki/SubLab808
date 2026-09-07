@@ -92,9 +92,12 @@ int main()
     removeAll[0].remove = "ALL";
     require(! hasExactUpgradeContract(removeAll, currentCode, otherCode, *newer),
             "non-NULL WiX Upgrade Remove policy rejected");
-    require(hasExactLaunchConditions({ "Installed OR NOT WIX_DOWNGRADE_DETECTED",
+    require(hasExactLaunchConditions({ "NOT WIX_DOWNGRADE_DETECTED",
                                        "(Installed OR NOT OTHERARCHITECTUREDETECTED)" }),
             "exact launch conditions accepted");
+    require(! hasExactLaunchConditions({ "Installed OR NOT WIX_DOWNGRADE_DETECTED",
+                                         "Installed OR NOT OTHERARCHITECTUREDETECTED" }),
+            "legacy WiX downgrade condition rejected");
     require(! hasExactLaunchConditions({ "1 OR NOT WIX_DOWNGRADE_DETECTED",
                                          "Installed OR NOT OTHERARCHITECTUREDETECTED" }),
             "bypassed downgrade condition rejected");

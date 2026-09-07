@@ -306,7 +306,7 @@ def validate_assets(
         launch_conditions = validation.get("launchConditions")
         _require(isinstance(launch_conditions, list) and len(launch_conditions) == 2 and
                  set(launch_conditions) == {
-            "INSTALLEDORNOTWIX_DOWNGRADE_DETECTED",
+            "NOTWIX_DOWNGRADE_DETECTED",
             "INSTALLEDORNOTOTHERARCHITECTUREDETECTED",
         }, f"MSI launch-condition evidence is invalid for {architecture}")
         _validate_payload_files(evidence, product)

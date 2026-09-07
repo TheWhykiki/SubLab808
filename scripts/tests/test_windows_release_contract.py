@@ -72,10 +72,18 @@ class WindowsReleaseContractTests(unittest.TestCase):
         self.assertIn(f"group: {PRODUCT}-windows-release\n", self.release)
         self.assertNotIn("windows-release-${{ inputs.tag }}", self.release)
 
-    def test_dispatch_tag_is_never_interpolated_into_shell_source(self) -> None:
+    def test_dispatch_values_are_never_interpolated_into_shell_source(self) -> None:
         self.assertEqual(self.release.count("WK_INPUT_TAG: ${{ inputs.tag }}"), 3)
         self.assertEqual(self.release.count("$tag = $env:WK_INPUT_TAG"), 1)
         self.assertEqual(self.release.count('tag="$WK_INPUT_TAG"'), 3)
+        self.assertEqual(
+            self.release.count(
+                "WK_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}"
+            ),
+            3,
+        )
+        self.assertEqual(self.release.count("$defaultBranch = $env:WK_DEFAULT_BRANCH"), 1)
+        self.assertEqual(self.release.count('default_branch="$WK_DEFAULT_BRANCH"'), 2)
         allowed_prefixes = ("run-name:", "ref:", "WK_INPUT_TAG:")
         unsafe_lines = [
             line
@@ -84,6 +92,13 @@ class WindowsReleaseContractTests(unittest.TestCase):
             and not line.strip().startswith(allowed_prefixes)
         ]
         self.assertEqual(unsafe_lines, [])
+        unsafe_default_branch_lines = [
+            line
+            for line in self.release.splitlines()
+            if "${{ github.event.repository.default_branch }}" in line
+            and not line.strip().startswith("WK_DEFAULT_BRANCH:")
+        ]
+        self.assertEqual(unsafe_default_branch_lines, [])
 
     def test_native_architectures_and_production_build_are_separate(self) -> None:
         for token in (
@@ -443,7 +458,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
                 ],
                 "launchConditions": [
                     "INSTALLEDORNOTOTHERARCHITECTUREDETECTED",
-                    "INSTALLEDORNOTWIX_DOWNGRADE_DETECTED",
+                    "NOTWIX_DOWNGRADE_DETECTED",
                 ],
             },
         }
@@ -498,6 +513,14 @@ class WindowsReleaseContractTests(unittest.TestCase):
             ("updaterVersionResource", "originalFilename", "WrongUpdater.exe"),
             ("validation", "msiDeploymentCompliant", "0"),
             ("validation", "secureCustomProperties", ["WIX_UPGRADE_DETECTED"]),
+            (
+                "validation",
+                "launchConditions",
+                [
+                    "INSTALLEDORNOTOTHERARCHITECTUREDETECTED",
+                    "INSTALLEDORNOTWIX_DOWNGRADE_DETECTED",
+                ],
+            ),
             ("validation", "displayName", PRODUCT),
         )
         for section, key, value in mutations:

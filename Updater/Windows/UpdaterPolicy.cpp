@@ -271,7 +271,7 @@ bool hasExactLaunchConditions(const std::vector<std::string>& rawConditions)
     }
     return conditions == std::set<std::string> {
         "INSTALLEDORNOTOTHERARCHITECTUREDETECTED",
-        "INSTALLEDORNOTWIX_DOWNGRADE_DETECTED" };
+        "NOTWIX_DOWNGRADE_DETECTED" };
 }
 
 bool componentDirectoriesAreInsideInstallFolder(

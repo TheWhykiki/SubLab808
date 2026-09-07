@@ -62,6 +62,7 @@ jobs:
     env:
       PRODUCT: SubLab808
       WK_INPUT_TAG: ${{ inputs.tag }}
+      WK_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       SIGNER_SHA256: ${{ vars.WINDOWS_CODE_SIGNING_CERT_SHA256 }}
       NEXT_SIGNER_SHA256: ${{ vars.WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256 }}
       TIMESTAMP_URL: ${{ vars.WINDOWS_RFC3161_TIMESTAMP_URL }}
@@ -91,7 +92,7 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $headCommit -cne $tagCommit) {
             throw 'Checkout does not exactly match the requested tag commit.'
           }
-          $defaultBranch = '${{ github.event.repository.default_branch }}'
+          $defaultBranch = $env:WK_DEFAULT_BRANCH
           & git fetch --no-tags origin "+refs/heads/${defaultBranch}:refs/remotes/origin/${defaultBranch}"
           if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the current origin default branch.' }
           & git merge-base --is-ancestor $tagCommit "refs/remotes/origin/$defaultBranch"
@@ -372,6 +373,7 @@ jobs:
     env:
       PRODUCT: SubLab808
       WK_INPUT_TAG: ${{ inputs.tag }}
+      WK_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       APPLICATION_IDENTITY: ${{ vars.MACOS_DEVELOPER_ID_APPLICATION_IDENTITY }}
       INSTALLER_IDENTITY: ${{ vars.MACOS_DEVELOPER_ID_INSTALLER_IDENTITY }}
       APPLICATION_SIGNER_SHA256: ${{ vars.MACOS_DEVELOPER_ID_APPLICATION_CERT_SHA256 }}
@@ -397,7 +399,7 @@ jobs:
           git show-ref --verify --quiet "$tag_reference"
           tag_commit="$(git rev-parse "$tag_reference^{commit}")"
           test "$(git rev-parse HEAD)" = "$tag_commit"
-          default_branch='${{ github.event.repository.default_branch }}'
+          default_branch="$WK_DEFAULT_BRANCH"
           git fetch --no-tags origin "+refs/heads/$default_branch:refs/remotes/origin/$default_branch"
           git merge-base --is-ancestor "$tag_commit" "refs/remotes/origin/$default_branch"
           remote_lines="$(git ls-remote --exit-code origin "$tag_reference" "$tag_reference^{}")"
@@ -586,6 +588,7 @@ jobs:
     env:
       PRODUCT: SubLab808
       WK_INPUT_TAG: ${{ inputs.tag }}
+      WK_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       SIGNER_SHA256: ${{ vars.WINDOWS_CODE_SIGNING_CERT_SHA256 }}
       NEXT_SIGNER_SHA256: ${{ vars.WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256 }}
       APPLICATION_IDENTITY: ${{ vars.MACOS_DEVELOPER_ID_APPLICATION_IDENTITY }}
@@ -622,7 +625,7 @@ jobs:
           version="${tag#v}"
           tag_commit="$(git rev-parse "refs/tags/$tag^{commit}")"
           test "$(git rev-parse HEAD)" = "$tag_commit"
-          default_branch='${{ github.event.repository.default_branch }}'
+          default_branch="$WK_DEFAULT_BRANCH"
           git fetch --no-tags origin "+refs/heads/$default_branch:refs/remotes/origin/$default_branch"
           git merge-base --is-ancestor "$tag_commit" "refs/remotes/origin/$default_branch"
           remote_lines="$(git ls-remote --exit-code origin "refs/tags/$tag" "refs/tags/$tag^{}")"

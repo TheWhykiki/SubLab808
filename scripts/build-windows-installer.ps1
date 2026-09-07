@@ -1164,7 +1164,7 @@ function Test-MsiContract {
         }
         $expectedLaunchConditions = [System.Collections.Generic.HashSet[string]]::new(
             [System.StringComparer]::Ordinal)
-        [void]$expectedLaunchConditions.Add('INSTALLEDORNOTWIX_DOWNGRADE_DETECTED')
+        [void]$expectedLaunchConditions.Add('NOTWIX_DOWNGRADE_DETECTED')
         [void]$expectedLaunchConditions.Add('INSTALLEDORNOTOTHERARCHITECTUREDETECTED')
         Assert-Condition ($launchConditions.SetEquals($expectedLaunchConditions)) `
             'MSI LaunchCondition table is not the exact downgrade/architecture contract.'
