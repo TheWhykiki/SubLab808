@@ -15,6 +15,10 @@ public:
     // Dispatch default AppKit/JUCE run-loop sources without manually sending
     // input events or re-entering NSApplication's unbounded top-level loop.
     static void dispatchEventsFor(int millisecondsToRunFor);
+    // The console harness has no NSApplication::run loop. Before the first
+    // native panel only, deliver one queued lifecycle event or one source slice;
+    // after a panel is observed this permanently falls back to source-only.
+    static void dispatchActivationEventsFor(int millisecondsToRunFor);
     static std::unique_ptr<NativeFilePanel> findVisible(bool importing, const char* title);
     static int visibleCount();
     ~NativeFilePanel();

@@ -8,9 +8,9 @@ with a fake or call an artificial successful import/export callback.
 Each case requires a visible, correctly typed native panel and a live JUCE modal
 before the owner transition. Afterwards the native panel must be hidden, its JUCE
 delegate cleared, removed from `NSApp.windows`, and the JUCE modal destroyed. A
-full dispatcher turn then gives pending completion work another opportunity to
-run before the editor is reopened; one disappearance observation alone is not
-treated as completed teardown. The next same-process case and wrap-around
+JUCE/default-run-loop source fence then gives pending completion work another
+opportunity to run before the editor is reopened; one disappearance observation
+alone is not treated as completed teardown. The next same-process case and wrap-around
 sentinel detect leaked session state. Exact processor state, preset selection,
 and every file/directory in the temporary fixture must remain unchanged.
 The reopened editor must accept a real Save As/Cancel interaction and parameter
@@ -24,11 +24,12 @@ event. This avoids re-entering the `ComponentMovementWatcher` notification that
 caused cancellation without posting a second owner-specific callback object.
 The deferred chooser remains owned by PresetBar. On destruction, its existing
 timer is stopped and member ordering unregisters the watcher before active or
-deferred choosers are destroyed. The harness then proves eventual AppKit
-quiescence on a running message loop before the editor is reopened. It does not
-claim that a host may dynamically unload the VST3 module in the same call stack,
-before AppKit has retired its completion handler; exact-host acceptance must
-cover that stronger boundary.
+deferred choosers are destroyed. Before the editor is reopened, the harness
+proves JUCE/default-run-loop source completion plus observed panel, delegate and
+modal teardown. It deliberately does not claim that every queued AppKit NSEvent
+has been drained, or that a host may dynamically unload the VST3 module in the
+same call stack before AppKit has retired its completion handler; exact-host
+acceptance must cover that stronger boundary.
 
 The bridge observes only the test process's own NSApp windows. It stores the
 panel's opaque identity and re-resolves it through the live window list on every
@@ -41,9 +42,11 @@ preset library is modified.
 The console harness completes `NSApplication` launch once, then dispatches only
 the default JUCE/AppKit run-loop sources. It never re-enters the unbounded top-level
 `[NSApp run]` for a short slice: an asynchronous native-panel completion can outlive
-that slice's one-shot stop event and strand the test outside its C++ deadline. It
-also sends only AppKit/application-defined lifecycle events, never pending user
-input. The tests invoke controls directly, while sending a mouse or key event may
+that slice's one-shot stop event and strand the test outside its C++ deadline.
+Only while activating the process's first test window may the setup bridge send
+one queued AppKit/application-defined lifecycle event; observing the first native
+panel permanently disables manual NSEvent delivery for the rest of that process.
+The tests invoke controls directly, while sending a mouse or key event may
 synchronously enter AppKit tracking and exceed the C++ slice deadline. Modal-panel
 and event-tracking modes remain under AppKit's control instead of being entered
 manually after the modeless panel has closed. Before its first order-in, the

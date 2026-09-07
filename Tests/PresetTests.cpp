@@ -445,12 +445,36 @@ juce::Button* findButton(juce::Component& parent, const juce::String& title)
 #if JUCE_MAC
 bool nativeFileChooserHarnessEnabled = false;
 #endif
+
+// Hosts normally mount a plug-in editor below their own content component.
+// Keep the native test window alive while exercising ancestor visibility so
+// the product lifecycle contract is not coupled to X11 window-manager frames.
+struct TestEditorOwner final : juce::Component
+{
+    explicit TestEditorOwner(juce::AudioProcessorEditor& editorToUse) { attach(editorToUse); }
+
+    void attach(juce::AudioProcessorEditor& editorToUse)
+    {
+        editor = &editorToUse;
+        addAndMakeVisible(editorToUse);
+        setSize(editorToUse.getWidth(), editorToUse.getHeight());
+        resized();
+    }
+
+    void resized() override
+    {
+        if (editor != nullptr) editor->setBounds(getLocalBounds());
+    }
+
+    juce::Component::SafePointer<juce::AudioProcessorEditor> editor;
+};
+
 struct TestWindow final : juce::DocumentWindow
 {
-    explicit TestWindow(juce::AudioProcessorEditor& editor)
+    explicit TestWindow(juce::Component& content)
         : DocumentWindow("Preset UI Tests", juce::Colour(0xff101820), DocumentWindow::closeButton, false)
     {
-        setUsingNativeTitleBar(true); setContentNonOwned(&editor, true);
+        setUsingNativeTitleBar(true); setContentNonOwned(&content, true);
         centreWithSize(getWidth(), getHeight());
         // Configure the title bar, content and initial bounds before creating
         // the native peer. In particular, X11 window-manager ConfigureNotify
@@ -600,11 +624,13 @@ struct LifecycleEditor
 {
     Processor& processor;
     std::unique_ptr<juce::AudioProcessorEditor> editor;
+    TestEditorOwner editorOwner;
     std::unique_ptr<TestWindow> window;
     explicit LifecycleEditor(Processor& p)
         : LifecycleEditor(p, std::unique_ptr<juce::AudioProcessorEditor>(p.createEditor())) {}
     LifecycleEditor(Processor& p, std::unique_ptr<juce::AudioProcessorEditor> preparedEditor)
-        : processor(p), editor(std::move(preparedEditor)), window(std::make_unique<TestWindow>(*editor))
+        : processor(p), editor(std::move(preparedEditor)), editorOwner(*editor),
+          window(std::make_unique<TestWindow>(editorOwner))
     {
         pump();
         require(editor->isShowing(), "lifecycle owner must initially be showing");
@@ -614,7 +640,7 @@ struct LifecycleEditor
         switch (action)
         {
             // Do not hide PresetBar directly: real hosts hide an ancestor.
-            case OwnerAction::hideAncestor: window->setVisible(false); break;
+            case OwnerAction::hideAncestor: editorOwner.setVisible(false); break;
             case OwnerAction::detach: window->clearContentComponent(); break;
             case OwnerAction::destroy:
                 // Destroy while still mounted/visible: detaching first would
@@ -625,7 +651,7 @@ struct LifecycleEditor
                 // Hide queues native-chooser teardown. Destroy immediately,
                 // without pumping that queue, to exercise pending UI cleanup
                 // before the plug-in instance could be unloaded.
-                window->setVisible(false);
+                editorOwner.setVisible(false);
                 require(! editor->isShowing(), "pending-destroy owner is hidden before immediate destruction");
                 editor.reset();
                 break;
@@ -635,8 +661,12 @@ struct LifecycleEditor
     void reopen(OwnerAction action)
     {
         if (action == OwnerAction::destroy || action == OwnerAction::hideThenDestroy)
+        {
             editor.reset(processor.createEditor());
-        if (action != OwnerAction::hideAncestor) window->setContentNonOwned(editor.get(), true);
+            editorOwner.attach(*editor);
+        }
+        if (action != OwnerAction::hideAncestor) window->setContentNonOwned(&editorOwner, true);
+        editorOwner.setVisible(true);
         window->setVisible(true);
         window->toFront(true);
         pump();
@@ -812,6 +842,10 @@ void checkOwnerLifecycle(const juce::File& root, LifecycleDialog kind, OwnerActi
     require(dialog.component->isCurrentlyModal() && juce::Component::getNumCurrentlyModalComponents() == 1,
             "one real owned dialog is modal before lifecycle action");
     owner.apply(action);
+    if (kind == LifecycleDialog::saveAs && action == OwnerAction::hideAncestor)
+        require(dialog.component != nullptr && ! dialog.component->isCurrentlyModal()
+                    && dialog.component->isVisible(),
+                "ancestor hide exits modal state without synchronously hiding its native peer");
     if (kind == LifecycleDialog::management)
         require(dialog.component == nullptr || ! dialog.component->isCurrentlyModal(),
                 "management popup leaves modal state synchronously with its private owner");
@@ -843,7 +877,7 @@ void checkQueuedLifecycleResult(const juce::File& root, LifecycleDialog kind, in
     // No dispatch between completion and the host hiding then reshowing the same
     // editor. isShowing() alone in the old callback cannot detect this stale UI.
     owner.apply(OwnerAction::hideAncestor);
-    owner.window->setVisible(true);
+    owner.editorOwner.setVisible(true);
     owner.window->toFront(true);
     waitForDeletion(dialog.component, "queued old-generation confirmation");
     pump();

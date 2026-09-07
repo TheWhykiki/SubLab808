@@ -104,10 +104,12 @@ private:
         if (component == nullptr) return;
         component->exitModalState(0);
         if (component == nullptr) return;
-        component->setVisible(false);
-        if (component != nullptr) component->setLookAndFeel(nullptr);
-        // JUCE owns these modal windows and deletes them asynchronously. Never
-        // pump a nested message loop, or delete CallOutBox's callback-owned data.
+        component->setLookAndFeel(nullptr);
+        // JUCE owns these modal windows and deletes them on its next async
+        // modal-manager update. Do not synchronously hide a native peer from a
+        // ComponentMovementWatcher callback: on X11 that can race a host-window
+        // unmap with the window manager's reparent/configure notifications.
+        // Never pump a nested loop or delete CallOutBox's callback-owned data.
     }
 
     void cancelFileChooser(std::unique_ptr<juce::FileChooser> fileChooser)

@@ -65,7 +65,7 @@ std::string runNativeFileChooserLifecycle(const juce::File& root, bool importing
         // after launching this process. Keep requesting focus until AppKit has
         // delivered activation to our real test window.
         juce::Process::makeForegroundProcess();
-        require(dispatchUiEventsFor(10), "activate native test window");
+        NativeFilePanel::dispatchActivationEventsFor(10);
     }
     const LifecycleSnapshot stateBefore(processor);
     const NativeFixtureSnapshot filesBefore(root);
@@ -118,8 +118,8 @@ std::string runNativeFileChooserLifecycle(const juce::File& root, bool importing
     }
     // NSSavePanel visibility and delegate teardown happen before AppKit has
     // necessarily removed the panel and retired beginWithCompletionHandler.
-    // Give pending completion work another full dispatcher turn. One panel
-    // disappearance observation is not treated as completed teardown: reopen
+    // Give pending completion work another default-run-loop source fence. One
+    // panel disappearance observation is not treated as completed teardown: reopen
     // assertions and the next same-process case (including the wrap-around
     // sentinel) detect leaked session state.
     pump();

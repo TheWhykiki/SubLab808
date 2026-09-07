@@ -1,11 +1,11 @@
 #include "NativeFilePanel.h"
-#include <algorithm>
-#include <chrono>
 #include <stdexcept>
 #import <AppKit/AppKit.h>
 
 namespace
 {
+bool activationLifecycleEventsAllowed = true;
+
 NSString* checkedUTF8(const char* text)
 {
     auto* result = [NSString stringWithUTF8String:text];
@@ -64,31 +64,55 @@ void NativeFilePanel::dispatchEventsFor(int millisecondsToRunFor)
     if (millisecondsToRunFor < 0)
         throw std::runtime_error("Native panel event dispatch received a negative duration");
 
-    const auto deadline = std::chrono::steady_clock::now()
-                        + std::chrono::milliseconds(millisecondsToRunFor);
-    while (std::chrono::steady_clock::now() < deadline)
+    @autoreleasepool
     {
-        @autoreleasepool
+        if (![NSThread isMainThread])
+            throw std::runtime_error("Native panel tests require main-thread event dispatch");
+
+        // Process one run-loop source boundary, then let the caller re-check its
+        // predicate. Sending NSEvents here can enter an unbounded synchronous
+        // AppKit callback after a native panel has closed.
+        if (millisecondsToRunFor > 0)
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode,
+                               static_cast<CFTimeInterval>(millisecondsToRunFor) * 0.001, true);
+    }
+}
+void NativeFilePanel::dispatchActivationEventsFor(int millisecondsToRunFor)
+{
+    if (millisecondsToRunFor < 0)
+        throw std::runtime_error("Native panel activation dispatch received a negative duration");
+
+    @autoreleasepool
+    {
+        if (![NSThread isMainThread])
+            throw std::runtime_error("Native panel tests require main-thread event dispatch");
+
+        // A lifecycle NSEvent is safe only while bootstrapping the process's
+        // first test window. Once any native panel has been observed, never
+        // re-enter AppKit through sendEvent; later windows need source delivery
+        // only and the caller retains its bounded activation predicate.
+        if (! activationLifecycleEventsAllowed)
         {
-            if (![NSThread isMainThread])
-                throw std::runtime_error("Native panel tests require main-thread event dispatch");
-            const auto remaining = std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count();
-            if (remaining <= 0.0) break;
-            // JUCE presents this panel asynchronously with a completion handler,
-            // not with an AppKit modal or event-tracking loop. The test invokes
-            // controls directly, so it only needs queued run-loop sources plus
-            // AppKit/application-defined lifecycle events. Manually sending an
-            // arbitrary pending NSEvent can enter AppKit's mouse/key tracking
-            // synchronously and outlive this bounded slice.
-            CFRunLoopRunInMode(kCFRunLoopDefaultMode, std::min(remaining, 0.001), true);
-            constexpr auto lifecycleEventMask = NSEventMaskAppKitDefined
-                                              | NSEventMaskApplicationDefined;
-            if (NSEvent* event = [NSApp nextEventMatchingMask:lifecycleEventMask
-                                                     untilDate:[NSDate distantPast]
-                                                        inMode:NSDefaultRunLoopMode
-                                                       dequeue:YES])
-                [NSApp sendEvent:event];
+            if (millisecondsToRunFor > 0)
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode,
+                                   static_cast<CFTimeInterval>(millisecondsToRunFor) * 0.001, true);
+            return;
         }
+
+        constexpr auto lifecycleEventMask = NSEventMaskAppKitDefined
+                                          | NSEventMaskApplicationDefined;
+        if (NSEvent* event = [NSApp nextEventMatchingMask:lifecycleEventMask
+                                                 untilDate:[NSDate distantPast]
+                                                    inMode:NSDefaultRunLoopMode
+                                                   dequeue:YES])
+        {
+            [NSApp sendEvent:event];
+            return;
+        }
+
+        if (millisecondsToRunFor > 0)
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode,
+                               static_cast<CFTimeInterval>(millisecondsToRunFor) * 0.001, true);
     }
 }
 std::unique_ptr<NativeFilePanel> NativeFilePanel::findVisible(bool importing, const char* title)
@@ -102,7 +126,10 @@ std::unique_ptr<NativeFilePanel> NativeFilePanel::findVisible(bool importing, co
             auto* candidate = (NSSavePanel*) window;
             const bool isOpen = [candidate isKindOfClass:[NSOpenPanel class]];
             if (isOpen == importing && [[candidate title] isEqualToString:checkedUTF8(title)])
+            {
+                activationLifecycleEventsAllowed = false;
                 return std::unique_ptr<NativeFilePanel>(new NativeFilePanel(candidate));
+            }
         }
         return {};
     }
