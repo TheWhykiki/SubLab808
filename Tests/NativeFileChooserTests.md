@@ -22,8 +22,11 @@ event. This avoids re-entering the `ComponentMovementWatcher` notification that
 caused cancellation without posting a second owner-specific callback object.
 The deferred chooser remains owned by PresetBar. On destruction, its existing
 timer is stopped and member ordering unregisters the watcher before active or
-deferred choosers are destroyed. Thus no callback or native object survives
-into a possible VST3 module unload.
+deferred choosers are destroyed. The harness then proves eventual AppKit
+quiescence on a running message loop before the editor is reopened. It does not
+claim that a host may dynamically unload the VST3 module in the same call stack,
+before AppKit has retired its completion handler; exact-host acceptance must
+cover that stronger boundary.
 
 The bridge observes only the test process's own NSApp windows. It stores the
 panel's opaque identity and re-resolves it through the live window list on every
@@ -56,7 +59,7 @@ To reproduce one isolated case manually, also set
 `WHYKIKI_PRESET_TEST_NATIVE_CASE` to an operation (`import` or `export`) plus
 one of `ancestor-hide`, `detach`, `destroy`, or `hide-then-destroy`. The last
 case intentionally performs no message-loop turn between hiding the owner and
-destroying it, so a queued native chooser cannot outlive the plug-in owner.
+destroying it, exercising member teardown before the queued timer can run.
 
 An active macOS desktop session is required. Run native UI suites serially.
 The console test's bridge completes NSApplication launch and activates only its

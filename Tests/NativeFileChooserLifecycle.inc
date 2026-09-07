@@ -82,6 +82,10 @@ void checkNativeFileChooserLifecycle(const juce::File& root, bool importing, Own
     const auto nativeClass = panel->className();
     panel->useFixtureLocation(external.getFullPathName().toStdString(),
                               (importing ? input : output).getFileName().toStdString());
+    // Let AppKit finish the test-only directory/name synchronization before
+    // exercising product teardown. Otherwise the fixture navigation itself
+    // races panel cancellation and confounds the owner-lifetime contract.
+    pump();
     require(nativeModal.component->isCurrentlyModal() && panel->isVisible(),
             "native panel and JUCE modal are both active before owner transition");
     stateBefore.unchanged(processor);
@@ -95,7 +99,7 @@ void checkNativeFileChooserLifecycle(const juce::File& root, bool importing, Own
     if (action == OwnerAction::destroy || action == OwnerAction::hideThenDestroy)
     {
         require(nativeModal.component == nullptr && ! panel->isVisible() && ! panel->hasDelegate(),
-                "editor destruction does not leave plugin code or a native chooser pending past owner lifetime");
+                "editor destruction synchronously clears the JUCE modal, native visibility and JUCE delegate");
     }
     else
     {
