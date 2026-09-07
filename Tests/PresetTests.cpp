@@ -453,6 +453,15 @@ struct TestWindow final : juce::DocumentWindow
     ~TestWindow() override { clearContentComponent(); }
     void closeButtonPressed() override { setVisible(false); }
 };
+bool dispatchUiEventsFor(int millisecondsToRunFor)
+{
+#if JUCE_MAC
+    NativeFilePanel::dispatchEventsFor(millisecondsToRunFor);
+    return true;
+#else
+    return juce::MessageManager::getInstance()->runDispatchLoopUntil(millisecondsToRunFor);
+#endif
+}
 void pump()
 {
     // Wait for the queued callbacks, not an arbitrary wall-clock delay. Busy CI
@@ -460,7 +469,7 @@ void pump()
     auto serviced = std::make_shared<bool>(false);
     require(juce::MessageManager::callAsync([serviced] { *serviced = true; }), "post UI queue barrier");
     for (int attempt = 0; attempt < 200 && ! *serviced; ++attempt)
-        juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+        require(dispatchUiEventsFor(10), "message dispatch stopped before UI queue barrier");
     require(*serviced, "UI queue barrier completed");
 }
 template <typename ComponentType>
@@ -479,7 +488,7 @@ void waitForDeletion(juce::Component::SafePointer<ComponentType> component, cons
                          juce::Component::getNumCurrentlyModalComponents());
             throw std::runtime_error(juce::String("Modal component was not destroyed: ").toStdString() + description);
         }
-        require(juce::MessageManager::getInstance()->runDispatchLoopUntil(10),
+        require(dispatchUiEventsFor(10),
                 "message dispatch stopped before modal component destruction");
     }
     std::printf("UI teardown: %s destroyed\n", description);
@@ -563,7 +572,7 @@ struct OwnedModalCleanup
         component->exitModalState(0);
         const auto began = juce::Time::getMillisecondCounterHiRes();
         while (component != nullptr && juce::Time::getMillisecondCounterHiRes() - began < 2000.0)
-            if (! juce::MessageManager::getInstance()->runDispatchLoopUntil(10)) break;
+            if (! dispatchUiEventsFor(10)) break;
         if (component != nullptr) std::fprintf(stderr, "FAILURE_CLEANUP: captured dialog still alive\n");
     }
 };

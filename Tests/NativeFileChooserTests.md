@@ -36,6 +36,16 @@ temporary directory containing an input preset and an initially nonexistent expo
 destination; it never confirms a file operation. No DAW, installed bundle, or user
 preset library is modified.
 
+The console harness also supplies its own deadline-aware macOS event-pump turn.
+JUCE 8.0.15's `runDispatchLoopUntil()` asks AppKit's
+`nextEventMatchingMask()` to wait until a future date; JUCE issue #1574
+documents delayed event delivery at that boundary, and CI observed dispatch
+calls outliving the surrounding lifecycle deadlines. The test-only bridge keeps
+the bounded CFRunLoop slice but polls AppKit with `distantPast`, removing the
+avoidable wait for nonexistent input. CTest remains the hard watchdog for an
+event callback itself. This changes no product code and relaxes none of the
+lifecycle assertions above.
+
 ## Running
 
 Build the product's PresetTests target, then set

@@ -1,4 +1,5 @@
 #include "NativeFilePanel.h"
+#include <chrono>
 #include <stdexcept>
 #import <AppKit/AppKit.h>
 
@@ -42,6 +43,36 @@ void NativeFilePanel::prepareTestApplication()
         if ([NSApp activationPolicy] != NSApplicationActivationPolicyRegular)
             throw std::runtime_error("NATIVE_PANEL_SETUP: test application cannot become a regular GUI process");
         [NSApp finishLaunching];
+    }
+}
+void NativeFilePanel::dispatchEventsFor(int millisecondsToRunFor)
+{
+    if (millisecondsToRunFor < 0)
+        throw std::runtime_error("Native panel event dispatch received a negative duration");
+
+    // This mirrors JUCE's macOS runDispatchLoopUntil() closely, except that
+    // AppKit event retrieval is deliberately non-blocking. JUCE 8.0.15 asks
+    // nextEventMatchingMask() to wait until a date in the future, and JUCE issue
+    // #1574 documents delayed event delivery around that boundary. CI observed
+    // dispatch calls outliving the surrounding lifecycle deadlines. distantPast
+    // removes that avoidable wait and only dequeues an event already available;
+    // CTest remains the hard watchdog for code executed by an event callback.
+    const auto deadline = std::chrono::steady_clock::now()
+                        + std::chrono::milliseconds(millisecondsToRunFor);
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        @autoreleasepool
+        {
+            const auto remaining = std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count();
+            if (remaining <= 0.0) break;
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, remaining < 0.001 ? remaining : 0.001, true);
+
+            if (NSEvent* event = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                                     untilDate:[NSDate distantPast]
+                                                        inMode:NSDefaultRunLoopMode
+                                                       dequeue:YES])
+                [NSApp sendEvent:event];
+        }
     }
 }
 std::unique_ptr<NativeFilePanel> NativeFilePanel::findVisible(bool importing, const char* title)

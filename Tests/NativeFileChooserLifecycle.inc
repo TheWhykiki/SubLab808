@@ -35,7 +35,7 @@ std::unique_ptr<NativeFilePanel> waitForNativeFilePanel(bool importing)
             require(NativeFilePanel::visibleCount() == 1, "exactly one native file panel belongs to this test process");
             return panel;
         }
-        require(juce::MessageManager::getInstance()->runDispatchLoopUntil(10),
+        require(dispatchUiEventsFor(10),
                 "message dispatch stopped while waiting for native file panel");
     }
     throw std::runtime_error("NATIVE_PANEL_SETUP_TIMEOUT: real NSSavePanel/NSOpenPanel did not become visible");
@@ -65,7 +65,7 @@ void checkNativeFileChooserLifecycle(const juce::File& root, bool importing, Own
         // after launching this process. Keep requesting focus until AppKit has
         // delivered activation to our real test window.
         juce::Process::makeForegroundProcess();
-        require(juce::MessageManager::getInstance()->runDispatchLoopUntil(10), "activate native test window");
+        require(dispatchUiEventsFor(10), "activate native test window");
     }
     const LifecycleSnapshot stateBefore(processor);
     const NativeFixtureSnapshot filesBefore(root);
@@ -113,7 +113,7 @@ void checkNativeFileChooserLifecycle(const juce::File& root, bool importing, Own
     {
         if (juce::Time::getMillisecondCounterHiRes() - started >= 10000.0)
             throw std::runtime_error("NATIVE_PANEL_TEARDOWN_TIMEOUT: panel remains visible, retains its JUCE delegate, or remains in NSApp.windows");
-        require(juce::MessageManager::getInstance()->runDispatchLoopUntil(10),
+        require(dispatchUiEventsFor(10),
                 "message dispatch stopped before native panel teardown");
     }
     // NSSavePanel visibility and delegate teardown happen before AppKit has
