@@ -615,7 +615,7 @@ function Invoke-InstallerPolicyMutationTests {
         Assert-PolicyMutationRejected {
             Get-PayloadExecutableContract (Get-SafeTreeSnapshot $payloadRoot) `
                 'PolicyFixture' $pluginRelative $true
-        } 'must not embed an updater or any additional PE helper' 'unsigned hidden PE helper'
+        } 'only the exact primary VST3 PE' 'unsigned hidden PE helper'
         [System.IO.File]::Delete($hiddenHelper)
 
         $expectedUpdater = Join-Path $payloadRoot 'Contents\Helpers\PolicyFixtureUpdater.exe'
