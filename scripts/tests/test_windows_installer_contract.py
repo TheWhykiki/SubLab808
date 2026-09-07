@@ -109,6 +109,53 @@ if ($errors.Count -ne 0) {
         self.assertIn("WiX failed with exit code ${exitCode}:", self.script)
         self.assertNotIn("WiX failed with exit code $exitCode:", self.script)
 
+    def test_string_presence_checks_bind_explicit_booleans(self) -> None:
+        resolve_file = self.script[
+            self.script.index("function Resolve-ExistingFile") :
+            self.script.index("function Get-RelativePathInside")
+        ]
+        resolve_dumpbin = self.script[
+            self.script.index("function Resolve-Dumpbin") :
+            self.script.index("function Resolve-SignTool")
+        ]
+        resolve_signtool = self.script[
+            self.script.index("function Resolve-SignTool") :
+            self.script.index("function Resolve-SigningCertificate")
+        ]
+        production = self.script[
+            self.script.index("if ($AllowUnsigned)") :
+            self.script.index("$outputRoot = Get-FullPath")
+        ]
+        self.assertIn(
+            "Assert-Condition (-not [string]::IsNullOrWhiteSpace($Path))",
+            resolve_file,
+        )
+        self.assertIn(
+            "Assert-Condition ($LASTEXITCODE -eq 0 -and\n"
+            "                      -not [string]::IsNullOrWhiteSpace($installation))",
+            resolve_dumpbin,
+        )
+        self.assertEqual(
+            sum(
+                "Assert-Condition (-not [string]::IsNullOrWhiteSpace($programFilesX86))"
+                in section
+                for section in (resolve_dumpbin, resolve_signtool)
+            ),
+            2,
+        )
+        self.assertIn(
+            "Assert-Condition (-not [string]::IsNullOrWhiteSpace($TimestampUrl))",
+            production,
+        )
+        self.assertNotIn(
+            "Assert-Condition ($LASTEXITCODE -eq 0 -and $installation)",
+            resolve_dumpbin,
+        )
+        self.assertNotRegex(
+            self.script,
+            r"Assert-Condition\s+\(\$[A-Za-z_][A-Za-z0-9_]*\)(?=\s)",
+        )
+
     def test_product_configuration_has_stable_architecture_identities(self) -> None:
         self.assertEqual(self.config["schemaVersion"], 1)
         self.assertEqual(self.config["productName"], ROOT.name)

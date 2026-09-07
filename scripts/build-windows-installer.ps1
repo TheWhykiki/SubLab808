@@ -62,7 +62,7 @@ function Get-FullPath {
 
 function Resolve-ExistingFile {
     param([string] $Path, [string] $Description)
-    Assert-Condition ($Path) "$Description path is required."
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($Path)) "$Description path is required."
     $full = Get-FullPath $Path
     Assert-Condition (Test-Path -LiteralPath $full -PathType Leaf) "$Description was not found: $full"
     $item = Get-Item -LiteralPath $full -Force
@@ -740,11 +740,14 @@ function Resolve-Dumpbin {
     if ($RequestedPath) { return Resolve-ExistingFile $RequestedPath 'dumpbin.exe' }
 
     $programFilesX86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
-    Assert-Condition ($programFilesX86) 'ProgramFiles(x86) is unavailable; pass -DumpbinPath explicitly.'
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($programFilesX86)) `
+        'ProgramFiles(x86) is unavailable; pass -DumpbinPath explicitly.'
     $vswhere = Join-Path $programFilesX86 'Microsoft Visual Studio\Installer\vswhere.exe'
     $vswhere = Resolve-ExistingFile $vswhere 'vswhere.exe'
     $installation = ((& $vswhere -latest -products '*' -property installationPath) | Out-String).Trim()
-    Assert-Condition ($LASTEXITCODE -eq 0 -and $installation) 'Visual Studio could not be resolved with vswhere.'
+    Assert-Condition ($LASTEXITCODE -eq 0 -and
+                      -not [string]::IsNullOrWhiteSpace($installation)) `
+        'Visual Studio could not be resolved with vswhere.'
     $versionFile = Join-Path $installation 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt'
     $versionFile = Resolve-ExistingFile $versionFile 'Visual C++ default toolset version file'
     $toolVersion = (Get-Content -LiteralPath $versionFile -Raw).Trim()
@@ -761,7 +764,8 @@ function Resolve-SignTool {
     if ($RequestedPath) { return Resolve-ExistingFile $RequestedPath 'signtool.exe' }
 
     $programFilesX86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
-    Assert-Condition ($programFilesX86) 'ProgramFiles(x86) is unavailable; pass -SignToolPath explicitly.'
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($programFilesX86)) `
+        'ProgramFiles(x86) is unavailable; pass -SignToolPath explicitly.'
     $sdkBin = Join-Path $programFilesX86 'Windows Kits\10\bin'
     Assert-Condition (Test-Path -LiteralPath $sdkBin -PathType Container) `
         'Windows SDK bin directory is unavailable; pass -SignToolPath explicitly.'
@@ -1511,7 +1515,8 @@ if ($AllowUnsigned) {
         'Production mode requires -HostTestPath.'
     Assert-Condition (($CertificateThumbprint -xor $CertificateSubject)) `
         'Production mode requires exactly one of -CertificateThumbprint or -CertificateSubject.'
-    Assert-Condition ($TimestampUrl) 'Production mode requires -TimestampUrl.'
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($TimestampUrl)) `
+        'Production mode requires -TimestampUrl.'
     Assert-Condition (-not [string]::IsNullOrWhiteSpace($ExpectedSignerSha256)) `
         'Production mode requires -ExpectedSignerSha256.'
     $ExpectedSignerSha256 = $ExpectedSignerSha256.Replace(' ', '').ToUpperInvariant()
