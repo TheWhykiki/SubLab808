@@ -7,11 +7,14 @@ Workflow besitzt ausschließlich `workflow_dispatch`, verlangt
 Tag im Format `vMAJOR.MINOR.PATCH`. Der Tag muss exakt zur CMake-Projektversion
 passen und ein Vorfahr des aktuellen Default-Branch-Standes sein. Der Dispatch
 muss außerdem aus dem Default Branch des kanonischen Repositories
-`TheWhykiki/SubLab808` stammen.
+`TheWhykiki/SubLab808` stammen. Der aktuelle Workflow ist absichtlich nur für
+den ersten signierten Windows-Release freigeschaltet und verlangt zusätzlich
+`confirm_first_windows_release_bootstrap=true`.
 
 Ein Release darf niemals nur Windows enthalten, weil auch der macOS-Updater
 `/releases/latest` auswertet. Der Publish-Job benötigt deshalb sowohl beide
-Windows-Jobs als auch den signierten und notarisierten macOS-Job.
+Windows-Jobs als auch den signierten und notarisierten macOS-Job und die
+nachgelagerte native Intel-Abnahme genau dieses macOS-Kandidaten.
 
 ## Geschützte Konfiguration
 
@@ -102,10 +105,32 @@ eine nicht beweisbar vollständige Entfernung blockiert den Upload. Der Gate fü
 keine manuelle rekursive Löschung im systemweiten VST3-Ziel aus, sondern verwendet
 ausschließlich die ProductCode-genaue MSI-Deinstallation.
 
-Der Matrix-Gate deckt den aktuellen Kandidaten auf einem sauberen Runner ab.
-N-1→N, die reale Downgrade-Ablehnung und x64↔ARM64EC-Wechsel bleiben ausdrücklich
-separate Release-Gates, bis unveränderliche signierte Vorgängerartefakte und die
-dafür nötigen Testumgebungen deterministisch bereitgestellt werden.
+Der Matrix-Gate deckt den aktuellen Kandidaten auf einem sauberen Runner ab. Da
+vor dem ersten Windows-Release noch keine signierte Vorversion existiert, kann
+dieser Bootstrap keinen echten N→N+1-Lauf des ausgelieferten Updaters beweisen.
+Der Autorisierungsjob liest deshalb die vollständige öffentliche Release-Liste
+fail-closed und erlaubt den Bootstrap nur, wenn noch kein stabiles Windows-MSI
+oder zugehöriges Evidence-Asset existiert. Derselbe Zustand wird vor Erzeugen
+des Drafts und unmittelbar vor dessen Sichtbarkeit erneut geprüft. Eine
+gebundene `--paginate --slurp`-Abfrage erfasst dabei alle REST-Seiten; zu viele,
+unvollständige oder strukturell mehrdeutige Seiten sowie doppelte Release-IDs
+werden abgelehnt.
+Zusätzlich bindet `Installer/Windows/bootstrap-policy.json` diese Ausnahme
+dauerhaft an Produkt und Tag `v1.4.0`; ein späterer Versionstag kann sie auch
+nach dem Löschen alter Release-Assets nicht erneut verwenden. Autorisierung und
+Publish beziehen Checker und Policy aus dem Default-Branch-Commit, aus dem der
+Workflow gestartet wurde, nicht aus frei wählbarem Candidate-Code.
+Dieser historische Bootstrap-Tag darf bei einem späteren Versions-Bump niemals
+mit der CMake-Projektversion weitergeschoben werden.
+
+Nach diesem einmaligen Bootstrap blockiert der Workflow absichtlich jeden
+weiteren Release. Vor einer Nachfolgeversion muss der Release-DAG erweitert
+werden: Die exakt installierte signierte Vorversion muss den vollständig
+signierten Kandidaten über ihren normalen GitHub-, Download-, Resume-, UAC- und
+Installationspfad auf x64 und ARM64EC übernehmen, bevor genau dieser Kandidat zu
+`latest` wird. Ein neu kompilierter Test-Helper oder ein anderes Repository ist
+kein Ersatz. Die reale Downgrade-Ablehnung und x64↔ARM64EC-Wechsel bleiben
+ebenfalls separate Abnahmen.
 
 Der macOS-Job führt den bestehenden, fail-closed Packagingpfad
 `scripts/package-release.sh Release <Version>` aus. Er baut eine Universal-VST3
@@ -115,6 +140,18 @@ Notarisierung, stapelt Tickets und prüft PKG sowie ZIP-Roundtrip mit Gatekeeper
 und Hosttest. Source-Manifest, Tag-Commit, `dirty=false`, Signer-Pins,
 Notary-Submission-ID und Artefakthashes werden in eine kleine Evidence-Datei
 gebunden.
+
+Ein separater Job auf `macos-15-intel` erhält keine Signing- oder
+Notarisierungs-Secrets. Er checkt denselben unveränderlichen Tag aus, bestätigt
+den Tag-Commit erneut gegen `origin`, baut daraus nur den Universal-Hosttest und
+lädt das anhand Run-ID und Run-Attempt eindeutig benannte Actions-Artefakt des
+macOS-Jobs herunter. Nach erneuter Prüfung des exakten Dreiersets aus PKG, ZIP
+und Evidence sowie der Signer-Pins, Staple-Tickets und Gatekeeper-Entscheidungen
+werden sowohl die VST3 aus dem veröffentlichten ZIP als auch die aus dem
+veröffentlichten PKG expandierte Nutzlast mit `arch -x86_64` in den Hosttest
+geladen. Damit laufen Scan, Instanziierung, State-Roundtrip und Audio-Render des
+signierten/notarisierten Release-Builds wirklich auf Intel und nicht nur gegen
+einen separat erzeugten CI-Build.
 
 Ein vollständiger Release enthält exakt diese Plattformdateien:
 
@@ -130,13 +167,16 @@ Ein vollständiger Release enthält exakt diese Plattformdateien:
 Die drei Build-Kandidaten sind Actions-Artefakte mit nur einem Tag
 Aufbewahrung. Ihre Container-Namen enthalten Run-ID und Run-Attempt, damit ein
 erneuter Lauf niemals Kandidaten eines früheren Versuchs übernimmt. Im
-Publish-Job werden die Windows-Evidence und sämtliche Hashes
+Intel-Gate wird zusätzlich ein deterministischer SHA-256-Wert über alle drei
+macOS-Dateien ausgegeben. Der Publish-Job hängt zwingend von diesem Gate ab,
+berechnet denselben Wert aus seinem erneut heruntergeladenen Kandidaten und
+verweigert bei jeder Abweichung die Veröffentlichung. Außerdem werden dort die Windows-Evidence und sämtliche Hashes
 erneut geprüft. Auf einem macOS-Runner werden zusätzlich die heruntergeladenen
 Signaturen, tatsächlichen Zertifikat-Fingerprints, Hardened Runtime,
 Zeitstempel, Universal-Slices, Staple-Tickets und Gatekeeper-Entscheidungen
 erneut geprüft.
 
-## Atomare Veröffentlichung
+## Gestufte Veröffentlichung und Fehlergrenzen
 
 Der Publish-Job besitzt als einziger `contents: write`. Er verweigert vorhandene
 Releases einschließlich Drafts, erstellt einen neuen Draft und merkt sich direkt
@@ -144,15 +184,32 @@ dessen exakte Release-ID. Erst nach Upload aller acht geprüften Dateien müssen
 API-Assetnamen und serverseitige SHA-256-Digests vollständig passen. Unmittelbar
 vor dem Publish werden Origin-Tag und die zu Beginn gemerkte Latest-Release-ID
 erneut verglichen. Eine zwischenzeitliche manuelle oder fremde Veröffentlichung
-verwirft den eigenen Draft.
+blockiert damit den Sichtbarkeitsschritt.
 
-Erst danach wird exakt dieser Draft mit `draft=false`, `prerelease=false` und
-`make_latest=true` sichtbar. Der Tag muss semantisch neuer als das bisherige
-Latest-Release sein. Ein einziger produktweiter Concurrency-Lock verhindert
-zusätzlich, dass zwei Tags ihre Latest-Reihenfolge gegenseitig überschreiben.
-Bei einem Fehler wird ausschließlich die im aktuellen Lauf neu erzeugte
-Release-ID gelöscht; fremde oder bereits vorhandene Drafts werden nie gesucht
-oder entfernt.
+Erst danach wird exakt dieser Draft mit einem einzelnen API-Aufruf
+`draft=false`, `prerelease=false` und `make_latest=true` sichtbar. Der Tag muss
+semantisch neuer als das bisherige Latest-Release sein. Anschließend werden die
+eigene ID, Tag, Sichtbarkeit und Latest-Position erneut gelesen. Außerdem muss
+die vollständige öffentliche Historie weiterhin frei von jedem anderen stabilen
+Windows-Release sein; nur die soeben publizierte exakte ID und ihr festgelegter
+Bootstrap-Tag sind bei dieser Nachprüfung erlaubt. Auch die acht Assetnamen und
+ihre serverseitigen SHA-256-Digests müssen weiterhin exakt zu den lokalen,
+bereits geprüften Dateien passen. Die gesamte Nachprüfung wird bei transienten
+API-Fehlern bis zu dreimal wiederholt. Ein produktweiter
+Concurrency-Lock serialisiert diesen Workflow. Manuelle oder andere API-Clients
+kann GitHub damit nicht atomar sperren; die Nachprüfung schließt das relevante
+Fenster um den Publish-Aufruf so weit wie die Release-API erlaubt.
+
+Vor dem Sichtbarkeitsversuch entfernt der Fehler-Trap ausschließlich die in
+diesem Lauf erzeugte ID, und auch nur wenn drei Identitätsprüfungen Tag,
+eindeutige Run-Markierung und `draft=true` bestätigen. Lesen und Löschen werden
+bis zu dreimal versucht; ein Fehler wird im Step Summary als Quarantänefall
+gemeldet. Sobald der Publish-Aufruf versucht wurde, verweigert der Trap bewusst
+eine automatische Löschung: Eine möglicherweise bereits von Updatern gesehene
+öffentliche Version darf nicht still verschwinden. Jede nicht vollständig
+verifizierbare Veröffentlichung schlägt stattdessen fehl und muss vor weiteren
+Release-Aktionen manuell geprüft und gegebenenfalls quarantänisiert werden.
+Fremde oder bereits vorhandene Drafts werden nie gesucht oder entfernt.
 
 ## Windows-Zertifikatswechsel
 

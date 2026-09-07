@@ -209,3 +209,5 @@ add_test(NAME SubLab808WindowsIntegrationContract COMMAND "${Python3_EXECUTABLE}
     -s "${CMAKE_CURRENT_SOURCE_DIR}/scripts/tests" -p "test_windows_integration.py")
 add_test(NAME SubLab808WindowsReleaseContract COMMAND "${Python3_EXECUTABLE}" -B -m unittest discover
     -s "${CMAKE_CURRENT_SOURCE_DIR}/scripts/tests" -p "test_windows_release_contract.py")
+add_test(NAME SubLab808WindowsReleaseBootstrap COMMAND "${Python3_EXECUTABLE}" -B -m unittest discover
+    -s "${CMAKE_CURRENT_SOURCE_DIR}/scripts/tests" -p "test_windows_release_bootstrap.py")

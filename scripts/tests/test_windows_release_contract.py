@@ -8,7 +8,9 @@ import importlib.util
 import json
 import pathlib
 import re
+import subprocess
 import tempfile
+import textwrap
 import unittest
 
 
@@ -20,6 +22,7 @@ NEXT_SIGNER = "D5" * 32
 APPLICATION_SIGNER = "B2" * 32
 INSTALLER_SIGNER = "C3" * 32
 TAG_COMMIT = "1" * 40
+BOOTSTRAP_TAG = {"SubLab808": "v1.4.0", "ReverseLab": "v1.1.0"}[PRODUCT]
 
 
 def load_module(name: str, filename: str):
@@ -40,6 +43,14 @@ class WindowsReleaseContractTests(unittest.TestCase):
         )
         cls.ci = (ROOT / ".github" / "workflows" / CI_WORKFLOW).read_text(encoding="utf-8")
         cls.docs = (ROOT / "WINDOWS_RELEASE.md").read_text(encoding="utf-8")
+        cls.bootstrap = (ROOT / "scripts" / "check-windows-release-bootstrap.py").read_text(
+            encoding="utf-8"
+        )
+        cls.bootstrap_policy = json.loads(
+            (ROOT / "Installer" / "Windows" / "bootstrap-policy.json").read_text(
+                encoding="utf-8"
+            )
+        )
         cls.package_config = json.loads(
             (ROOT / "Installer" / "Windows" / "package-config.json").read_text(
                 encoding="utf-8"
@@ -72,18 +83,99 @@ class WindowsReleaseContractTests(unittest.TestCase):
         self.assertIn(f"group: {PRODUCT}-windows-release\n", self.release)
         self.assertNotIn("windows-release-${{ inputs.tag }}", self.release)
 
+    def test_first_windows_release_is_an_explicit_fail_closed_bootstrap(self) -> None:
+        for token in (
+            "confirm_first_windows_release_bootstrap:",
+            "WK_BOOTSTRAP_CONFIRMATION: ${{ inputs.confirm_first_windows_release_bootstrap }}",
+            "test \"$WK_BOOTSTRAP_CONFIRMATION\" = 'true'",
+            "authorize_windows_bootstrap:",
+            "needs: authorize_windows_bootstrap",
+            "needs.authorize_windows_bootstrap.result == 'success'",
+            "Refuse an untested follow-up Windows release",
+            "verify_no_public_windows_release()",
+            "scripts/check-windows-release-bootstrap.py",
+            "ref: ${{ github.sha }}",
+            'git show "$GITHUB_SHA:scripts/check-windows-release-bootstrap.py"',
+            'git show "$GITHUB_SHA:Installer/Windows/bootstrap-policy.json"',
+            "--policy-json",
+            "--paginate --slurp",
+            "--paginated",
+        ):
+            self.assertIn(token, self.release)
+        for token in (
+            "Cannot prove the complete public release history for bootstrap",
+            "A published Windows baseline already exists; exact N-to-N+1 updater acceptance is required",
+            "Paginated release metadata contains duplicate release IDs",
+        ):
+            self.assertIn(token, self.bootstrap)
+        self.assertEqual(self.release.count("needs: authorize_windows_bootstrap"), 2)
+        self.assertGreaterEqual(self.release.count("verify_no_public_windows_release\n"), 2)
+        gate_start = self.release.index("verify_no_public_windows_release()")
+        gate_end = self.release.index("read_latest_state()", gate_start)
+        gate = self.release[gate_start:gate_end]
+        for token in (
+            'test "$#" -le 1 || return 1',
+            "if ! gh api --method GET --paginate --slurp",
+            "if ! python3 -B",
+            'rm -f -- "$metadata" || return 1',
+        ):
+            self.assertIn(token, gate)
+        self.assertEqual(
+            self.bootstrap_policy,
+            {"bootstrapTag": BOOTSTRAP_TAG, "product": PRODUCT, "schemaVersion": 1},
+        )
+        for token in ("Bootstrap", "N→N+1", "blockiert", "Vorversion"):
+            self.assertIn(token, self.docs)
+
+    def test_nested_post_publish_baseline_failures_propagate_in_bash(self) -> None:
+        gate_start = self.release.index("          verify_no_public_windows_release()")
+        gate_end = self.release.index("          read_latest_state()", gate_start)
+        gate = textwrap.dedent(self.release[gate_start:gate_end])
+        cases = (
+            ("return 23", "return 0", "failure"),
+            ("printf '[[]]\\n'; return 0", "return 24", "failure"),
+            ("printf '[[]]\\n'; return 0", "return 0", "success"),
+        )
+        for gh_body, python_body, expected in cases:
+            with self.subTest(gh=gh_body, python=python_body, expected=expected), tempfile.TemporaryDirectory() as temporary:
+                script = f"""
+                    set -euo pipefail
+                    RUNNER_TEMP={temporary!r}
+                    GITHUB_REPOSITORY=TheWhykiki/{PRODUCT}
+                    trusted_gate_directory="$RUNNER_TEMP"
+                    PRODUCT={PRODUCT!r}
+                    tag={BOOTSTRAP_TAG!r}
+                    gh() {{ {gh_body}; }}
+                    python3() {{ {python_body}; }}
+                    {gate}
+                    nested() {{ verify_no_public_windows_release 41 || return 1; }}
+                    if nested; then actual=success; else actual=failure; fi
+                    test "$actual" = {expected!r}
+                """
+                completed = subprocess.run(
+                    ["bash", "-c", textwrap.dedent(script)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    f"stdout={completed.stdout!r} stderr={completed.stderr!r}",
+                )
+
     def test_dispatch_values_are_never_interpolated_into_shell_source(self) -> None:
-        self.assertEqual(self.release.count("WK_INPUT_TAG: ${{ inputs.tag }}"), 3)
+        self.assertEqual(self.release.count("WK_INPUT_TAG: ${{ inputs.tag }}"), 5)
         self.assertEqual(self.release.count("$tag = $env:WK_INPUT_TAG"), 1)
-        self.assertEqual(self.release.count('tag="$WK_INPUT_TAG"'), 3)
+        self.assertEqual(self.release.count('tag="$WK_INPUT_TAG"'), 4)
         self.assertEqual(
             self.release.count(
                 "WK_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}"
             ),
-            3,
+            4,
         )
         self.assertEqual(self.release.count("$defaultBranch = $env:WK_DEFAULT_BRANCH"), 1)
-        self.assertEqual(self.release.count('default_branch="$WK_DEFAULT_BRANCH"'), 2)
+        self.assertEqual(self.release.count('default_branch="$WK_DEFAULT_BRANCH"'), 3)
         allowed_prefixes = ("run-name:", "ref:", "WK_INPUT_TAG:")
         unsafe_lines = [
             line
@@ -118,6 +210,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "PresetTests",
         ):
             self.assertIn(token, self.release)
+        self.assertIn("runs-on: ${{ matrix.runner }}\n    timeout-minutes: 120", self.release)
 
     def test_pfx_is_ephemeral_and_leaf_pin_is_fail_closed(self) -> None:
         for token in (
@@ -209,13 +302,13 @@ class WindowsReleaseContractTests(unittest.TestCase):
                 rf"\s+upgrade_code: {self.package_config['upgradeCodes'][architecture]}\n"
                 rf"\s+other_architecture_upgrade_code: {self.package_config['upgradeCodes'][other]}\n",
             )
-        for limitation in ("N-1→N", "Downgrade", "x64↔ARM64EC", "separate Release-Gates"):
+        for limitation in ("N→N+1", "Downgrade", "x64↔ARM64EC", "separate Abnahmen"):
             self.assertIn(limitation, self.docs)
 
     def test_release_is_staged_complete_then_published_once(self) -> None:
         self.assertEqual(self.release.count("contents: write"), 1)
         for token in (
-            "needs: [build-windows, build-macos]",
+            "needs: [build-windows, build-macos, test-macos-intel-candidate]",
             "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
             "merge-multiple: true",
             "github.run_attempt",
@@ -239,22 +332,73 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "tuple(map(int",
             ".assets[] | select(.name",
             ".digest",
-            "cleanup_draft",
+            "cleanup_created_release",
+            "release_marker=",
+            "--allow-release-id",
+            'verify_no_public_windows_release "$created_release_id"',
+            "publication_attempted=false",
+            "publication_attempted=true",
+            "verify_release_assets()",
+            "verify_published_release()",
+            "post_publish_verified=false",
         ):
             self.assertIn(token, self.release)
-        cleanup_start = self.release.index("cleanup_draft()")
-        cleanup_end = self.release.index("trap cleanup_draft EXIT", cleanup_start)
+        cleanup_start = self.release.index("cleanup_created_release()")
+        cleanup_end = self.release.index("trap cleanup_created_release EXIT", cleanup_start)
         cleanup = self.release[cleanup_start:cleanup_end]
-        self.assertIn("releases/$created_release_id", cleanup)
-        self.assertIn("draft_state=", cleanup)
-        self.assertIn('[[ "$draft_state" == true ]]', cleanup)
+        for token in (
+            "releases/$created_release_id",
+            "release_state=",
+            "identity_valid=false",
+            "for attempt in 1 2 3",
+            'value.get("draft") is True',
+            'value.get("tag_name") == sys.argv[2]',
+            'sys.argv[3] in (value.get("body") or "")',
+            "gh api --method DELETE",
+            "cleanup_failed=true",
+            "GITHUB_STEP_SUMMARY",
+        ):
+            self.assertIn(token, cleanup)
         self.assertNotIn("releases?per_page", cleanup)
-        self.assertNotIn("tag_name", cleanup)
         self.assertGreaterEqual(self.release.count("verify_origin_tag\n"), 2)
         self.assertNotIn('releases/latest" --jq \'.id\' 2>/dev/null || true', self.release)
         self.assertGreaterEqual(self.release.count("${{ github.run_attempt }}"), 4)
         post_publish = self.release.index("published=true")
-        self.assertIn("--jq '.tag_name'", self.release[post_publish:])
+        for postcondition in (
+            'releases/$created_release_id" --jq \'.draft\'',
+            'releases/$created_release_id" --jq \'.prerelease\'',
+            'releases/$created_release_id" --jq \'.tag_name\'',
+            'releases/latest" --jq \'.id\'',
+            'releases/latest" --jq \'.tag_name\'',
+            'verify_no_public_windows_release "$created_release_id"',
+        ):
+            self.assertLess(self.release.rindex(postcondition), post_publish)
+        publication_attempted = self.release.rindex("publication_attempted=true")
+        publish_patch = self.release.rindex('gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$created_release_id"')
+        post_publish_audit = self.release.rindex("if verify_published_release; then")
+        self.assertLess(publication_attempted, publish_patch)
+        self.assertLess(publish_patch, post_publish_audit)
+        self.assertLess(post_publish_audit, post_publish)
+        verifier_start = self.release.index("verify_published_release()")
+        verifier_end = self.release.index("release_body=", verifier_start)
+        verifier = self.release[verifier_start:verifier_end]
+        self.assertIn("verify_release_assets || return 1", verifier)
+        self.assertIn(
+            'verify_no_public_windows_release "$created_release_id" || return 1', verifier
+        )
+        self.assertIn("post_publish_verified=false", self.release[publish_patch:post_publish])
+        self.assertIn("for attempt in 1 2 3", self.release[publish_patch:post_publish])
+        self.assertIn('published_body=', verifier)
+        self.assertIn('[[ "$published_body" == *"$release_marker"* ]]', verifier)
+        for variable in (
+            "release_draft",
+            "release_prerelease",
+            "release_tag",
+            "published_body",
+            "latest_id",
+            "latest_tag",
+        ):
+            self.assertRegex(verifier, rf'{variable}="\$\(gh api .*?\)" \|\| return 1')
         for architecture in ("x64", "arm64ec"):
             self.assertIn(
                 f'release-assets/windows/{PRODUCT}-$version-Windows-{architecture}.msi',
@@ -270,7 +414,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
         for token in (
             "build-macos:",
             "runs-on: macos-15",
-            "needs: [build-windows, build-macos]",
+            "needs: [build-windows, build-macos, test-macos-intel-candidate]",
             "secrets.MACOS_DEVELOPER_ID_APPLICATION_P12_BASE64",
             "secrets.MACOS_DEVELOPER_ID_APPLICATION_P12_PASSWORD",
             "secrets.MACOS_DEVELOPER_ID_INSTALLER_P12_BASE64",
@@ -308,9 +452,10 @@ class WindowsReleaseContractTests(unittest.TestCase):
         ):
             self.assertIn(token, self.release)
         self.assertEqual(self.release.count("retention-days: 1"), 2)
-        self.assertEqual(self.release.count("APPLICATION_SIGNER_SHA256:"), 2)
-        self.assertEqual(self.release.count("INSTALLER_SIGNER_SHA256:"), 2)
+        self.assertEqual(self.release.count("APPLICATION_SIGNER_SHA256:"), 3)
+        self.assertEqual(self.release.count("INSTALLER_SIGNER_SHA256:"), 3)
         self.assertEqual(self.release.count("\n      NEXT_SIGNER_SHA256:"), 2)
+        self.assertGreaterEqual(self.release.count("timeout-minutes: 120"), 2)
         self.assertNotIn(f"{PRODUCT}-$version-Windows-SHA256SUMS.txt", self.release)
         self.assertLess(
             self.release.index("unset APPLICATION_P12_BASE64"),
@@ -319,6 +464,52 @@ class WindowsReleaseContractTests(unittest.TestCase):
         publish = self.release[self.release.index("publish-release:") :]
         self.assertIn("macOS-universal", publish)
         self.assertIn("Windows-arm64ec", publish)
+
+    def test_exact_macos_candidate_is_host_loaded_on_native_intel_before_publish(self) -> None:
+        start = self.release.index("  test-macos-intel-candidate:")
+        end = self.release.index("\n  publish-release:", start)
+        intel_gate = self.release[start:end]
+        for token in (
+            "needs: build-macos",
+            "needs.build-macos.result == 'success'",
+            "runs-on: macos-15-intel",
+            "timeout-minutes: 45",
+            "permissions:\n      contents: read",
+            "test \"$RUNNER_ARCH\" = 'X64'",
+            "test \"$(uname -m)\" = 'x86_64'",
+            "ref: ${{ inputs.tag }}",
+            "persist-credentials: false",
+            "git ls-remote --exit-code origin",
+            "CMAKE_PROJECT_VERSION:STATIC",
+            f"--target {PRODUCT}HostTests",
+            f"name: {PRODUCT}-macOS-universal-SIGNED-NOTARIZED-RELEASE-CANDIDATE-${{{{ github.run_id }}}}-${{{{ github.run_attempt }}}}",
+            "scripts/macos-release-assets.py validate",
+            "pkgutil --expand-full",
+            f'zip_bundle="$roundtrip/zip/{PRODUCT}.vst3"',
+            f'package_bundle="$roundtrip/package/Payload/Library/Audio/Plug-Ins/VST3/{PRODUCT}.vst3"',
+            "for source in zip package; do",
+            'package) signed_bundle="$package_bundle" ;;',
+            'codesign -d --extract-certificates "$certificate_prefix" "$signed_bundle"',
+            f'host="build-macos-intel-host/{PRODUCT}HostTests_artefacts/Release/{PRODUCT}HostTests"',
+            '/usr/bin/arch -x86_64 "$host" "$zip_bundle"',
+            '/usr/bin/arch -x86_64 "$host" "$package_bundle"',
+            "candidate_sha256: ${{ steps.native_intel_gate.outputs.candidate_sha256 }}",
+            "printf 'candidate_sha256=%s\\n' \"$candidate_digest\" >> \"$GITHUB_OUTPUT\"",
+        ):
+            self.assertIn(token, intel_gate)
+        self.assertNotIn("${{ secrets.", intel_gate)
+        self.assertNotIn("WK_RUNNER_ARCH: ${{ runner.arch }}", intel_gate)
+
+        publish = self.release[end:]
+        for token in (
+            "needs: [build-windows, build-macos, test-macos-intel-candidate]",
+            "needs.test-macos-intel-candidate.result == 'success'",
+            "WK_INTEL_TESTED_MACOS_CANDIDATE_SHA256: ${{ needs.test-macos-intel-candidate.outputs.candidate_sha256 }}",
+            'tested_candidate_digest="$WK_INTEL_TESTED_MACOS_CANDIDATE_SHA256"',
+            'test "$actual_candidate_digest" = "$tested_candidate_digest"',
+        ):
+            self.assertIn(token, publish)
+        self.assertIn("runs-on: macos-15\n    timeout-minutes: 30", publish)
 
     def test_all_external_actions_are_full_commit_pinned(self) -> None:
         references = re.findall(r"(?m)^\s*-?\s*uses:\s*[^@\s]+@([^\s#]+)", self.release)
