@@ -1,6 +1,9 @@
 #pragma once
 #include <juce_gui_extra/juce_gui_extra.h>
 #include "PresetLibrary.h"
+#if JUCE_MAC
+#include "MacModulePin.h"
+#endif
 #include <cstdint>
 
 namespace wk
@@ -457,6 +460,17 @@ private:
     void chooseFile(bool importing)
     {
         if (! canOpenUi()) return;
+#if JUCE_MAC
+        const auto& modulePin = retainCurrentModuleForNativeCallbacks();
+        if (! modulePin.succeeded())
+        {
+            const auto message = juce::String("Preset import/export is unavailable: ")
+                               + modulePin.errorMessage() + ".";
+            manage.setTooltip(message);
+            juce::Logger::writeToLog(message);
+            return;
+        }
+#endif
         const auto generation = uiGeneration;
         const auto exportToken = importing ? std::optional<PresetLibrary::SoundToken> {} : presets.currentSoundToken();
         if (! importing && ! exportToken.has_value())

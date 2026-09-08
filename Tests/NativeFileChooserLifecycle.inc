@@ -44,6 +44,7 @@ struct NativeChooserCaseState
     std::unique_ptr<LifecycleSnapshot> stateBefore;
     std::unique_ptr<NativeFixtureSnapshot> filesBefore;
     std::unique_ptr<LifecycleSnapshot> reopenedBeforeInteraction;
+    std::unique_ptr<LifecycleSnapshot> postInteractionState;
     juce::Component::SafePointer<juce::Component> managementMenu;
     juce::Component::SafePointer<juce::Component> nativeModal;
     juce::Component::SafePointer<juce::AlertWindow> reopenedDialog;
@@ -134,10 +135,34 @@ private:
         return false;
     }
 
+    void auditRetiredCases()
+    {
+        for (const auto& retired : retiredCases)
+        {
+            auto& state = *retired;
+            require(state.owner == nullptr && state.nativeModal == nullptr
+                        && state.reopenedDialog == nullptr && state.managementMenu == nullptr,
+                    "retired native chooser case has no live editor or modal owner");
+            require(state.panel != nullptr && ! state.panel->isAlive()
+                        && ! state.panel->isVisible() && ! state.panel->hasDelegate()
+                        && state.panel->completionProgressIsValid()
+                        && state.panel->completionIsQuiescent()
+                        && state.panel->markSafeOwnerRetired(),
+                    "retired native chooser case remains quiescent and owner-safe");
+            require(state.postInteractionState != nullptr,
+                    "retired native chooser case has a final state snapshot");
+            state.postInteractionState->unchanged(*state.processor);
+            state.filesBefore->unchanged(state.testCase.root);
+            require(! state.output.exists(),
+                    "retired cancelled export never creates its target");
+        }
+    }
+
     void timerCallback() override
     {
         try
         {
+            if (failure.empty()) auditRetiredCases();
             if (failure.empty() && runDeadline > 0.0 && now() >= runDeadline)
                 throw std::runtime_error(
                     std::string("NATIVE_CHOOSER_RUN_TIMEOUT: overall deadline reached in case ")
@@ -220,7 +245,7 @@ private:
         require(NativeFilePanel::visibleCount() == 0,
                 "native chooser case starts without a native file panel");
         require(! NativeFilePanel::hasActiveCompletionSession(),
-                "native chooser case starts without an unfinished AppKit completion");
+                "native chooser case starts without an unretired completion observer");
 
         current = std::make_unique<NativeChooserCaseState>(cases[caseIndex]);
         const auto& testCase = current->testCase;
@@ -285,6 +310,8 @@ private:
                         "NATIVE_PANEL_SETUP_TIMEOUT: real NSSavePanel/NSOpenPanel did not become visible")) return;
         current->panel = std::move(panel);
         require(current->panel->hasDelegate(), "native file panel has its real JUCE delegate before teardown");
+        require(current->panel->moduleWasRetainedAtBegin(),
+                "the product retained its module before AppKit copied the native completion");
         require(current->panel->beganExactlyOnce() && current->panel->completionHasNotStarted(),
                 "visible native file panel has one active, not-yet-completed AppKit session");
         require(NativeFilePanel::visibleCount() == 1,
@@ -342,24 +369,30 @@ private:
     {
         require(current->panel->completionProgressIsValid(),
                 "native file panel completion-session counts became invalid");
-        const bool retired = ! current->panel->isVisible() && ! current->panel->hasDelegate()
-                          && ! current->panel->isAlive()
-                          && current->panel->completionResolvedExactlyOnce()
-                          && ! NativeFilePanel::hasActiveCompletionSession();
-        if (! waitUntil(retired,
-                        "NATIVE_PANEL_TEARDOWN_TIMEOUT: panel/delegate/window or AppKit completion remains active")) return;
+        const bool ownerRetired = current->nativeModal == nullptr
+                               && ! current->panel->isVisible()
+                               && ! current->panel->hasDelegate()
+                               && ! current->panel->isAlive();
+        if (! waitUntil(ownerRetired,
+                        "NATIVE_PANEL_TEARDOWN_TIMEOUT: JUCE modal or native panel/delegate/window remains active")) return;
+        require(current->panel->completionIsQuiescent(),
+                "native completion was executing at the safe owner-retirement boundary");
+        require(current->panel->markSafeOwnerRetired(),
+                "native completion observer could not mark safe owner retirement");
+        require(! NativeFilePanel::hasActiveCompletionSession(),
+                "native completion remained active after owner retirement");
         enter(Phase::retirementFence);
     }
 
     void retirementFence()
     {
-        // The observer proves that JUCE's real AppKit completion either returned
-        // or its never-entered block was released. In both cases no stale
-        // callback can fire; these turns provide an additional loop grace fence.
+        // JUCE's SafePointer-bearing native owner is gone. Keep returning to the
+        // real app loop; any later AppKit entry must return before the next turn.
         if (++fenceTurns < 3) return;
         auto& state = *current;
         require(state.nativeModal == nullptr && ! state.panel->isAlive()
-                    && state.panel->completionResolvedExactlyOnce()
+                    && state.panel->completionIsQuiescent()
+                    && state.panel->markSafeOwnerRetired()
                     && NativeFilePanel::visibleCount() == 0
                     && ! NativeFilePanel::hasActiveCompletionSession()
                     && juce::Component::getNumCurrentlyModalComponents() == 0,
@@ -451,15 +484,31 @@ private:
                 "no modal remains after reopened-control probe");
         state.reopenedBeforeInteraction->libraryUnchanged(*state.processor);
         state.filesBefore->unchanged(state.testCase.root);
+        require(! state.output.exists(), "cancelled export never creates its target");
+        state.postInteractionState = std::make_unique<LifecycleSnapshot>(*state.processor);
         enter(Phase::destroyCase);
     }
 
     void destroyCase()
     {
+        require(current != nullptr && current->postInteractionState != nullptr,
+                "native chooser case has a final audit snapshot before retirement");
+        current->postInteractionState->unchanged(*current->processor);
+        current->filesBefore->unchanged(current->testCase.root);
+        require(! current->output.exists(), "cancelled export never creates its target");
+        require(current->panel->completionProgressIsValid()
+                    && current->panel->completionIsQuiescent()
+                    && current->panel->markSafeOwnerRetired(),
+                "native completion remains valid before retiring the reopened editor");
         lastImporting = current->testCase.importing;
         lastAction = current->testCase.action;
         lastNativeClass = current->nativeClass;
-        current.reset();
+        lastLateCompletionEntries = current->panel->lateCompletionEntryCount();
+        current->reopenedToggle = nullptr;
+        current->reopenedParameter = nullptr;
+        current->owner.reset();
+        retiredCases.push_back(std::move(current));
+        auditRetiredCases();
         enter(Phase::betweenCases, 10000.0);
     }
 
@@ -471,8 +520,12 @@ private:
         if (! waitUntil(clean,
                         "NATIVE_PANEL_TEARDOWN_TIMEOUT: case destruction left native or JUCE modal state")) return;
         if (++fenceTurns < 3) return;
-        std::printf("PASS: native %s / %s [%s]: real panel closed, delegate cleared, modal deleted, state/files unchanged, editor interactive.\n",
-                    lastImporting ? "Import" : "Export", actionName(lastAction), lastNativeClass.c_str());
+        auditRetiredCases();
+        lastLateCompletionEntries = retiredCases.back()->panel->lateCompletionEntryCount();
+        std::printf("PASS: native %s / %s [%s]: real panel closed, delegate cleared, modal deleted, state/files unchanged, editor interactive (late AppKit completions=%zu; process total=%zu).\n",
+                    lastImporting ? "Import" : "Export", actionName(lastAction), lastNativeClass.c_str(),
+                    lastLateCompletionEntries,
+                    NativeFilePanel::totalLateCompletionEntryCount());
         ++caseIndex;
         if (caseIndex < cases.size())
         {
@@ -534,6 +587,7 @@ private:
             enter(Phase::failureAwaitRetired, 3000.0);
             return;
         }
+        failureNativeModal = current->nativeModal;
         failurePanel = std::move(current->panel);
         current.reset();
         enter(Phase::failureAwaitRetired, 3000.0);
@@ -541,10 +595,14 @@ private:
 
     void failureAwaitRetired()
     {
-        const bool panelClean = failurePanel == nullptr
-                             || (! failurePanel->isVisible() && ! failurePanel->hasDelegate()
-                                 && ! failurePanel->isAlive()
-                                 && failurePanel->completionResolvedExactlyOnce());
+        bool panelClean = failurePanel == nullptr && failureNativeModal == nullptr;
+        if (failurePanel != nullptr
+            && failureNativeModal == nullptr
+            && ! failurePanel->isVisible()
+            && ! failurePanel->hasDelegate()
+            && ! failurePanel->isAlive()
+            && failurePanel->completionIsQuiescent())
+            panelClean = failurePanel->markSafeOwnerRetired();
         const bool globallyClean = juce::Component::getNumCurrentlyModalComponents() == 0
                                 && NativeFilePanel::visibleCount() == 0
                                 && ! NativeFilePanel::hasActiveCompletionSession();
@@ -557,10 +615,11 @@ private:
         if (now() < deadline) return;
 
         std::fprintf(stderr,
-                     "FAILURE_CLEANUP_TIMEOUT: modal=%d visiblePanels=%d activeCompletion=%d completionResolved=%d\n",
+                     "FAILURE_CLEANUP_TIMEOUT: modal=%d visiblePanels=%d activeCompletion=%d completionQuiescent=%d lateCompletions=%zu\n",
                      juce::Component::getNumCurrentlyModalComponents(), NativeFilePanel::visibleCount(),
                      NativeFilePanel::hasActiveCompletionSession(),
-                     failurePanel == nullptr || failurePanel->completionResolvedExactlyOnce());
+                     failurePanel == nullptr || failurePanel->completionIsQuiescent(),
+                     NativeFilePanel::totalLateCompletionEntryCount());
         std::fflush(stderr);
         failurePanel.reset();
         enter(Phase::failureDrain, 100.0);
@@ -576,7 +635,9 @@ private:
 
     std::vector<NativeChooserCase> cases;
     std::unique_ptr<NativeChooserCaseState> current;
+    std::vector<std::unique_ptr<NativeChooserCaseState>> retiredCases;
     std::unique_ptr<NativeFilePanel> failurePanel;
+    juce::Component::SafePointer<juce::Component> failureNativeModal;
     size_t caseIndex = 0;
     Phase phase = Phase::createCase;
     double deadline = 0.0;
@@ -585,6 +646,7 @@ private:
     bool lastImporting = false;
     OwnerAction lastAction = OwnerAction::hideAncestor;
     std::string lastNativeClass;
+    std::size_t lastLateCompletionEntries = 0;
     bool completed = false;
     std::string failure;
 };

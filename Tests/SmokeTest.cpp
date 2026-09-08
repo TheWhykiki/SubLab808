@@ -945,9 +945,12 @@ bool invalidStateValuesAreRejected()
     const auto& range = output->getNormalisableRange();
     const std::array<std::pair<const char*, juce::var>, 8> invalid {{
         { "non-numeric", juce::var("not-a-number") },
-        { "NaN", juce::var(std::numeric_limits<double>::quiet_NaN()) },
-        { "+Inf", juce::var(std::numeric_limits<double>::infinity()) },
-        { "-Inf", juce::var(-std::numeric_limits<double>::infinity()) },
+        // Persisted ValueTree XML attributes are strings. Passing a non-finite
+        // double through JUCE's XML writer would invoke its finite-only number
+        // formatter before these bytes ever reach the processor under test.
+        { "NaN", juce::var("nan") },
+        { "+Inf", juce::var("inf") },
+        { "-Inf", juce::var("-inf") },
         { "below range", juce::var(static_cast<double>(range.start) - 1.0) },
         { "above range", juce::var(static_cast<double>(range.end) + 1.0) },
         { "just below range", juce::var("-24.00000001") },

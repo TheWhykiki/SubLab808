@@ -6,14 +6,17 @@ detach, destruction, and hide-then-immediate-destruction (eight cases per produc
 with a fake or call an artificial successful import/export callback.
 
 Each case requires a visible, correctly typed native panel and a live JUCE modal
-before the owner transition. Afterwards the native panel must be hidden, its JUCE
+before the owner transition. The interception also proves that the product retained
+its module before AppKit copied the completion block. Afterwards the native panel must be hidden, its JUCE
 delegate cleared, removed from `NSApp.windows`, and the JUCE modal destroyed. The
-test-only observer also requires AppKit to release JUCE's real
-`beginWithCompletionHandler` block before the editor is reopened. The callback
-must either enter and return exactly once before that release, or remain entirely
-unentered when owner teardown closes the panel; panel disappearance alone is not
-treated as completed teardown. The next same-process case and wrap-around
-sentinel additionally detect leaked session state. Exact processor state, preset selection,
+test-only observer marks safe owner retirement only after all four conditions hold.
+At that boundary the callback must either have entered and returned exactly once,
+or remain entirely unentered. AppKit does not promise to release a modeless
+completion block immediately after a programmatic close, so block release is
+recorded only as a diagnostic. A process-wide counter records any completion that
+enters after owner retirement; such an entry is legal only if it returns exactly
+once without changing product state or files. The next same-process case and wrap-around
+sentinel additionally detect leaked observer state. Exact processor state, preset selection,
 and every file/directory in the temporary fixture must remain unchanged.
 The reopened editor must accept a real Save As/Cancel interaction and parameter
 button clicks.
@@ -28,17 +31,24 @@ The deferred chooser remains owned by PresetBar. On destruction, its existing
 timer is stopped and member ordering unregisters the watcher before active or
 deferred choosers are destroyed. Before the editor is reopened, the harness
 returns repeatedly to the real top-level app loop and proves panel, delegate and
-modal teardown. It deliberately does not claim that every queued AppKit NSEvent
-has been drained, or that a host may dynamically unload the VST3 module in the
-same call stack before AppKit has retired its completion handler; exact-host
-acceptance must cover that stronger boundary.
+modal teardown. JUCE's modeless handler captures a `SafePointer` to that native
+component, so a later AppKit invocation cannot reach the destroyed chooser. The
+harness nevertheless records any such late entry while the process continues.
+Before launching a native chooser, the product resolves its own Mach-O image and
+acquires one ref-counted `RTLD_NOLOAD` handle that is intentionally kept until
+process exit. If that fails, Import/Export stops without registering another
+asynchronous UI callback. This keeps the block's code mapped even if a host drops
+its VST3 handle. A separate unloadable-module test proves this behavior with an
+unpinned negative control. The panel harness does not claim that every queued
+AppKit event has been drained; exact-host acceptance still covers host behavior.
 
 The bridge observes only the test process's own NSApp windows. It installs a
 test-process-only observer around `NSSavePanel.beginWithCompletionHandler`, calls
 the original implementation and JUCE handler exactly as supplied, and records
-entry, normal return, and final wrapper-block release without closing or confirming
-the panel itself. A callback-local retain keeps the observer valid if the JUCE
-handler synchronously releases AppKit's last block owner. It stores
+module retention at entry, normal return, final wrapper-block release, safe owner retirement, and any
+late entry without closing or confirming the panel itself. A callback-local retain
+keeps the observer valid if the JUCE handler synchronously releases AppKit's last
+block owner. It stores
 the panel's opaque identity and re-resolves it through the live window list on every
 inspection; it deliberately does not retain the panel because JUCE's close-release
 is part of the lifecycle under test. The fixture redirects the panel to an isolated
@@ -52,15 +62,19 @@ timer-driven state machine performs at most one bounded action per callback and
 returns after every asynchronous boundary: activation, menu dismissal, panel
 presentation, owner transition, panel retirement, editor reopen and control probe.
 It never calls `CFRunLoopRunInMode`, manually sends an `NSEvent`, or enters a nested
-JUCE dispatch loop. AppKit therefore invokes or discards, and then releases, each
-modeless panel completion in its normal application loop before the next session
-starts. Before its first order-in, the
+JUCE dispatch loop. The harness does not assume that AppKit invokes, discards, or
+releases a modeless panel completion after a programmatic close. Instead it marks
+the verified JUCE/AppKit owner-retirement boundary atomically and keeps the late-
+entry sentinel active across subsequent editor interaction and chooser sessions.
+Completed processors and their final state/file snapshots are retained and audited
+on every later coordinator turn, so a late callback cannot hide in the final fence.
+Before its first order-in, the
 synthetic `Preset UI Tests` host window also disables AppKit's automatic order
 animation; otherwise that short-lived console-only window can leave a display-link
 worker running after `main()` exits. Native
 file-panel animations remain enabled. A callback itself can still block inside
-AppKit, so CTest remains the hard process watchdog. This changes no product code
-and relaxes none of the lifecycle assertions above.
+AppKit, so CTest remains the hard process watchdog. The lifetime guard is product
+code; the AppKit interception remains test-only and relaxes none of the assertions.
 
 ## Running
 
@@ -82,6 +96,14 @@ next native session. The sequential test is required: it detects stale AppKit
 modal state that process isolation would hide. Native UI is kept out of the
 normal unfiltered PresetTests invocation; the existing reentrancy-only and
 lifecycle-only modes remain unchanged.
+
+The normal, non-sanitized macOS CTest matrices also run `MacModulePinPinned` and
+`MacModulePinUnpinned` in separate
+processes against a deliberately unloadable module. Sixteen threads race the
+first pin and must observe one cached status; after the simulated host handle is
+closed, pinned code remains callable while the unpinned control is absent. These
+two controls are omitted under sanitizers because an instrumented DSO may be made
+non-unloadable by the sanitizer runtime, which would invalidate the oracle.
 
 The coordinator has an absolute 45-second isolated / 450-second sequential
 deadline so a responsive failure reports its case and phase before CTest's
@@ -111,3 +133,5 @@ They do **not** establish behavior when a particular DAW only hides an NSWindow
 without changing the JUCE owner hierarchy. Cubase/REAPER acceptance on the exact
 delivered bundle remains a separate requirement. They also do not exercise actual
 file selection/confirmation or an externally queued native successful callback.
+They do not replace unload and UI acceptance of the signed VST3 in every supported
+Cubase/REAPER version.

@@ -223,6 +223,35 @@ add_test(NAME SubLab808Presets COMMAND SubLab808PresetTests)
 set_tests_properties(SubLab808Presets PROPERTIES TIMEOUT 600)
 
 if(APPLE)
+    # Every macOS binary that instantiates PresetBar gets the same module-local
+    # native-callback lifetime guard. Keep it independent of updater packaging.
+    foreach(module_pin_target IN ITEMS SubLab808 SubLab808Tests SubLab808PresetTests)
+        target_sources(${module_pin_target} PRIVATE Source/MacModulePin.cpp Source/MacModulePin.h)
+    endforeach()
+
+    # Prove the guard with a genuinely unloadable module. Sanitizer runtimes can
+    # make an instrumented DSO non-unloadable themselves, invalidating the
+    # negative control; the normal arm64/x86_64 jobs run these two probes.
+    set(SUBLAB808_MODULE_PIN_TEST_FLAGS
+        "${CMAKE_C_FLAGS} ${CMAKE_CXX_FLAGS} ${CMAKE_EXE_LINKER_FLAGS} ${CMAKE_MODULE_LINKER_FLAGS}")
+    if(NOT SUBLAB808_MODULE_PIN_TEST_FLAGS MATCHES "(^|[ ;])-fsanitize=")
+        add_library(SubLab808MacModulePinFixture MODULE
+            Tests/MacModulePinFixture.cpp Source/MacModulePin.cpp Source/MacModulePin.h)
+        target_include_directories(SubLab808MacModulePinFixture PRIVATE Source)
+        target_link_libraries(SubLab808MacModulePinFixture PRIVATE juce::juce_recommended_warning_flags)
+        add_executable(SubLab808MacModulePinTests Tests/MacModulePinTests.cpp)
+        target_link_libraries(SubLab808MacModulePinTests PRIVATE juce::juce_recommended_warning_flags)
+        add_dependencies(SubLab808MacModulePinTests SubLab808MacModulePinFixture)
+        add_dependencies(SubLab808PresetTests SubLab808MacModulePinTests)
+        add_test(NAME SubLab808MacModulePinPinned COMMAND SubLab808MacModulePinTests
+            pinned "$<TARGET_FILE:SubLab808MacModulePinFixture>")
+        add_test(NAME SubLab808MacModulePinUnpinned COMMAND SubLab808MacModulePinTests
+            unpinned "$<TARGET_FILE:SubLab808MacModulePinFixture>")
+        set_tests_properties(SubLab808MacModulePinPinned SubLab808MacModulePinUnpinned
+            PROPERTIES TIMEOUT 30)
+    endif()
+    unset(SUBLAB808_MODULE_PIN_TEST_FLAGS)
+
     # Test-only Cocoa observation proves that native file panels really open and
     # close. Product code and non-macOS tests do not depend on this bridge.
     # Updater.cmake enables Objective-C++; sanitizer configurations must pass

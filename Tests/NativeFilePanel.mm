@@ -1,4 +1,5 @@
 #include "NativeFilePanel.h"
+#include "MacModulePin.h"
 #include <stdexcept>
 #import <AppKit/AppKit.h>
 #import <objc/runtime.h>
@@ -12,6 +13,9 @@
     NSUInteger completionReturnCount;
     NSUInteger completionDiscardCount;
     NSUInteger completionBlockReleaseCount;
+    bool moduleRetainedAtBegin;
+    bool safeOwnerRetired;
+    NSUInteger lateCompletionEntryCount;
 }
 @end
 
@@ -34,6 +38,7 @@ using BeginWithCompletionHandler = void (*)(id, SEL, CompletionHandler);
 
 BeginWithCompletionHandler originalBeginWithCompletionHandler = nullptr;
 NSMutableSet* activeCompletionObservations = nil;
+NSUInteger globalLateCompletionEntryCount = 0;
 char completionObservationKey;
 
 bool resolvedExactlyOnce(const WhyKikiNativePanelSessionObservation* state)
@@ -41,20 +46,52 @@ bool resolvedExactlyOnce(const WhyKikiNativePanelSessionObservation* state)
     if (state == nil || state->beginCount != 1 || state->beginReturnCount != 1)
         return false;
 
-    const auto returned = state->completionEntryCount == 1
-                       && state->completionReturnCount == 1
-                       && state->completionDiscardCount == 0
-                       && state->completionBlockReleaseCount == 1;
-    const auto discarded = state->completionEntryCount == 0
-                        && state->completionReturnCount == 0
-                        && state->completionDiscardCount == 1
-                        && state->completionBlockReleaseCount == 1;
-    return returned || discarded;
+    const auto releasedAfterReturn = state->completionEntryCount == 1
+                                  && state->completionReturnCount == 1
+                                  && state->completionDiscardCount == 0
+                                  && state->completionBlockReleaseCount == 1;
+    const auto releasedWithoutEntry = state->completionEntryCount == 0
+                                   && state->completionReturnCount == 0
+                                   && state->completionDiscardCount == 1
+                                   && state->completionBlockReleaseCount == 1;
+    return releasedAfterReturn || releasedWithoutEntry;
 }
 
-void retireResolvedObservation(WhyKikiNativePanelSessionObservation* state)
+bool completionProgressIsValid(const WhyKikiNativePanelSessionObservation* state)
 {
-    if (resolvedExactlyOnce(state)) [activeCompletionObservations removeObject:state];
+    if (state == nil || state->beginCount != 1 || state->beginReturnCount != 1)
+        return false;
+
+    return state->completionEntryCount <= 1
+        && state->completionReturnCount <= state->completionEntryCount
+        && state->completionDiscardCount <= 1
+        && state->completionBlockReleaseCount <= 1
+        && state->completionDiscardCount <= state->completionBlockReleaseCount
+        && (state->completionDiscardCount == 0 || state->completionEntryCount == 0)
+        && (state->completionBlockReleaseCount == 0 || resolvedExactlyOnce(state))
+        && state->lateCompletionEntryCount <= state->completionEntryCount
+        && (state->lateCompletionEntryCount == 0 || state->safeOwnerRetired);
+}
+
+bool completionIsQuiescent(const WhyKikiNativePanelSessionObservation* state)
+{
+    return completionProgressIsValid(state)
+        && state->completionReturnCount == state->completionEntryCount;
+}
+
+void retireObservationIfSafe(WhyKikiNativePanelSessionObservation* state)
+{
+    if (resolvedExactlyOnce(state)
+        || (state != nil && state->safeOwnerRetired && completionIsQuiescent(state)))
+        [activeCompletionObservations removeObject:state];
+}
+
+bool markSafeOwnerRetired(WhyKikiNativePanelSessionObservation* state)
+{
+    if (! completionIsQuiescent(state)) return false;
+    state->safeOwnerRetired = true;
+    retireObservationIfSafe(state);
+    return true;
 }
 
 }
@@ -70,25 +107,37 @@ void retireResolvedObservation(WhyKikiNativePanelSessionObservation* state)
 {
     @synchronized ([NSSavePanel class])
     {
-        // AppKit may dispose the completion block without invoking it when a
-        // panel is closed by owner teardown. Block disposal is the important
-        // safety boundary: after this point no stale JUCE callback can run.
+        // Block release is diagnostic only. AppKit does not promise to release
+        // a modeless completion immediately after a programmatic panel close.
         if (observation->completionEntryCount == 0
             && observation->completionReturnCount == 0)
             ++observation->completionDiscardCount;
         ++observation->completionBlockReleaseCount;
-        retireResolvedObservation(observation);
+        retireObservationIfSafe(observation);
     }
     [observation release];
     [super dealloc];
 }
 - (void)completionWillEnter
 {
-    @synchronized ([NSSavePanel class]) { ++observation->completionEntryCount; }
+    @synchronized ([NSSavePanel class])
+    {
+        if (observation->safeOwnerRetired)
+        {
+            ++observation->lateCompletionEntryCount;
+            ++globalLateCompletionEntryCount;
+            [activeCompletionObservations addObject:observation];
+        }
+        ++observation->completionEntryCount;
+    }
 }
 - (void)completionDidReturn
 {
-    @synchronized ([NSSavePanel class]) { ++observation->completionReturnCount; }
+    @synchronized ([NSSavePanel class])
+    {
+        ++observation->completionReturnCount;
+        retireObservationIfSafe(observation);
+    }
 }
 @end
 
@@ -108,18 +157,22 @@ private:
 
 void verifyCompletionObserverContract()
 {
+    const auto lateEntryBaseline = globalLateCompletionEntryCount;
     auto* returnedState = [[WhyKikiNativePanelSessionObservation alloc] init];
     returnedState->beginCount = 1;
     returnedState->beginReturnCount = 1;
     auto* returnedLifetime = [[WhyKikiNativePanelCompletionLifetime alloc]
         initWithObservation:returnedState];
+    [activeCompletionObservations addObject:returnedState];
     [returnedLifetime completionWillEnter];
     [returnedLifetime completionDidReturn];
-    if (resolvedExactlyOnce(returnedState))
-        throw std::runtime_error("NATIVE_PANEL_SETUP: retained completion block looked retired");
+    if (! completionIsQuiescent(returnedState)
+        || ! markSafeOwnerRetired(returnedState)
+        || [activeCompletionObservations containsObject:returnedState])
+        throw std::runtime_error("NATIVE_PANEL_SETUP: returned completion did not reach safe owner retirement");
     [returnedLifetime release];
-    if (! resolvedExactlyOnce(returnedState))
-        throw std::runtime_error("NATIVE_PANEL_SETUP: returned and released completion did not retire");
+    if (! completionProgressIsValid(returnedState))
+        throw std::runtime_error("NATIVE_PANEL_SETUP: returned completion release accounting failed");
     [returnedState release];
 
     auto* discardedState = [[WhyKikiNativePanelSessionObservation alloc] init];
@@ -127,10 +180,39 @@ void verifyCompletionObserverContract()
     discardedState->beginReturnCount = 1;
     auto* discardedLifetime = [[WhyKikiNativePanelCompletionLifetime alloc]
         initWithObservation:discardedState];
+    [activeCompletionObservations addObject:discardedState];
+    if (! completionIsQuiescent(discardedState)
+        || ! markSafeOwnerRetired(discardedState)
+        || [activeCompletionObservations containsObject:discardedState])
+        throw std::runtime_error("NATIVE_PANEL_SETUP: unentered completion did not reach safe owner retirement");
     [discardedLifetime release];
-    if (! resolvedExactlyOnce(discardedState))
-        throw std::runtime_error("NATIVE_PANEL_SETUP: released unentered completion did not retire");
+    if (! completionProgressIsValid(discardedState))
+        throw std::runtime_error("NATIVE_PANEL_SETUP: unentered completion release accounting failed");
     [discardedState release];
+
+    auto* lateState = [[WhyKikiNativePanelSessionObservation alloc] init];
+    lateState->beginCount = 1;
+    lateState->beginReturnCount = 1;
+    auto* lateLifetime = [[WhyKikiNativePanelCompletionLifetime alloc]
+        initWithObservation:lateState];
+    [activeCompletionObservations addObject:lateState];
+    if (! markSafeOwnerRetired(lateState)
+        || [activeCompletionObservations containsObject:lateState])
+        throw std::runtime_error("NATIVE_PANEL_SETUP: late-completion fixture did not retire its owner");
+    [lateLifetime completionWillEnter];
+    if (lateState->lateCompletionEntryCount != 1
+        || globalLateCompletionEntryCount != lateEntryBaseline + 1
+        || ! [activeCompletionObservations containsObject:lateState])
+        throw std::runtime_error("NATIVE_PANEL_SETUP: late completion was not reactivated and counted");
+    [lateLifetime completionDidReturn];
+    if (! completionIsQuiescent(lateState)
+        || [activeCompletionObservations containsObject:lateState])
+        throw std::runtime_error("NATIVE_PANEL_SETUP: late completion did not return to quiescence");
+    [lateLifetime release];
+    if (! completionProgressIsValid(lateState))
+        throw std::runtime_error("NATIVE_PANEL_SETUP: late completion release accounting failed");
+    globalLateCompletionEntryCount = lateEntryBaseline;
+    [lateState release];
 }
 
 void trackedBeginWithCompletionHandler(id self, SEL selector, CompletionHandler handler)
@@ -146,7 +228,7 @@ void trackedBeginWithCompletionHandler(id self, SEL selector, CompletionHandler 
     {
         state = (WhyKikiNativePanelSessionObservation*)
             objc_getAssociatedObject(self, &completionObservationKey);
-        if (state == nil || resolvedExactlyOnce(state))
+        if (state == nil || state->safeOwnerRetired || resolvedExactlyOnce(state))
         {
             state = [[WhyKikiNativePanelSessionObservation alloc] init];
             objc_setAssociatedObject(self, &completionObservationKey, state,
@@ -154,6 +236,7 @@ void trackedBeginWithCompletionHandler(id self, SEL selector, CompletionHandler 
             [state release];
         }
         [state retain];
+        state->moduleRetainedAtBegin = wk::currentModuleIsRetainedForNativeCallbacks();
         ++state->beginCount;
         [activeCompletionObservations addObject:state];
     }
@@ -174,7 +257,7 @@ void trackedBeginWithCompletionHandler(id self, SEL selector, CompletionHandler 
     @synchronized ([NSSavePanel class])
     {
         ++state->beginReturnCount;
-        retireResolvedObservation(state);
+        retireObservationIfSafe(state);
     }
     [lifetime release];
     [state release];
@@ -187,12 +270,14 @@ NSString* checkedUTF8(const char* text)
     return result;
 }
 
-NSSavePanel* resolvePanel(void* identity)
+NSSavePanel* resolvePanel(void* identity, void* expectedObservation)
 {
     // JUCE uses releasedWhenClosed for these panels, so retaining one here
     // would change the lifecycle that this bridge is meant to observe.
     for (NSWindow* window in [NSApp windows])
-        if ((void*) window == identity && [window isKindOfClass:[NSSavePanel class]])
+        if ((void*) window == identity && [window isKindOfClass:[NSSavePanel class]]
+            && (expectedObservation == nullptr
+                || objc_getAssociatedObject(window, &completionObservationKey) == (id) expectedObservation))
             return (NSSavePanel*) window;
     return nil;
 }
@@ -208,7 +293,7 @@ bool NativeFilePanel::isAlive() const
 {
     @autoreleasepool
     {
-        return resolvePanel(panel) != nil;
+        return resolvePanel(panel, observation) != nil;
     }
 }
 void NativeFilePanel::prepareTestApplication()
@@ -303,7 +388,7 @@ bool NativeFilePanel::isVisible() const
 {
     @autoreleasepool
     {
-        auto* candidate = resolvePanel(panel);
+        auto* candidate = resolvePanel(panel, observation);
         return candidate != nil && [candidate isVisible];
     }
 }
@@ -311,7 +396,7 @@ bool NativeFilePanel::hasDelegate() const
 {
     @autoreleasepool
     {
-        auto* candidate = resolvePanel(panel);
+        auto* candidate = resolvePanel(panel, observation);
         return candidate != nil && [candidate delegate] != nil;
     }
 }
@@ -323,6 +408,14 @@ bool NativeFilePanel::beganExactlyOnce() const
         return state != nil && state->beginCount == 1 && state->beginReturnCount == 1;
     }
 }
+bool NativeFilePanel::moduleWasRetainedAtBegin() const
+{
+    @synchronized ([NSSavePanel class])
+    {
+        auto* state = (WhyKikiNativePanelSessionObservation*) observation;
+        return state != nil && state->moduleRetainedAtBegin;
+    }
+}
 bool NativeFilePanel::completionHasNotStarted() const
 {
     @synchronized ([NSSavePanel class])
@@ -331,43 +424,62 @@ bool NativeFilePanel::completionHasNotStarted() const
         return state != nil && state->beginCount == 1 && state->beginReturnCount == 1
             && state->completionEntryCount == 0 && state->completionReturnCount == 0
             && state->completionDiscardCount == 0
-            && state->completionBlockReleaseCount == 0;
+            && state->completionBlockReleaseCount == 0
+            && ! state->safeOwnerRetired && state->lateCompletionEntryCount == 0;
     }
 }
 bool NativeFilePanel::completionProgressIsValid() const
 {
     @synchronized ([NSSavePanel class])
     {
-        auto* state = (WhyKikiNativePanelSessionObservation*) observation;
-        return state != nil && state->beginCount == 1 && state->beginReturnCount == 1
-            && state->completionEntryCount <= 1
-            && state->completionReturnCount <= state->completionEntryCount
-            && state->completionDiscardCount <= 1
-            && state->completionBlockReleaseCount <= 1
-            && state->completionDiscardCount <= state->completionBlockReleaseCount
-            && (state->completionDiscardCount == 0 || state->completionEntryCount == 0)
-            && (state->completionBlockReleaseCount == 0 || resolvedExactlyOnce(state));
+        return ::completionProgressIsValid(
+            (WhyKikiNativePanelSessionObservation*) observation);
     }
 }
-bool NativeFilePanel::completionResolvedExactlyOnce() const
+bool NativeFilePanel::completionIsQuiescent() const
 {
     @synchronized ([NSSavePanel class])
     {
-        return resolvedExactlyOnce((WhyKikiNativePanelSessionObservation*) observation);
+        return ::completionIsQuiescent(
+            (WhyKikiNativePanelSessionObservation*) observation);
+    }
+}
+bool NativeFilePanel::markSafeOwnerRetired()
+{
+    @synchronized ([NSSavePanel class])
+    {
+        return ::markSafeOwnerRetired(
+            (WhyKikiNativePanelSessionObservation*) observation);
+    }
+}
+std::size_t NativeFilePanel::lateCompletionEntryCount() const
+{
+    @synchronized ([NSSavePanel class])
+    {
+        auto* state = (WhyKikiNativePanelSessionObservation*) observation;
+        return state == nil ? 0 : static_cast<std::size_t>(state->lateCompletionEntryCount);
+    }
+}
+std::size_t NativeFilePanel::totalLateCompletionEntryCount()
+{
+    @synchronized ([NSSavePanel class])
+    {
+        return static_cast<std::size_t>(globalLateCompletionEntryCount);
     }
 }
 bool NativeFilePanel::hasActiveCompletionSession()
 {
     @synchronized ([NSSavePanel class])
     {
-        return activeCompletionObservations != nil && [activeCompletionObservations count] != 0;
+        return activeCompletionObservations != nil
+            && [activeCompletionObservations count] != 0;
     }
 }
 std::string NativeFilePanel::className() const
 {
     @autoreleasepool
     {
-        auto* candidate = resolvePanel(panel);
+        auto* candidate = resolvePanel(panel, observation);
         if (candidate == nil) throw std::runtime_error("Native panel disappeared before inspection");
         return NSStringFromClass([candidate class]).UTF8String;
     }
@@ -376,7 +488,7 @@ void NativeFilePanel::useFixtureLocation(const std::string& directory, const std
 {
     @autoreleasepool
     {
-        auto* candidate = resolvePanel(panel);
+        auto* candidate = resolvePanel(panel, observation);
         if (candidate == nil) throw std::runtime_error("Native panel disappeared before fixture setup");
         [candidate setDirectoryURL:[NSURL fileURLWithPath:checkedUTF8(directory.c_str())
                                              isDirectory:YES]];
