@@ -77,7 +77,10 @@ editor reopen and control probe.
 It never calls `CFRunLoopRunInMode`, directly invokes `sendEvent:`, or enters a nested
 JUCE dispatch loop. Because `NSApplication.stop` called from a timer does not stop the
 main loop, shutdown first requires three consecutive timer turns while `NSApplication`
-is running without an AppKit modal window. On that final ready turn the coordinator arms
+is running without an AppKit modal window. JUCE may deliver those timer messages
+from any common run-loop mode, so posting does not depend on AppKit's transient
+`currentMode`; the marked SETTLE and STOP events themselves must still be dequeued
+in default mode. On that final ready turn the coordinator arms
 an independent GCD watchdog, stops the recurring 10 ms timer, and posts one private
 prioritized SETTLE event at the front of AppKit's queue. Stopping the recurring timer
 prevents further coordinator-timer messages. The bounded outer fetch must dequeue SETTLE

@@ -699,9 +699,12 @@ private:
         enter(Phase::awaitApplicationStopReady, 5000.0);
         std::fputs("NATIVE_APP_LOOP_STOP_READY_BEGIN\n", stderr);
         std::fflush(stderr);
-        // Stable readiness is established on default-mode timer turns. The
-        // final turn arms an independent watchdog and retires this recurring
-        // source before queueing SETTLE for the outer application loop.
+        // Stable readiness is established on clean main-thread timer turns.
+        // JUCE delivers timer messages from a common-mode run-loop source, so
+        // the posting precondition must not depend on a transient currentMode
+        // left behind by a closed native panel. SETTLE itself must still be
+        // dequeued in default mode. The final turn arms an independent watchdog
+        // and retires this recurring source before queueing SETTLE.
         startTimer(10);
     }
 

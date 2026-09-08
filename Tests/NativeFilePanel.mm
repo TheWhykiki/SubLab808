@@ -122,12 +122,6 @@ bool isRunnableApplicationEventContext() noexcept
         && [NSApp modalWindow] == nil;
 }
 
-bool isDefaultApplicationRunLoopMode() noexcept
-{
-    auto* mode = [[NSRunLoop currentRunLoop] currentMode];
-    return mode != nil && [mode isEqualToString:NSDefaultRunLoopMode];
-}
-
 bool postApplicationControlEvent(NSInteger code) noexcept
 {
     @autoreleasepool
@@ -640,8 +634,7 @@ bool NativeFilePanel::applicationIsReadyForSettleEvent() noexcept
             && applicationSettleEventCount == 0
             && ! applicationStopEventPosted
             && applicationStopEventCount == 0
-            && isRunnableApplicationEventContext()
-            && isDefaultApplicationRunLoopMode();
+            && isRunnableApplicationEventContext();
     }
 }
 bool NativeFilePanel::postApplicationSettleEvent() noexcept
