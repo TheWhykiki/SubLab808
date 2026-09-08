@@ -9,12 +9,16 @@
 class NativeFilePanel final
 {
 public:
-    static void prepareTestApplication();
-    [[nodiscard]] static bool applicationHasFinishedLaunching() noexcept;
+    using ApplicationStopCallback = bool (*)() noexcept;
+    static void prepareTestApplication(ApplicationStopCallback);
     [[nodiscard]] static bool applicationIsRunning() noexcept;
-    // NSApplication only observes stop: after dispatching a real NSEvent. The
-    // native suite finishes from a JUCE Timer, so it must enqueue one wake event.
-    [[nodiscard]] static bool postApplicationStopWakeEvent() noexcept;
+    // A private START event proves that NSApplication is dispatching NSEvents;
+    // a matching STOP event calls stop: from that real event-handler boundary.
+    [[nodiscard]] static bool postApplicationStartEvent() noexcept;
+    [[nodiscard]] static bool applicationStartEventWasHandled() noexcept;
+    [[nodiscard]] static bool postApplicationStopEvent() noexcept;
+    [[nodiscard]] static bool applicationStopEventWasHandled() noexcept;
+    static void finishTestApplication() noexcept;
     // The short-lived synthetic host window must not leave an AppKit display-
     // link animation running after the console test exits.
     static void disableAutomaticHostWindowAnimations(void* nativeView);

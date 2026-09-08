@@ -55,27 +55,44 @@ struct NativeChooserCaseState
     std::string nativeClass;
 };
 
-bool nativeApplicationStopWakePosted = false;
+bool nativeApplicationStartEventPosted = false;
+bool nativeApplicationStopEventPosted = false;
 bool nativeApplicationWasRunningAtStop = false;
+
+bool stopJuceApplicationLoopFromEvent() noexcept
+{
+    auto* messageManager = juce::MessageManager::getInstanceWithoutCreating();
+    if (messageManager == nullptr)
+    {
+        std::fputs("NATIVE_APP_LOOP_STOP_FAILED: message manager missing\n", stderr);
+        std::fflush(stderr);
+        return false;
+    }
+    if (messageManager->hasStopMessageBeenSent())
+    {
+        std::fputs("NATIVE_APP_LOOP_STOP_FAILED: stop was already requested\n", stderr);
+        std::fflush(stderr);
+        return false;
+    }
+    messageManager->stopDispatchLoop();
+    return messageManager->hasStopMessageBeenSent();
+}
 
 void stopNativeChooserApplicationLoop() noexcept
 {
     nativeApplicationWasRunningAtStop = NativeFilePanel::applicationIsRunning();
     std::fprintf(stderr, "NATIVE_APP_LOOP_STOP_BEGIN running=%d\n",
                  nativeApplicationWasRunningAtStop ? 1 : 0);
-    auto* messageManager = juce::MessageManager::getInstanceWithoutCreating();
-    if (messageManager == nullptr)
+    nativeApplicationStopEventPosted = NativeFilePanel::postApplicationStopEvent();
+    if (! nativeApplicationStopEventPosted)
     {
-        std::fputs("NATIVE_APP_LOOP_STOP_FAILED: message manager missing\n", stderr);
+        std::fputs("NATIVE_APP_LOOP_STOP_POST_FAILED\n", stderr);
         std::fflush(stderr);
-        return;
+        // Without a dispatched NSEvent AppKit has no supported path back from
+        // run(). Fail promptly instead of consuming CTest's 60/480 s watchdog.
+        std::terminate();
     }
-    messageManager->stopDispatchLoop();
-    nativeApplicationStopWakePosted = NativeFilePanel::postApplicationStopWakeEvent();
-    std::fputs(nativeApplicationStopWakePosted
-                   ? "NATIVE_APP_LOOP_WAKE_POSTED\n"
-                   : "NATIVE_APP_LOOP_WAKE_FAILED\n",
-               stderr);
+    std::fputs("NATIVE_APP_LOOP_STOP_POSTED\n", stderr);
     std::fflush(stderr);
 }
 
@@ -109,9 +126,8 @@ public:
     {
         require(juce::MessageManager::getInstance()->isThisTheMessageThread(),
                 "native chooser coordinator starts on the message thread");
-        // NSApplication::run performs launch work before normal event dispatch,
-        // and that work may service Timer sources. timerCallback gates the first
-        // phase and deadline on both DidFinishLaunching and isRunning.
+        // NSApplication::run may service Timer sources during launch. The first
+        // phase remains gated until AppKit dispatches our private START NSEvent.
         startTimer(10);
     }
 
@@ -187,14 +203,13 @@ private:
         {
             if (! applicationLoopStarted)
             {
-                if (! NativeFilePanel::applicationHasFinishedLaunching()
-                    || ! NativeFilePanel::applicationIsRunning()) return;
+                if (! NativeFilePanel::applicationStartEventWasHandled()) return;
                 applicationLoopStarted = true;
                 // Finish through the coordinator before CTest's 60/480-second
                 // process watchdog so failures retain case/phase diagnostics.
                 runDeadline = now() + (cases.size() == 1 ? 45000.0 : 450000.0);
                 enter(Phase::createCase);
-                std::fputs("NATIVE_APP_LOOP_ACTIVE launched=1 running=1\n", stderr);
+                std::fputs("NATIVE_APP_LOOP_ACTIVE dispatch=1 running=1\n", stderr);
             }
             if (failure.empty()) auditRetiredCases();
             if (failure.empty() && runDeadline > 0.0 && now() >= runDeadline)
@@ -688,27 +703,48 @@ private:
 
 int runNativeFileChooserLifecycles(const juce::File& root, const juce::String& requestedCase = {})
 {
+    struct ApplicationCleanup final
+    {
+        ~ApplicationCleanup()
+        {
+            nativeFileChooserHarnessEnabled = false;
+            NativeFilePanel::finishTestApplication();
+        }
+    } applicationCleanup;
+
     require(juce::MessageManager::getInstance()->isThisTheMessageThread(),
             "native chooser tests start on the message thread");
     require(! juce::Desktop::getInstance().getDisplays().displays.isEmpty(),
             "native chooser tests require an active macOS desktop session");
     require(juce::FileChooser::isPlatformDialogAvailable(),
             "native chooser platform implementation is available");
-    NativeFilePanel::prepareTestApplication();
-    nativeApplicationStopWakePosted = false;
+    NativeFilePanel::prepareTestApplication(stopJuceApplicationLoopFromEvent);
+    nativeApplicationStartEventPosted = false;
+    nativeApplicationStopEventPosted = false;
     nativeApplicationWasRunningAtStop = false;
     nativeFileChooserHarnessEnabled = true;
     NativeChooserCoordinator coordinator(root, requestedCase);
+    nativeApplicationStartEventPosted = NativeFilePanel::postApplicationStartEvent();
+    require(nativeApplicationStartEventPosted,
+            "native chooser could not post its AppKit start event");
+    std::fputs("NATIVE_APP_LOOP_START_POSTED\n", stderr);
     coordinator.start();
     std::fputs("NATIVE_APP_LOOP_ENTER\n", stderr);
     juce::MessageManager::getInstance()->runDispatchLoop();
     std::fputs("NATIVE_APP_LOOP_RETURN\n", stderr);
+    const auto startEventWasHandled = NativeFilePanel::applicationStartEventWasHandled();
+    const auto stopEventWasHandled = NativeFilePanel::applicationStopEventWasHandled();
+    NativeFilePanel::finishTestApplication();
     nativeFileChooserHarnessEnabled = false;
     require(coordinator.completedNormally(), "native chooser application loop stopped before completion");
+    require(startEventWasHandled,
+            "native chooser AppKit start event was not handled once in the running application loop");
     require(nativeApplicationWasRunningAtStop,
             "native chooser requested shutdown before the AppKit event loop was running");
-    require(nativeApplicationStopWakePosted,
-            "native chooser application loop stopped without its AppKit wake event");
+    require(nativeApplicationStopEventPosted,
+            "native chooser application loop stopped without its AppKit stop event");
+    require(stopEventWasHandled,
+            "native chooser AppKit stop event was not handled once in the running application loop");
     if (! coordinator.failureMessage().empty())
         throw std::runtime_error(coordinator.failureMessage());
     std::fputs("NATIVE_TEST_RETURN\n", stderr);

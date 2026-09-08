@@ -57,17 +57,19 @@ destination; it never confirms a file operation. No DAW, installed bundle, or us
 preset library is modified.
 
 The console target runs one genuine top-level `MessageManager`/`NSApplication` loop
-for the complete native suite. Its timer-driven state machine remains dormant until
-`NSApplicationDidFinishLaunchingNotification` and `NSApplication.isRunning` prove
-that launch has finished and the top-level event loop is active. It then performs at
-most one bounded action per callback and returns after every asynchronous boundary:
+for the complete native suite. Before entering that loop it posts a private START
+`NSEvent`; the timer-driven state machine remains dormant until a local AppKit monitor
+sees that event in the real `NSApplication.sendEvent:` path while the application is
+running. This proves that launch has yielded to top-level event dispatch. It then
+performs at most one bounded action per callback and returns after every asynchronous boundary:
 activation, menu dismissal, panel presentation, owner transition, panel retirement,
 editor reopen and control probe.
 It never calls `CFRunLoopRunInMode`, directly invokes `sendEvent:`, or enters a nested
-JUCE dispatch loop. Because `NSApplication.stop` called from a timer is observed only
-after a real event boundary, shutdown posts one neutral application-defined wake event
-at the front of the queue after JUCE requests the stop. The harness also verifies that
-`NSApplication` was still running when shutdown was requested. It does not assume
+JUCE dispatch loop. Because `NSApplication.stop` called from a timer does not stop the
+main loop, shutdown posts one private STOP event. The same local monitor invokes JUCE's
+stop request from that event-handler boundary, and the harness verifies that START and
+STOP were each handled exactly once while `NSApplication` was running. The monitor is
+removed exactly once after the loop returns. It does not assume
 that AppKit invokes, discards, or releases a modeless panel completion after a programmatic
 close. Instead it marks the verified JUCE/AppKit owner-retirement boundary atomically
 and keeps the late-entry sentinel active across subsequent editor interaction and

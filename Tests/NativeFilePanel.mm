@@ -1,5 +1,6 @@
 #include "NativeFilePanel.h"
 #include "MacModulePin.h"
+#include <cstdio>
 #include <stdexcept>
 #import <AppKit/AppKit.h>
 #import <objc/runtime.h>
@@ -38,10 +39,45 @@ using BeginWithCompletionHandler = void (*)(id, SEL, CompletionHandler);
 
 BeginWithCompletionHandler originalBeginWithCompletionHandler = nullptr;
 NSMutableSet* activeCompletionObservations = nil;
-id applicationDidFinishLaunchingObserver = nil;
-bool testApplicationDidFinishLaunching = false;
+id applicationEventMonitor = nil;
+NativeFilePanel::ApplicationStopCallback applicationStopCallback = nullptr;
+NSUInteger applicationStartEventCount = 0;
+NSUInteger applicationStopEventCount = 0;
+bool applicationStartEventHandledWhileRunning = false;
+bool applicationStopEventHandledWhileRunning = false;
+bool applicationStopCallbackSucceeded = false;
+bool applicationStartEventPosted = false;
+bool applicationStopEventPosted = false;
 NSUInteger globalLateCompletionEntryCount = 0;
 char completionObservationKey;
+
+constexpr short applicationControlEventSubtype = 0x574b;
+constexpr NSInteger applicationControlEventMagic = 0x5748594b;
+constexpr NSInteger applicationStartEventCode = 1;
+constexpr NSInteger applicationStopEventCode = 2;
+
+bool postApplicationControlEvent(NSInteger code) noexcept
+{
+    @autoreleasepool
+    {
+        if (![NSThread isMainThread] || NSApp == nil || applicationEventMonitor == nil)
+            return false;
+
+        auto* event = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
+                                         location:NSZeroPoint
+                                    modifierFlags:0
+                                        timestamp:0.0
+                                     windowNumber:0
+                                          context:nil
+                                          subtype:applicationControlEventSubtype
+                                            data1:applicationControlEventMagic
+                                            data2:code];
+        if (event == nil)
+            return false;
+        [NSApp postEvent:event atStart:YES];
+        return true;
+    }
+}
 
 bool resolvedExactlyOnce(const WhyKikiNativePanelSessionObservation* state)
 {
@@ -298,7 +334,7 @@ bool NativeFilePanel::isAlive() const
         return resolvePanel(panel, observation) != nil;
     }
 }
-void NativeFilePanel::prepareTestApplication()
+void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallback)
 {
     // ScopedJuceInitialiser_GUI in a console test does not provide an active
     // regular app. Create and configure one here; the coordinator independently
@@ -307,26 +343,13 @@ void NativeFilePanel::prepareTestApplication()
     {
         if (![NSThread isMainThread])
             throw std::runtime_error("NATIVE_PANEL_SETUP: native chooser tests require the main thread");
+        if (stopCallback == nullptr)
+            throw std::runtime_error("NATIVE_PANEL_SETUP: application stop callback is missing");
         [NSApplication sharedApplication];
         if ([NSApp isRunning])
-            throw std::runtime_error("NATIVE_PANEL_SETUP: launch observer must be installed before the app loop");
-
-        if (applicationDidFinishLaunchingObserver == nil)
-        {
-            testApplicationDidFinishLaunching = false;
-            applicationDidFinishLaunchingObserver =
-                [[NSNotificationCenter defaultCenter]
-                    addObserverForName:NSApplicationDidFinishLaunchingNotification
-                                object:NSApp
-                                 queue:nil
-                            usingBlock:^(NSNotification*)
-                            {
-                                if ([NSThread isMainThread])
-                                    testApplicationDidFinishLaunching = true;
-                            }];
-            if (applicationDidFinishLaunchingObserver == nil)
-                throw std::runtime_error("NATIVE_PANEL_SETUP: cannot observe application launch completion");
-        }
+            throw std::runtime_error("NATIVE_PANEL_SETUP: event monitor must be installed before the app loop");
+        if (applicationEventMonitor != nil)
+            throw std::runtime_error("NATIVE_PANEL_SETUP: application event monitor is already active");
 
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         if ([NSApp activationPolicy] != NSApplicationActivationPolicyRegular)
@@ -360,13 +383,58 @@ void NativeFilePanel::prepareTestApplication()
             if (displaced != original)
                 throw std::runtime_error("NATIVE_PANEL_SETUP: native panel completion observer changed concurrently");
         }
-    }
-}
-bool NativeFilePanel::applicationHasFinishedLaunching() noexcept
-{
-    @autoreleasepool
-    {
-        return [NSThread isMainThread] && testApplicationDidFinishLaunching;
+
+        // Install last, after every other setup operation that can throw. The
+        // caller's scope guard removes this monitor exactly once after the loop.
+        applicationStopCallback = stopCallback;
+        applicationStartEventCount = 0;
+        applicationStopEventCount = 0;
+        applicationStartEventHandledWhileRunning = false;
+        applicationStopEventHandledWhileRunning = false;
+        applicationStopCallbackSucceeded = false;
+        applicationStartEventPosted = false;
+        applicationStopEventPosted = false;
+        applicationEventMonitor = [NSEvent
+            addLocalMonitorForEventsMatchingMask:NSEventMaskApplicationDefined
+                                       handler:^NSEvent* (NSEvent* event)
+                                       {
+                                           if ([event type] != NSEventTypeApplicationDefined
+                                               || [event subtype] != applicationControlEventSubtype
+                                               || [event data1] != applicationControlEventMagic)
+                                               return event;
+
+                                           const bool running = [NSApp isRunning];
+                                           if ([event data2] == applicationStartEventCode)
+                                           {
+                                               ++applicationStartEventCount;
+                                               applicationStartEventHandledWhileRunning = running;
+                                               std::fprintf(stderr,
+                                                            "NATIVE_APP_LOOP_START_HANDLED count=%lu running=%d\n",
+                                                            static_cast<unsigned long>(applicationStartEventCount),
+                                                            running ? 1 : 0);
+                                           }
+                                           else if ([event data2] == applicationStopEventCode)
+                                           {
+                                               ++applicationStopEventCount;
+                                               applicationStopEventHandledWhileRunning = running;
+                                               applicationStopCallbackSucceeded = applicationStopCallback != nullptr
+                                                   && applicationStopCallback();
+                                               std::fprintf(stderr,
+                                                            "NATIVE_APP_LOOP_STOP_HANDLED count=%lu running=%d callback=%d\n",
+                                                            static_cast<unsigned long>(applicationStopEventCount),
+                                                            running ? 1 : 0,
+                                                            applicationStopCallbackSucceeded ? 1 : 0);
+                                               if (! applicationStopCallbackSucceeded)
+                                                   [NSApp stop:nil];
+                                           }
+                                           std::fflush(stderr);
+                                           return event;
+                                       }];
+        if (applicationEventMonitor == nil)
+        {
+            applicationStopCallback = nullptr;
+            throw std::runtime_error("NATIVE_PANEL_SETUP: cannot install application event monitor");
+        }
     }
 }
 bool NativeFilePanel::applicationIsRunning() noexcept
@@ -376,29 +444,55 @@ bool NativeFilePanel::applicationIsRunning() noexcept
         return [NSThread isMainThread] && NSApp != nil && [NSApp isRunning];
     }
 }
-bool NativeFilePanel::postApplicationStopWakeEvent() noexcept
+bool NativeFilePanel::postApplicationStartEvent() noexcept
 {
     @autoreleasepool
     {
-        if (![NSThread isMainThread] || NSApp == nil)
+        if (![NSThread isMainThread] || applicationStartEventPosted
+            || applicationStartEventCount != 0)
             return false;
-
-        // NSApplication's stop: flag is checked only after an actual NSEvent is
-        // dispatched. A Timer callback alone is not an event-handler boundary,
-        // and JUCE's periodic-event wake is not reliable on headless CI hosts.
-        auto* event = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
-                                         location:NSZeroPoint
-                                    modifierFlags:0
-                                        timestamp:0.0
-                                     windowNumber:0
-                                          context:nil
-                                          subtype:0
-                                            data1:0
-                                            data2:0];
-        if (event == nil)
+        applicationStartEventPosted = postApplicationControlEvent(applicationStartEventCode);
+        return applicationStartEventPosted;
+    }
+}
+bool NativeFilePanel::applicationStartEventWasHandled() noexcept
+{
+    @autoreleasepool
+    {
+        return [NSThread isMainThread] && applicationStartEventPosted
+            && applicationStartEventCount == 1
+            && applicationStartEventHandledWhileRunning;
+    }
+}
+bool NativeFilePanel::postApplicationStopEvent() noexcept
+{
+    @autoreleasepool
+    {
+        if (![NSThread isMainThread] || applicationStopEventPosted
+            || applicationStopEventCount != 0)
             return false;
-        [NSApp postEvent:event atStart:YES];
-        return true;
+        applicationStopEventPosted = postApplicationControlEvent(applicationStopEventCode);
+        return applicationStopEventPosted;
+    }
+}
+bool NativeFilePanel::applicationStopEventWasHandled() noexcept
+{
+    @autoreleasepool
+    {
+        return [NSThread isMainThread] && applicationStopEventPosted
+            && applicationStopEventCount == 1
+            && applicationStopEventHandledWhileRunning && applicationStopCallbackSucceeded;
+    }
+}
+void NativeFilePanel::finishTestApplication() noexcept
+{
+    @autoreleasepool
+    {
+        if (![NSThread isMainThread] || applicationEventMonitor == nil)
+            return;
+        [NSEvent removeMonitor:applicationEventMonitor];
+        applicationEventMonitor = nil;
+        applicationStopCallback = nullptr;
     }
 }
 void NativeFilePanel::disableAutomaticHostWindowAnimations(void* nativeView)
