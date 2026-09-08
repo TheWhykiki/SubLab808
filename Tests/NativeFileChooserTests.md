@@ -67,20 +67,22 @@ editor reopen and control probe.
 It never calls `CFRunLoopRunInMode`, directly invokes `sendEvent:`, or enters a nested
 JUCE dispatch loop. Because `NSApplication.stop` called from a timer does not stop the
 main loop, shutdown first requires three consecutive timer turns while `NSApplication`
-is running without an AppKit modal window, then posts one private prioritized
-SETTLE event at the front of AppKit's queue. The local monitor must confirm that AppKit
-retrieved this exact event while the application was running without a modal window. On
-a later timer turn while the application is still running without a modal window,
-the coordinator posts a prioritized STOP event at the front of the queue; the monitor invokes JUCE's stop
-request from that real event-handler boundary. START, SETTLE and STOP must each be handled
-exactly once. The 10 ms timer stays armed through the STOP post as a run-loop wake source,
-with separate five-second readiness, SETTLE and STOP diagnostics. Because JUCE stops
-delivering message callbacks after accepting STOP, an independent GCD watchdog also
-requires `[NSApp run]` to return within five seconds; the main thread acknowledges that
-return atomically. The coordinator stops its timer before its retained case members are
-destroyed, and the harness retires JUCE's periodic AppKit wake events after the loop returns.
-A final state/files/global-modal audit closes the last timer-to-STOP gap before the monitor
-is removed exactly once. It does not assume
+is running without an AppKit modal window. On that final ready turn the coordinator arms
+an independent GCD watchdog, stops the recurring 10 ms timer, and posts one private
+prioritized SETTLE event at the front of AppKit's queue. Stopping the recurring timer
+prevents further timer messages from keeping JUCE's shared common-mode queue source ready
+and starving the queued event. The local monitor must confirm that AppKit
+retrieved this exact SETTLE event while the application was running without a modal window.
+Only then does that handler post prioritized STOP before consuming SETTLE.
+`postEvent:` is asynchronous, so STOP can be retrieved only as a subsequent, distinct
+AppKit event; its monitor validates the same context and invokes JUCE's stop request from
+that real event-handler boundary. START, SETTLE and STOP must each be handled exactly once.
+An atomic return acknowledgement lets the independent GCD watchdog require SETTLE delivery,
+STOP delivery and `[NSApp run]` return to complete within five seconds.
+The coordinator destructor retains an idempotent timer stop, and the harness retires JUCE's
+periodic AppKit wake events after the loop returns. Final state/files/global-modal audits
+run immediately before the timer is retired and again after run-loop return, before the
+monitor is removed exactly once. It does not assume
 that AppKit invokes, discards, or releases a modeless panel completion after a programmatic
 close. Instead it marks the verified JUCE/AppKit owner-retirement boundary atomically
 and keeps the late-entry sentinel active across subsequent editor interaction and
@@ -130,9 +132,9 @@ non-unloadable by the sanitizer runtime, which would invalidate the oracle.
 
 START has a five-second dispatch deadline. After START, the coordinator has an absolute
 32-second isolated / 435-second sequential functional deadline. Even the maximum bounded
-failure cleanup plus all three five-second shutdown stages stays below CTest's 60-second /
-480-second process watchdog with reserve. CTest remains the fallback for a callback that
-blocks before the independent shutdown watchdog is armed.
+failure cleanup plus the five-second readiness phase and five-second event/return watchdog
+stays below CTest's 60-second / 480-second process watchdog with reserve. CTest remains the
+fallback for a callback that blocks before the independent shutdown watchdog is armed.
 
 To reproduce one isolated case manually, also set
 `WHYKIKI_PRESET_TEST_NATIVE_CASE` to an operation (`import` or `export`) plus

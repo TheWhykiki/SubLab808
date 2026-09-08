@@ -57,16 +57,42 @@ struct NativeChooserCaseState
 
 bool nativeApplicationStartEventPosted = false;
 bool nativeApplicationSettleEventPosted = false;
-bool nativeApplicationStopEventPosted = false;
 bool nativeApplicationWasRunningAtStop = false;
 std::atomic<bool> nativeApplicationLoopReturned { false };
 std::atomic<bool> nativeApplicationReturnWatchdogArmed { false };
 
+enum class NativeApplicationShutdownStage
+{
+    idle,
+    watchdogArmed,
+    settlePosted,
+    stopAccepted,
+    loopReturned
+};
+
+std::atomic<NativeApplicationShutdownStage> nativeApplicationShutdownStage {
+    NativeApplicationShutdownStage::idle
+};
+
+const char* shutdownStageName(NativeApplicationShutdownStage stage) noexcept
+{
+    switch (stage)
+    {
+        case NativeApplicationShutdownStage::idle: return "idle";
+        case NativeApplicationShutdownStage::watchdogArmed: return "watchdog-armed";
+        case NativeApplicationShutdownStage::settlePosted: return "settle-posted";
+        case NativeApplicationShutdownStage::stopAccepted: return "stop-accepted";
+        case NativeApplicationShutdownStage::loopReturned: return "loop-returned";
+    }
+    return "unknown";
+}
+
 void nativeApplicationReturnWatchdog(void*) noexcept
 {
     if (nativeApplicationLoopReturned.load(std::memory_order_acquire)) return;
-    std::fputs("NATIVE_APP_LOOP_RETURN_TIMEOUT: NSApplication::run did not return within five seconds after STOP was armed\n",
-               stderr);
+    std::fprintf(stderr,
+                 "NATIVE_APP_LOOP_RETURN_TIMEOUT: NSApplication::run did not return within five seconds after the shutdown handshake was armed (stage=%s)\n",
+                 shutdownStageName(nativeApplicationShutdownStage.load(std::memory_order_acquire)));
     std::fflush(stderr);
     std::terminate();
 }
@@ -77,6 +103,8 @@ bool armNativeApplicationReturnWatchdog() noexcept
     if (! nativeApplicationReturnWatchdogArmed.compare_exchange_strong(
             expected, true, std::memory_order_acq_rel))
         return false;
+    nativeApplicationShutdownStage.store(NativeApplicationShutdownStage::watchdogArmed,
+                                         std::memory_order_release);
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
                      dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0),
                      nullptr, nativeApplicationReturnWatchdog);
@@ -102,7 +130,11 @@ bool stopJuceApplicationLoopFromEvent() noexcept
         return false;
     }
     messageManager->stopDispatchLoop();
-    return messageManager->hasStopMessageBeenSent();
+    const auto accepted = messageManager->hasStopMessageBeenSent();
+    if (accepted)
+        nativeApplicationShutdownStage.store(NativeApplicationShutdownStage::stopAccepted,
+                                             std::memory_order_release);
+    return accepted;
 }
 
 class NativeChooserCoordinator final : private juce::Timer
@@ -133,9 +165,9 @@ public:
 
     ~NativeChooserCoordinator() override
     {
-        // STOP keeps the timer armed until NSApplication::run returns. Stop it
-        // in the most-derived destructor, before C++ destroys the retained
-        // case state and only later reaches juce::Timer's base destructor.
+        // The normal handshake stops this timer before posting SETTLE. Keep an
+        // idempotent most-derived guard before retained case members are
+        // destroyed and only later juce::Timer's base destructor is reached.
         stopTimer();
     }
 
@@ -185,8 +217,7 @@ private:
         failureAwaitRetired,
         failureDrain,
         awaitApplicationStopReady,
-        awaitApplicationStopProbe,
-        awaitApplicationStop
+        awaitApplicationReturn
     };
 
     static double now() { return juce::Time::getMillisecondCounterHiRes(); }
@@ -311,8 +342,7 @@ private:
             case Phase::failureAwaitRetired: failureAwaitRetired(); return;
             case Phase::failureDrain: failureDrain(); return;
             case Phase::awaitApplicationStopReady: awaitApplicationStopReady(); return;
-            case Phase::awaitApplicationStopProbe: awaitApplicationStopProbe(); return;
-            case Phase::awaitApplicationStop: awaitApplicationStop(); return;
+            case Phase::awaitApplicationReturn: awaitApplicationReturn(); return;
         }
         throw std::runtime_error("unknown native chooser phase");
     }
@@ -341,8 +371,7 @@ private:
             case Phase::failureAwaitRetired: return "failureAwaitRetired";
             case Phase::failureDrain: return "failureDrain";
             case Phase::awaitApplicationStopReady: return "awaitApplicationStopReady";
-            case Phase::awaitApplicationStopProbe: return "awaitApplicationStopProbe";
-            case Phase::awaitApplicationStop: return "awaitApplicationStop";
+            case Phase::awaitApplicationReturn: return "awaitApplicationReturn";
         }
         return "unknown";
     }
@@ -668,19 +697,22 @@ private:
         enter(Phase::awaitApplicationStopReady, 5000.0);
         std::fputs("NATIVE_APP_LOOP_STOP_READY_BEGIN\n", stderr);
         std::fflush(stderr);
-        // Keep this CFRunLoop wake source armed through the STOP post. Once
-        // JUCE accepts STOP, the independent GCD watchdog covers run return.
+        // Stable readiness is established on timer turns. The final turn arms
+        // an independent watchdog and retires this recurring timer before
+        // AppKit retrieves the two control events, so it can no longer keep
+        // feeding JUCE's shared common-mode queue source.
         startTimer(10);
     }
 
     [[noreturn]] void shutdownTimeout(const char* stage) const noexcept
     {
         std::fprintf(stderr,
-                     "NATIVE_APP_LOOP_SHUTDOWN_TIMEOUT stage=%s readyForSettle=%d settle=%d readyForStop=%d stop=%d running=%d\n",
+                     "NATIVE_APP_LOOP_SHUTDOWN_TIMEOUT stage=%s readyForSettle=%d settle=%d readyForStop=%d stopPosted=%d stopHandled=%d running=%d\n",
                      stage,
                      NativeFilePanel::applicationIsReadyForSettleEvent() ? 1 : 0,
                      NativeFilePanel::applicationSettleEventWasHandled() ? 1 : 0,
                      NativeFilePanel::applicationIsReadyForStopEvent() ? 1 : 0,
+                     NativeFilePanel::applicationStopEventWasPosted() ? 1 : 0,
                      NativeFilePanel::applicationStopEventWasHandled() ? 1 : 0,
                      NativeFilePanel::applicationIsRunning() ? 1 : 0);
         std::fflush(stderr);
@@ -697,28 +729,6 @@ private:
         }
         if (++fenceTurns < 3) return;
 
-        std::fputs("NATIVE_APP_LOOP_SETTLE_BEGIN\n", stderr);
-        nativeApplicationSettleEventPosted = NativeFilePanel::postApplicationSettleEvent();
-        if (! nativeApplicationSettleEventPosted)
-        {
-            std::fputs("NATIVE_APP_LOOP_SETTLE_POST_FAILED\n", stderr);
-            std::fflush(stderr);
-            std::terminate();
-        }
-        std::fputs("NATIVE_APP_LOOP_SETTLE_POSTED\n", stderr);
-        std::fflush(stderr);
-        enter(Phase::awaitApplicationStopProbe, 5000.0);
-    }
-
-    void awaitApplicationStopProbe()
-    {
-        if (! NativeFilePanel::applicationSettleEventWasHandled()
-            || ! NativeFilePanel::applicationIsReadyForStopEvent())
-        {
-            if (now() >= deadline) shutdownTimeout("settle");
-            return;
-        }
-
         if (! armNativeApplicationReturnWatchdog())
         {
             std::fputs("NATIVE_APP_LOOP_RETURN_WATCHDOG_ARM_FAILED\n", stderr);
@@ -727,21 +737,28 @@ private:
         }
         std::fputs("NATIVE_APP_LOOP_RETURN_WATCHDOG_ARMED\n", stderr);
         std::fflush(stderr);
-        nativeApplicationStopEventPosted = NativeFilePanel::postApplicationStopEvent();
-        if (! nativeApplicationStopEventPosted)
+        // Retire the recurring timer before enqueuing SETTLE. stopTimer() is
+        // synchronous and supported from inside this callback; postEvent:
+        // cannot dispatch re-entrantly.
+        stopTimer();
+        std::fputs("NATIVE_APP_LOOP_SETTLE_BEGIN\n", stderr);
+        nativeApplicationSettleEventPosted = NativeFilePanel::postApplicationSettleEvent();
+        if (! nativeApplicationSettleEventPosted)
         {
-            std::fputs("NATIVE_APP_LOOP_STOP_POST_FAILED\n", stderr);
+            std::fputs("NATIVE_APP_LOOP_SETTLE_POST_FAILED\n", stderr);
             std::fflush(stderr);
             std::terminate();
         }
-        std::fputs("NATIVE_APP_LOOP_STOP_POSTED\n", stderr);
+        nativeApplicationShutdownStage.store(NativeApplicationShutdownStage::settlePosted,
+                                             std::memory_order_release);
+        std::fputs("NATIVE_APP_LOOP_SETTLE_POSTED\n", stderr);
         std::fflush(stderr);
-        enter(Phase::awaitApplicationStop, 5000.0);
+        enter(Phase::awaitApplicationReturn);
     }
 
-    void awaitApplicationStop()
+    [[noreturn]] void awaitApplicationReturn() const noexcept
     {
-        if (now() >= deadline) shutdownTimeout("stop");
+        shutdownTimeout("timer-fired-after-settle");
     }
 
     void failDuringShutdown(const char* message) noexcept
@@ -884,9 +901,10 @@ int runNativeFileChooserLifecycles(const juce::File& root, const juce::String& r
     NativeFilePanel::prepareTestApplication(stopJuceApplicationLoopFromEvent);
     nativeApplicationLoopReturned.store(false, std::memory_order_release);
     nativeApplicationReturnWatchdogArmed.store(false, std::memory_order_release);
+    nativeApplicationShutdownStage.store(NativeApplicationShutdownStage::idle,
+                                         std::memory_order_release);
     nativeApplicationStartEventPosted = false;
     nativeApplicationSettleEventPosted = false;
-    nativeApplicationStopEventPosted = false;
     nativeApplicationWasRunningAtStop = false;
     nativeFileChooserHarnessEnabled = true;
     NativeChooserCoordinator coordinator(root, requestedCase);
@@ -898,9 +916,12 @@ int runNativeFileChooserLifecycles(const juce::File& root, const juce::String& r
     std::fputs("NATIVE_APP_LOOP_ENTER\n", stderr);
     juce::MessageManager::getInstance()->runDispatchLoop();
     nativeApplicationLoopReturned.store(true, std::memory_order_release);
+    nativeApplicationShutdownStage.store(NativeApplicationShutdownStage::loopReturned,
+                                         std::memory_order_release);
     std::fputs("NATIVE_APP_LOOP_RETURN\n", stderr);
     const auto startEventWasHandled = NativeFilePanel::applicationStartEventWasHandled();
     const auto settleEventWasHandled = NativeFilePanel::applicationSettleEventWasHandled();
+    const auto stopEventWasPosted = NativeFilePanel::applicationStopEventWasPosted();
     const auto stopEventWasHandled = NativeFilePanel::applicationStopEventWasHandled();
     if (coordinator.failureMessage().empty()) coordinator.verifyFinalState();
     NativeFilePanel::finishTestApplication();
@@ -914,7 +935,7 @@ int runNativeFileChooserLifecycles(const juce::File& root, const juce::String& r
             "native chooser application loop stopped without its AppKit settle event");
     require(settleEventWasHandled,
             "native chooser AppKit settle event was not handled once in the AppKit dispatch path");
-    require(nativeApplicationStopEventPosted,
+    require(stopEventWasPosted,
             "native chooser application loop stopped without its AppKit stop event");
     require(stopEventWasHandled,
             "native chooser AppKit stop event was not handled once in the running application loop");

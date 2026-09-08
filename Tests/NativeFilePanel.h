@@ -13,8 +13,8 @@ public:
     static void prepareTestApplication(ApplicationStopCallback);
     [[nodiscard]] static bool applicationIsRunning() noexcept;
     // Private START/SETTLE events prove that NSApplication is dispatching.
-    // STOP calls stop: from a later real event while the app is running and
-    // has no modal window.
+    // A valid SETTLE handler posts STOP; that subsequent real event calls
+    // stop: while the app is running and has no modal window.
     [[nodiscard]] static bool postApplicationStartEvent() noexcept;
     [[nodiscard]] static bool applicationStartEventWasHandled() noexcept;
     [[nodiscard]] static bool applicationIsReadyForSettleEvent() noexcept;
@@ -22,6 +22,7 @@ public:
     [[nodiscard]] static bool applicationSettleEventWasHandled() noexcept;
     [[nodiscard]] static bool applicationIsReadyForStopEvent() noexcept;
     [[nodiscard]] static bool postApplicationStopEvent() noexcept;
+    [[nodiscard]] static bool applicationStopEventWasPosted() noexcept;
     [[nodiscard]] static bool applicationStopEventWasHandled() noexcept;
     static void finishTestApplication() noexcept;
     // A captured, test-owned JUCE desktop peer must not leave an AppKit

@@ -468,8 +468,22 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
                                                             applicationSettleEventWasCurrentEvent ? 1 : 0,
                                                             applicationSettleEventHandledWithoutModalWindow ? 0 : 1);
                                                std::fflush(stderr);
-                                               // The coordinator must observe this completed dispatch
-                                               // before it may enqueue STOP on a later timer turn.
+                                               if (! NativeFilePanel::applicationSettleEventWasHandled())
+                                               {
+                                                   std::fputs("NATIVE_APP_LOOP_SETTLE_INVALID\n", stderr);
+                                                   std::fflush(stderr);
+                                                   std::terminate();
+                                               }
+                                               // postEvent: only enqueues. STOP cannot be retrieved
+                                               // until this distinct SETTLE monitor call returns.
+                                               if (! NativeFilePanel::postApplicationStopEvent())
+                                               {
+                                                   std::fputs("NATIVE_APP_LOOP_STOP_POST_FAILED\n", stderr);
+                                                   std::fflush(stderr);
+                                                   std::terminate();
+                                               }
+                                               std::fputs("NATIVE_APP_LOOP_STOP_POSTED\n", stderr);
+                                               std::fflush(stderr);
                                                return nil;
                                            }
                                            else if ([event data2] == applicationStopEventCode)
@@ -480,7 +494,9 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
                                                    [NSApp currentEvent] == event;
                                                applicationStopEventHandledWithoutModalWindow =
                                                    [NSApp modalWindow] == nil;
-                                               applicationStopCallbackSucceeded = running
+                                               applicationStopCallbackSucceeded = applicationStopEventCount == 1
+                                                   && NativeFilePanel::applicationSettleEventWasHandled()
+                                                   && running
                                                    && applicationStopEventPostedFromReadyContext
                                                    && applicationStopEventWasCurrentEvent
                                                    && applicationStopEventHandledWithoutModalWindow
@@ -591,6 +607,14 @@ bool NativeFilePanel::postApplicationStopEvent() noexcept
         applicationStopEventPostedFromReadyContext =
             postedFromReadyContext && applicationStopEventPosted;
         return applicationStopEventPosted;
+    }
+}
+bool NativeFilePanel::applicationStopEventWasPosted() noexcept
+{
+    @autoreleasepool
+    {
+        return [NSThread isMainThread] && applicationStopEventPosted
+            && applicationStopEventPostedFromReadyContext;
     }
 }
 bool NativeFilePanel::applicationStopEventWasHandled() noexcept
