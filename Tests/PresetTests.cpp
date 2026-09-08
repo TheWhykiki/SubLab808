@@ -1,6 +1,7 @@
 #include "PluginProcessor.h"
 #include "FactoryBank.h"
 #include "UpdaterLauncher.h"
+#include <atomic>
 #include <cstdio>
 #include <set>
 #include <stdexcept>
@@ -8,6 +9,7 @@
 #include <exception>
 #if JUCE_MAC
 #include "NativeFilePanel.h"
+#include <dispatch/dispatch.h>
 #endif
 
 #if PRESET_TEST_SUBLAB

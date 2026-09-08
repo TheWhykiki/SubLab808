@@ -56,11 +56,38 @@ struct NativeChooserCaseState
 };
 
 bool nativeApplicationStartEventPosted = false;
+bool nativeApplicationSettleEventPosted = false;
 bool nativeApplicationStopEventPosted = false;
 bool nativeApplicationWasRunningAtStop = false;
+std::atomic<bool> nativeApplicationLoopReturned { false };
+std::atomic<bool> nativeApplicationReturnWatchdogArmed { false };
+
+void nativeApplicationReturnWatchdog(void*) noexcept
+{
+    if (nativeApplicationLoopReturned.load(std::memory_order_acquire)) return;
+    std::fputs("NATIVE_APP_LOOP_RETURN_TIMEOUT: NSApplication::run did not return within five seconds after STOP was armed\n",
+               stderr);
+    std::fflush(stderr);
+    std::terminate();
+}
+
+bool armNativeApplicationReturnWatchdog() noexcept
+{
+    bool expected = false;
+    if (! nativeApplicationReturnWatchdogArmed.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel))
+        return false;
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+                     dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0),
+                     nullptr, nativeApplicationReturnWatchdog);
+    return true;
+}
 
 bool stopJuceApplicationLoopFromEvent() noexcept
 {
+    nativeApplicationWasRunningAtStop = NativeFilePanel::applicationIsRunning();
+    std::fprintf(stderr, "NATIVE_APP_LOOP_STOP_BEGIN running=%d\n",
+                 nativeApplicationWasRunningAtStop ? 1 : 0);
     auto* messageManager = juce::MessageManager::getInstanceWithoutCreating();
     if (messageManager == nullptr)
     {
@@ -76,24 +103,6 @@ bool stopJuceApplicationLoopFromEvent() noexcept
     }
     messageManager->stopDispatchLoop();
     return messageManager->hasStopMessageBeenSent();
-}
-
-void stopNativeChooserApplicationLoop() noexcept
-{
-    nativeApplicationWasRunningAtStop = NativeFilePanel::applicationIsRunning();
-    std::fprintf(stderr, "NATIVE_APP_LOOP_STOP_BEGIN running=%d\n",
-                 nativeApplicationWasRunningAtStop ? 1 : 0);
-    nativeApplicationStopEventPosted = NativeFilePanel::postApplicationStopEvent();
-    if (! nativeApplicationStopEventPosted)
-    {
-        std::fputs("NATIVE_APP_LOOP_STOP_POST_FAILED\n", stderr);
-        std::fflush(stderr);
-        // Without a dispatched NSEvent AppKit has no supported path back from
-        // run(). Fail promptly instead of consuming CTest's 60/480 s watchdog.
-        std::terminate();
-    }
-    std::fputs("NATIVE_APP_LOOP_STOP_POSTED\n", stderr);
-    std::fflush(stderr);
 }
 
 class NativeChooserCoordinator final : private juce::Timer
@@ -128,11 +137,22 @@ public:
                 "native chooser coordinator starts on the message thread");
         // NSApplication::run may service Timer sources during launch. The first
         // phase remains gated until AppKit dispatches our private START NSEvent.
+        startupDeadline = now() + 5000.0;
         startTimer(10);
     }
 
     bool completedNormally() const { return completed; }
     const std::string& failureMessage() const { return failure; }
+    std::size_t caseCount() const { return cases.size(); }
+
+    void verifyFinalState()
+    {
+        require(failure.empty(), "native chooser final audit requires a successful lifecycle");
+        require(shutdownStarted && current == nullptr && caseIndex == cases.size(),
+                "native chooser reached run-loop return from the completed shutdown state");
+        auditRetiredCases();
+        auditGlobalState();
+    }
 
 private:
     enum class Phase
@@ -155,7 +175,10 @@ private:
         betweenCases,
         failureDestroy,
         failureAwaitRetired,
-        failureDrain
+        failureDrain,
+        awaitApplicationStopReady,
+        awaitApplicationStopProbe,
+        awaitApplicationStop
     };
 
     static double now() { return juce::Time::getMillisecondCounterHiRes(); }
@@ -203,16 +226,32 @@ private:
         {
             if (! applicationLoopStarted)
             {
-                if (! NativeFilePanel::applicationStartEventWasHandled()) return;
+                if (! NativeFilePanel::applicationStartEventWasHandled())
+                {
+                    if (now() >= startupDeadline)
+                    {
+                        std::fprintf(stderr,
+                                     "NATIVE_APP_LOOP_START_TIMEOUT running=%d\n",
+                                     NativeFilePanel::applicationIsRunning() ? 1 : 0);
+                        std::fflush(stderr);
+                        std::terminate();
+                    }
+                    return;
+                }
                 applicationLoopStarted = true;
-                // Finish through the coordinator before CTest's 60/480-second
-                // process watchdog so failures retain case/phase diagnostics.
-                runDeadline = now() + (cases.size() == 1 ? 45000.0 : 450000.0);
+                // Reserve room below CTest's 60/480-second process watchdogs
+                // for bounded failure cleanup plus the three shutdown stages.
+                runDeadline = now() + (cases.size() == 1 ? 32000.0 : 435000.0);
                 enter(Phase::createCase);
                 std::fputs("NATIVE_APP_LOOP_ACTIVE dispatch=1 running=1\n", stderr);
             }
-            if (failure.empty()) auditRetiredCases();
-            if (failure.empty() && runDeadline > 0.0 && now() >= runDeadline)
+            if (failure.empty())
+            {
+                auditRetiredCases();
+                if (shutdownStarted) auditGlobalState();
+            }
+            if (! shutdownStarted && failure.empty()
+                && runDeadline > 0.0 && now() >= runDeadline)
                 throw std::runtime_error(
                     std::string("NATIVE_CHOOSER_RUN_TIMEOUT: overall deadline reached in case ")
                     + std::to_string(caseIndex + 1) + "/" + std::to_string(cases.size())
@@ -221,11 +260,12 @@ private:
         }
         catch (const std::exception& exception)
         {
-            fail(exception.what());
+            shutdownStarted ? failDuringShutdown(exception.what()) : fail(exception.what());
         }
         catch (...)
         {
-            fail("unknown exception in native chooser coordinator");
+            shutdownStarted ? failDuringShutdown("unknown exception in native chooser shutdown")
+                            : fail("unknown exception in native chooser coordinator");
         }
     }
 
@@ -255,6 +295,9 @@ private:
             case Phase::failureDestroy: failureDestroy(); return;
             case Phase::failureAwaitRetired: failureAwaitRetired(); return;
             case Phase::failureDrain: failureDrain(); return;
+            case Phase::awaitApplicationStopReady: awaitApplicationStopReady(); return;
+            case Phase::awaitApplicationStopProbe: awaitApplicationStopProbe(); return;
+            case Phase::awaitApplicationStop: awaitApplicationStop(); return;
         }
         throw std::runtime_error("unknown native chooser phase");
     }
@@ -282,6 +325,9 @@ private:
             case Phase::failureDestroy: return "failureDestroy";
             case Phase::failureAwaitRetired: return "failureAwaitRetired";
             case Phase::failureDrain: return "failureDrain";
+            case Phase::awaitApplicationStopReady: return "awaitApplicationStopReady";
+            case Phase::awaitApplicationStopProbe: return "awaitApplicationStopProbe";
+            case Phase::awaitApplicationStop: return "awaitApplicationStop";
         }
         return "unknown";
     }
@@ -563,9 +609,7 @@ private:
 
     void betweenCases()
     {
-        const bool clean = juce::Component::getNumCurrentlyModalComponents() == 0
-                        && NativeFilePanel::visibleCount() == 0
-                        && ! NativeFilePanel::hasActiveCompletionSession();
+        const bool clean = globalStateIsClean();
         if (! waitUntil(clean,
                         "NATIVE_PANEL_TEARDOWN_TIMEOUT: case destruction left native or JUCE modal state")) return;
         if (++fenceTurns < 3) return;
@@ -582,11 +626,118 @@ private:
             return;
         }
 
-        std::printf("PASS: %zu real native file-chooser lifecycle regression%s.\n",
-                    cases.size(), cases.size() == 1 ? "" : "s");
+        beginApplicationStopHandshake();
+    }
+
+    bool globalStateIsClean() const
+    {
+        return juce::Component::getNumCurrentlyModalComponents() == 0
+            && NativeFilePanel::visibleCount() == 0
+            && ! NativeFilePanel::hasActiveCompletionSession();
+    }
+
+    void auditGlobalState() const
+    {
+        require(globalStateIsClean(),
+                "native chooser shutdown has no JUCE modal, native panel or completion session");
+    }
+
+    void beginApplicationStopHandshake() noexcept
+    {
+        if (shutdownStarted) return;
+        shutdownStarted = true;
         completed = true;
-        stopTimer();
-        stopNativeChooserApplicationLoop();
+        enter(Phase::awaitApplicationStopReady, 5000.0);
+        std::fputs("NATIVE_APP_LOOP_STOP_READY_BEGIN\n", stderr);
+        std::fflush(stderr);
+        // Keep this CFRunLoop wake source armed through the STOP post. Once
+        // JUCE accepts STOP, the independent GCD watchdog covers run return.
+        startTimer(10);
+    }
+
+    [[noreturn]] void shutdownTimeout(const char* stage) const noexcept
+    {
+        std::fprintf(stderr,
+                     "NATIVE_APP_LOOP_SHUTDOWN_TIMEOUT stage=%s readyForSettle=%d settle=%d readyForStop=%d stop=%d running=%d\n",
+                     stage,
+                     NativeFilePanel::applicationIsReadyForSettleEvent() ? 1 : 0,
+                     NativeFilePanel::applicationSettleEventWasHandled() ? 1 : 0,
+                     NativeFilePanel::applicationIsReadyForStopEvent() ? 1 : 0,
+                     NativeFilePanel::applicationStopEventWasHandled() ? 1 : 0,
+                     NativeFilePanel::applicationIsRunning() ? 1 : 0);
+        std::fflush(stderr);
+        std::terminate();
+    }
+
+    void awaitApplicationStopReady()
+    {
+        if (! NativeFilePanel::applicationIsReadyForSettleEvent())
+        {
+            fenceTurns = 0;
+            if (now() >= deadline) shutdownTimeout("ready");
+            return;
+        }
+        if (++fenceTurns < 3) return;
+
+        std::fputs("NATIVE_APP_LOOP_SETTLE_BEGIN\n", stderr);
+        nativeApplicationSettleEventPosted = NativeFilePanel::postApplicationSettleEvent();
+        if (! nativeApplicationSettleEventPosted)
+        {
+            std::fputs("NATIVE_APP_LOOP_SETTLE_POST_FAILED\n", stderr);
+            std::fflush(stderr);
+            std::terminate();
+        }
+        std::fputs("NATIVE_APP_LOOP_SETTLE_POSTED\n", stderr);
+        std::fflush(stderr);
+        enter(Phase::awaitApplicationStopProbe, 5000.0);
+    }
+
+    void awaitApplicationStopProbe()
+    {
+        if (! NativeFilePanel::applicationSettleEventWasHandled()
+            || ! NativeFilePanel::applicationIsReadyForStopEvent())
+        {
+            if (now() >= deadline) shutdownTimeout("settle");
+            return;
+        }
+
+        if (! armNativeApplicationReturnWatchdog())
+        {
+            std::fputs("NATIVE_APP_LOOP_RETURN_WATCHDOG_ARM_FAILED\n", stderr);
+            std::fflush(stderr);
+            std::terminate();
+        }
+        std::fputs("NATIVE_APP_LOOP_RETURN_WATCHDOG_ARMED\n", stderr);
+        std::fflush(stderr);
+        nativeApplicationStopEventPosted = NativeFilePanel::postApplicationStopEvent();
+        if (! nativeApplicationStopEventPosted)
+        {
+            std::fputs("NATIVE_APP_LOOP_STOP_POST_FAILED\n", stderr);
+            std::fflush(stderr);
+            std::terminate();
+        }
+        std::fputs("NATIVE_APP_LOOP_STOP_POSTED\n", stderr);
+        std::fflush(stderr);
+        enter(Phase::awaitApplicationStop, 5000.0);
+    }
+
+    void awaitApplicationStop()
+    {
+        if (now() >= deadline) shutdownTimeout("stop");
+    }
+
+    void failDuringShutdown(const char* message) noexcept
+    {
+        if (failure.empty())
+        {
+            failure = message;
+            std::fprintf(stderr, "FAIL_DURING_SHUTDOWN: %s\n", failure.c_str());
+        }
+        else
+        {
+            std::fprintf(stderr, "FAILURE_CLEANUP_ERROR: %s\n", message);
+        }
+        std::fflush(stderr);
     }
 
     void fail(const char* message) noexcept
@@ -597,9 +748,7 @@ private:
             {
                 std::fprintf(stderr, "FAILURE_CLEANUP_ERROR: %s\n", message);
                 std::fflush(stderr);
-                completed = true;
-                stopTimer();
-                stopNativeChooserApplicationLoop();
+                beginApplicationStopHandshake();
                 return;
             }
             failure = message;
@@ -622,9 +771,7 @@ private:
         {
             std::fputs("FAILURE_CLEANUP_ERROR: initial cleanup threw; stopping app loop\n", stderr);
             std::fflush(stderr);
-            completed = true;
-            stopTimer();
-            stopNativeChooserApplicationLoop();
+            beginApplicationStopHandshake();
         }
     }
 
@@ -652,9 +799,7 @@ private:
             && ! failurePanel->isAlive()
             && failurePanel->completionIsQuiescent())
             panelClean = failurePanel->markSafeOwnerRetired();
-        const bool globallyClean = juce::Component::getNumCurrentlyModalComponents() == 0
-                                && NativeFilePanel::visibleCount() == 0
-                                && ! NativeFilePanel::hasActiveCompletionSession();
+        const bool globallyClean = globalStateIsClean();
         if (panelClean && globallyClean)
         {
             failurePanel.reset();
@@ -677,9 +822,7 @@ private:
     void failureDrain()
     {
         if (now() < deadline) return;
-        completed = true;
-        stopTimer();
-        stopNativeChooserApplicationLoop();
+        beginApplicationStopHandshake();
     }
 
     std::vector<NativeChooserCase> cases;
@@ -690,6 +833,7 @@ private:
     size_t caseIndex = 0;
     Phase phase = Phase::createCase;
     double deadline = 0.0;
+    double startupDeadline = 0.0;
     double runDeadline = 0.0;
     int fenceTurns = 0;
     bool lastImporting = false;
@@ -698,6 +842,7 @@ private:
     std::size_t lastLateCompletionEntries = 0;
     bool completed = false;
     bool applicationLoopStarted = false;
+    bool shutdownStarted = false;
     std::string failure;
 };
 
@@ -719,7 +864,10 @@ int runNativeFileChooserLifecycles(const juce::File& root, const juce::String& r
     require(juce::FileChooser::isPlatformDialogAvailable(),
             "native chooser platform implementation is available");
     NativeFilePanel::prepareTestApplication(stopJuceApplicationLoopFromEvent);
+    nativeApplicationLoopReturned.store(false, std::memory_order_release);
+    nativeApplicationReturnWatchdogArmed.store(false, std::memory_order_release);
     nativeApplicationStartEventPosted = false;
+    nativeApplicationSettleEventPosted = false;
     nativeApplicationStopEventPosted = false;
     nativeApplicationWasRunningAtStop = false;
     nativeFileChooserHarnessEnabled = true;
@@ -731,9 +879,12 @@ int runNativeFileChooserLifecycles(const juce::File& root, const juce::String& r
     coordinator.start();
     std::fputs("NATIVE_APP_LOOP_ENTER\n", stderr);
     juce::MessageManager::getInstance()->runDispatchLoop();
+    nativeApplicationLoopReturned.store(true, std::memory_order_release);
     std::fputs("NATIVE_APP_LOOP_RETURN\n", stderr);
     const auto startEventWasHandled = NativeFilePanel::applicationStartEventWasHandled();
+    const auto settleEventWasHandled = NativeFilePanel::applicationSettleEventWasHandled();
     const auto stopEventWasHandled = NativeFilePanel::applicationStopEventWasHandled();
+    if (coordinator.failureMessage().empty()) coordinator.verifyFinalState();
     NativeFilePanel::finishTestApplication();
     nativeFileChooserHarnessEnabled = false;
     require(coordinator.completedNormally(), "native chooser application loop stopped before completion");
@@ -741,12 +892,18 @@ int runNativeFileChooserLifecycles(const juce::File& root, const juce::String& r
             "native chooser AppKit start event was not handled once in the running application loop");
     require(nativeApplicationWasRunningAtStop,
             "native chooser requested shutdown before the AppKit event loop was running");
+    require(nativeApplicationSettleEventPosted,
+            "native chooser application loop stopped without its AppKit settle event");
+    require(settleEventWasHandled,
+            "native chooser AppKit settle event was not handled once in the default loop");
     require(nativeApplicationStopEventPosted,
             "native chooser application loop stopped without its AppKit stop event");
     require(stopEventWasHandled,
             "native chooser AppKit stop event was not handled once in the running application loop");
     if (! coordinator.failureMessage().empty())
         throw std::runtime_error(coordinator.failureMessage());
+    std::printf("PASS: %zu real native file-chooser lifecycle regression%s.\n",
+                coordinator.caseCount(), coordinator.caseCount() == 1 ? "" : "s");
     std::fputs("NATIVE_TEST_RETURN\n", stderr);
     return 0;
 }

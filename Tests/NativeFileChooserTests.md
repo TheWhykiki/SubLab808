@@ -66,10 +66,19 @@ activation, menu dismissal, panel presentation, owner transition, panel retireme
 editor reopen and control probe.
 It never calls `CFRunLoopRunInMode`, directly invokes `sendEvent:`, or enters a nested
 JUCE dispatch loop. Because `NSApplication.stop` called from a timer does not stop the
-main loop, shutdown posts one private STOP event. The same local monitor invokes JUCE's
-stop request from that event-handler boundary, and the harness verifies that START and
-STOP were each handled exactly once while `NSApplication` was running. The monitor is
-removed exactly once after the loop returns. It does not assume
+main loop, shutdown first requires three consecutive timer turns while `NSApplication`
+is running in `NSDefaultRunLoopMode` without an AppKit modal window, then posts one private
+SETTLE event at the back of AppKit's queue. The local monitor must confirm that AppKit
+retrieved this exact event while the application was running without a modal window. On
+a later default-mode timer turn,
+the coordinator posts STOP at the back of the queue; the monitor invokes JUCE's stop
+request from that real event-handler boundary. START, SETTLE and STOP must each be handled
+exactly once. The 10 ms timer stays armed through the STOP post as a run-loop wake source,
+with separate five-second readiness, SETTLE and STOP diagnostics. Because JUCE stops
+delivering message callbacks after accepting STOP, an independent GCD watchdog also
+requires `[NSApp run]` to return within five seconds; the main thread acknowledges that
+return atomically. A final state/files/global-modal audit closes the last timer-to-STOP
+gap before the monitor is removed exactly once. It does not assume
 that AppKit invokes, discards, or releases a modeless panel completion after a programmatic
 close. Instead it marks the verified JUCE/AppKit owner-retirement boundary atomically
 and keeps the late-entry sentinel active across subsequent editor interaction and
@@ -113,10 +122,11 @@ closed, pinned code remains callable while the unpinned control is absent. These
 two controls are omitted under sanitizers because an instrumented DSO may be made
 non-unloadable by the sanitizer runtime, which would invalidate the oracle.
 
-The coordinator has an absolute 45-second isolated / 450-second sequential
-deadline so a responsive failure reports its case and phase before CTest's
-60-second / 480-second process watchdog. CTest remains the fallback for a callback
-that blocks the message thread completely.
+START has a five-second dispatch deadline. After START, the coordinator has an absolute
+32-second isolated / 435-second sequential functional deadline. Even the maximum bounded
+failure cleanup plus all three five-second shutdown stages stays below CTest's 60-second /
+480-second process watchdog with reserve. CTest remains the fallback for a callback that
+blocks before the independent shutdown watchdog is armed.
 
 To reproduce one isolated case manually, also set
 `WHYKIKI_PRESET_TEST_NATIVE_CASE` to an operation (`import` or `export`) plus
