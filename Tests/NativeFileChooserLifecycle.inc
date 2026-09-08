@@ -746,7 +746,7 @@ private:
         std::fflush(stderr);
         // stopTimer() is synchronous inside its callback. Queue BARRIER before
         // SETTLE exists. An active eligible fetch is stopped; between fetches,
-        // the next eligible outer fetch binds and returns BARRIER itself.
+        // the next eligible fetch binds and returns BARRIER itself.
         stopTimer();
         nativeApplicationSettleDispatchRequested =
             NativeFilePanel::requestApplicationEventFetchReturn();

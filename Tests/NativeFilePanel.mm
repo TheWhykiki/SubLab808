@@ -34,10 +34,11 @@
 
 // The coordinator runs from JUCE's main-thread run-loop source, which can fire
 // while AppKit is blocked inside nextEventMatchingMask:. postEvent: only queues
-// an event, so an eligible active fetch gets a marked BARRIER before its
-// innermost CFRunLoop activation is stopped. Between fetches, the next eligible
-// outer fetch binds the request and queues BARRIER before retrieval. Only that
-// exact fetch may return BARRIER and queue SETTLE for a later AppKit dispatch.
+// an event, so the innermost eligible active fetch gets a marked BARRIER before
+// CFRunLoopStop requests exit from the innermost run-loop activation. Between
+// fetches, the next eligible fetch binds the request and queues BARRIER before
+// retrieval. Only the exact bound fetch may return BARRIER and queue SETTLE;
+// that return validates the active-path binding at runtime.
 static NSUInteger applicationEventFetchDepth = 0;
 static NSUInteger applicationEventFetchReturnRequestedDepth = 0;
 static NSUInteger applicationEventFetchReturnRequestCount = 0;
@@ -50,6 +51,9 @@ static NSUInteger applicationEventFetchReturnRequestedInvocation = 0;
 static NSUInteger applicationFetchBarrierEventDequeueInvocation = 0;
 static NSUInteger applicationSettleEventDequeueInvocation = 0;
 static NSUInteger applicationStopEventDequeueInvocation = 0;
+static NSUInteger applicationFetchBarrierEventDequeueDepth = 0;
+static NSUInteger applicationSettleEventDequeueDepth = 0;
+static NSUInteger applicationStopEventDequeueDepth = 0;
 static bool applicationEventFetchReturnRequested = false;
 static bool applicationEventFetchReturnRequestTargetsActiveFetch = false;
 static NSEventMask applicationEventFetchMask = 0;
@@ -77,25 +81,28 @@ static constexpr NSInteger applicationStopEventCode = 4;
                            inMode:(NSRunLoopMode)mode
                           dequeue:(BOOL)dequeue
 {
+    const auto previousActiveInvocation = applicationEventFetchActiveInvocation;
+    const auto previousMask = applicationEventFetchMask;
+    const auto previousDequeues = applicationEventFetchDequeues;
+    const auto previousModeSupplied = applicationEventFetchModeSupplied;
+    const auto previousContextRecorded = applicationEventFetchContextRecorded;
     const auto fetchDepth = ++applicationEventFetchDepth;
     const auto fetchInvocation = ++applicationEventFetchInvocationCount;
     NSEvent* event = nil;
     @try
     {
-        if (fetchDepth == 1)
-        {
-            applicationEventFetchActiveInvocation = fetchInvocation;
-            applicationEventFetchMask = mask;
-            applicationEventFetchDequeues = dequeue == YES;
-            applicationEventFetchModeSupplied = mode != nil;
-            applicationEventFetchContextRecorded = true;
-        }
+        // These fields describe the current innermost fetch. A nested fetch
+        // restores its caller's context in @finally when it returns.
+        applicationEventFetchActiveInvocation = fetchInvocation;
+        applicationEventFetchMask = mask;
+        applicationEventFetchDequeues = dequeue == YES;
+        applicationEventFetchModeSupplied = mode != nil;
+        applicationEventFetchContextRecorded = true;
 
         // A shutdown request made between AppKit fetches has no invocation to
-        // bind yet. The first eligible outer fetch claims it and queues BARRIER
+        // bind yet. The first eligible fetch claims it and queues BARRIER
         // before calling super, so only that exact fetch may return the event.
-        if (fetchDepth == 1
-            && applicationEventFetchReturnRequested
+        if (applicationEventFetchReturnRequested
             && applicationEventFetchReturnRequestedDepth == 0
             && applicationEventFetchReturnRequestedInvocation == 0
             && dequeue == YES
@@ -135,8 +142,9 @@ static constexpr NSInteger applicationStopEventCode = 4;
         {
             const auto* modeName = [mode UTF8String];
             std::fprintf(stderr,
-                         "NATIVE_APP_LOOP_CONTROL_DEQUEUED code=%ld invocation=%lu mode=%s\n",
+                         "NATIVE_APP_LOOP_CONTROL_DEQUEUED code=%ld depth=%lu invocation=%lu mode=%s\n",
                          static_cast<long>([event data2]),
+                         static_cast<unsigned long>(fetchDepth),
                          static_cast<unsigned long>(fetchInvocation),
                          modeName != nullptr ? modeName : "<unavailable>");
             std::fflush(stderr);
@@ -149,14 +157,17 @@ static constexpr NSInteger applicationStopEventCode = 4;
                 case applicationFetchBarrierEventCode:
                     ++applicationFetchBarrierEventDequeueCount;
                     applicationFetchBarrierEventDequeueInvocation = fetchInvocation;
+                    applicationFetchBarrierEventDequeueDepth = fetchDepth;
                     break;
                 case applicationSettleEventCode:
                     ++applicationSettleEventDequeueCount;
                     applicationSettleEventDequeueInvocation = fetchInvocation;
+                    applicationSettleEventDequeueDepth = fetchDepth;
                     break;
                 case applicationStopEventCode:
                     ++applicationStopEventDequeueCount;
                     applicationStopEventDequeueInvocation = fetchInvocation;
+                    applicationStopEventDequeueDepth = fetchDepth;
                     break;
                 default: break;
             }
@@ -169,6 +180,7 @@ static constexpr NSInteger applicationStopEventCode = 4;
             const bool returnedExpectedBarrier = markedControlEvent
                 && [event data2] == applicationFetchBarrierEventCode
                 && applicationFetchBarrierEventDequeueCount == 1
+                && applicationFetchBarrierEventDequeueDepth == fetchDepth
                 && applicationFetchBarrierEventDequeueInvocation == fetchInvocation;
             if (! returnedExpectedBarrier)
             {
@@ -201,14 +213,11 @@ static constexpr NSInteger applicationStopEventCode = 4;
     @finally
     {
         --applicationEventFetchDepth;
-        if (fetchDepth == 1)
-        {
-            applicationEventFetchActiveInvocation = 0;
-            applicationEventFetchMask = 0;
-            applicationEventFetchDequeues = false;
-            applicationEventFetchModeSupplied = false;
-            applicationEventFetchContextRecorded = false;
-        }
+        applicationEventFetchActiveInvocation = previousActiveInvocation;
+        applicationEventFetchMask = previousMask;
+        applicationEventFetchDequeues = previousDequeues;
+        applicationEventFetchModeSupplied = previousModeSupplied;
+        applicationEventFetchContextRecorded = previousContextRecorded;
     }
     return event;
 }
@@ -233,17 +242,17 @@ bool applicationStartEventHandledAfterFetchReturn = false;
 bool applicationFetchBarrierEventHandledWhileRunning = false;
 bool applicationFetchBarrierEventWasCurrentEvent = false;
 bool applicationFetchBarrierEventHandledWithoutModalWindow = false;
-bool applicationFetchBarrierEventHandledAfterFetchReturn = false;
+NSUInteger applicationFetchBarrierEventHandlerDepth = 0;
 bool applicationSettleEventHandledWhileRunning = false;
 bool applicationSettleEventPostedFromReadyContext = false;
 bool applicationSettleEventWasCurrentEvent = false;
 bool applicationSettleEventHandledWithoutModalWindow = false;
-bool applicationSettleEventHandledAfterFetchReturn = false;
+NSUInteger applicationSettleEventHandlerDepth = 0;
 bool applicationStopEventHandledWhileRunning = false;
 bool applicationStopEventPostedFromReadyContext = false;
 bool applicationStopEventWasCurrentEvent = false;
 bool applicationStopEventHandledWithoutModalWindow = false;
-bool applicationStopEventHandledAfterFetchReturn = false;
+NSUInteger applicationStopEventHandlerDepth = 0;
 bool applicationStopCallbackSucceeded = false;
 bool applicationStartEventPosted = false;
 bool applicationFetchBarrierEventPosted = false;
@@ -620,17 +629,17 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
         applicationFetchBarrierEventHandledWhileRunning = false;
         applicationFetchBarrierEventWasCurrentEvent = false;
         applicationFetchBarrierEventHandledWithoutModalWindow = false;
-        applicationFetchBarrierEventHandledAfterFetchReturn = false;
+        applicationFetchBarrierEventHandlerDepth = 0;
         applicationSettleEventHandledWhileRunning = false;
         applicationSettleEventPostedFromReadyContext = false;
         applicationSettleEventWasCurrentEvent = false;
         applicationSettleEventHandledWithoutModalWindow = false;
-        applicationSettleEventHandledAfterFetchReturn = false;
+        applicationSettleEventHandlerDepth = 0;
         applicationStopEventHandledWhileRunning = false;
         applicationStopEventPostedFromReadyContext = false;
         applicationStopEventWasCurrentEvent = false;
         applicationStopEventHandledWithoutModalWindow = false;
-        applicationStopEventHandledAfterFetchReturn = false;
+        applicationStopEventHandlerDepth = 0;
         applicationStopCallbackSucceeded = false;
         applicationStartEventPosted = false;
         applicationFetchBarrierEventPosted = false;
@@ -648,6 +657,9 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
         applicationFetchBarrierEventDequeueInvocation = 0;
         applicationSettleEventDequeueInvocation = 0;
         applicationStopEventDequeueInvocation = 0;
+        applicationFetchBarrierEventDequeueDepth = 0;
+        applicationSettleEventDequeueDepth = 0;
+        applicationStopEventDequeueDepth = 0;
         applicationEventFetchReturnRequested = false;
         applicationEventFetchReturnRequestTargetsActiveFetch = false;
         applicationEventFetchMask = 0;
@@ -667,6 +679,7 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
                                                || [event data1] != applicationControlEventMagic)
                                                return event;
 
+                                           const auto handlerDepth = applicationEventFetchDepth;
                                            const bool running = [NSApp isRunning];
                                            if ([event data2] == applicationStartEventCode)
                                            {
@@ -695,15 +708,16 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
                                                    [NSApp currentEvent] == event;
                                                applicationFetchBarrierEventHandledWithoutModalWindow =
                                                    [NSApp modalWindow] == nil;
-                                               applicationFetchBarrierEventHandledAfterFetchReturn =
-                                                   applicationEventFetchDepth == 0;
+                                               applicationFetchBarrierEventHandlerDepth =
+                                                   handlerDepth;
                                                std::fprintf(stderr,
-                                                            "NATIVE_APP_LOOP_FETCH_BARRIER_HANDLED count=%lu running=%d currentEvent=%d modalWindow=%d activeFetchDepth=%lu dequeues=%lu\n",
+                                                            "NATIVE_APP_LOOP_FETCH_BARRIER_HANDLED count=%lu running=%d currentEvent=%d modalWindow=%d handlerDepth=%lu dequeueDepth=%lu dequeues=%lu\n",
                                                             static_cast<unsigned long>(applicationFetchBarrierEventCount),
                                                             running ? 1 : 0,
                                                             applicationFetchBarrierEventWasCurrentEvent ? 1 : 0,
                                                             applicationFetchBarrierEventHandledWithoutModalWindow ? 0 : 1,
-                                                            static_cast<unsigned long>(applicationEventFetchDepth),
+                                                            static_cast<unsigned long>(applicationFetchBarrierEventHandlerDepth),
+                                                            static_cast<unsigned long>(applicationFetchBarrierEventDequeueDepth),
                                                             static_cast<unsigned long>(applicationFetchBarrierEventDequeueCount));
                                                std::fflush(stderr);
                                                return nil;
@@ -716,16 +730,17 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
                                                    [NSApp currentEvent] == event;
                                                applicationSettleEventHandledWithoutModalWindow =
                                                    [NSApp modalWindow] == nil;
-                                               applicationSettleEventHandledAfterFetchReturn =
-                                                   applicationEventFetchDepth == 0;
+                                               applicationSettleEventHandlerDepth =
+                                                   handlerDepth;
                                                std::fprintf(stderr,
-                                                            "NATIVE_APP_LOOP_SETTLE_HANDLED count=%lu running=%d postedFromReady=%d currentEvent=%d modalWindow=%d activeFetchDepth=%lu dequeues=%lu\n",
+                                                            "NATIVE_APP_LOOP_SETTLE_HANDLED count=%lu running=%d postedFromReady=%d currentEvent=%d modalWindow=%d handlerDepth=%lu dequeueDepth=%lu dequeues=%lu\n",
                                                             static_cast<unsigned long>(applicationSettleEventCount),
                                                             running ? 1 : 0,
                                                             applicationSettleEventPostedFromReadyContext ? 1 : 0,
                                                             applicationSettleEventWasCurrentEvent ? 1 : 0,
                                                             applicationSettleEventHandledWithoutModalWindow ? 0 : 1,
-                                                            static_cast<unsigned long>(applicationEventFetchDepth),
+                                                            static_cast<unsigned long>(applicationSettleEventHandlerDepth),
+                                                            static_cast<unsigned long>(applicationSettleEventDequeueDepth),
                                                             static_cast<unsigned long>(applicationSettleEventDequeueCount));
                                                std::fflush(stderr);
                                                if (! NativeFilePanel::applicationSettleEventWasHandled())
@@ -755,8 +770,8 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
                                                    [NSApp currentEvent] == event;
                                                applicationStopEventHandledWithoutModalWindow =
                                                    [NSApp modalWindow] == nil;
-                                               applicationStopEventHandledAfterFetchReturn =
-                                                   applicationEventFetchDepth == 0;
+                                               applicationStopEventHandlerDepth =
+                                                   handlerDepth;
                                                applicationStopCallbackSucceeded = applicationStopEventCount == 1
                                                    && NativeFilePanel::applicationSettleEventWasHandled()
                                                    && running
@@ -764,16 +779,21 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
                                                    && applicationStopEventWasCurrentEvent
                                                    && applicationStopEventHandledWithoutModalWindow
                                                    && applicationStopEventDequeueCount == 1
+                                                   && applicationStopEventHandlerDepth
+                                                       < applicationStopEventDequeueDepth
+                                                   && applicationStopEventDequeueInvocation
+                                                       > applicationSettleEventDequeueInvocation
                                                    && applicationStopCallback != nullptr
                                                    && applicationStopCallback();
                                                std::fprintf(stderr,
-                                                            "NATIVE_APP_LOOP_STOP_HANDLED count=%lu running=%d postedFromReady=%d currentEvent=%d modalWindow=%d activeFetchDepth=%lu dequeues=%lu callback=%d\n",
+                                                            "NATIVE_APP_LOOP_STOP_HANDLED count=%lu running=%d postedFromReady=%d currentEvent=%d modalWindow=%d handlerDepth=%lu dequeueDepth=%lu dequeues=%lu callback=%d\n",
                                                             static_cast<unsigned long>(applicationStopEventCount),
                                                             running ? 1 : 0,
                                                             applicationStopEventPostedFromReadyContext ? 1 : 0,
                                                             applicationStopEventWasCurrentEvent ? 1 : 0,
                                                             applicationStopEventHandledWithoutModalWindow ? 0 : 1,
-                                                            static_cast<unsigned long>(applicationEventFetchDepth),
+                                                            static_cast<unsigned long>(applicationStopEventHandlerDepth),
+                                                            static_cast<unsigned long>(applicationStopEventDequeueDepth),
                                                             static_cast<unsigned long>(applicationStopEventDequeueCount),
                                                             applicationStopCallbackSucceeded ? 1 : 0);
                                                std::fflush(stderr);
@@ -825,7 +845,7 @@ bool NativeFilePanel::applicationIsReadyForSettleEvent() noexcept
         const auto betweenFetches = applicationEventFetchDepth == 0
             && applicationEventFetchActiveInvocation == 0
             && ! applicationEventFetchContextRecorded;
-        const auto eligibleActiveFetch = applicationEventFetchDepth == 1
+        const auto eligibleActiveFetch = applicationEventFetchDepth > 0
             && applicationEventFetchActiveInvocation != 0
             && applicationEventFetchDequeues
             && applicationEventFetchModeSupplied
@@ -857,13 +877,17 @@ bool NativeFilePanel::postApplicationSettleEvent() noexcept
         const auto postedFromReadyContext = [NSThread isMainThread]
             && applicationFetchBarrierEventPosted
             && applicationFetchBarrierEventDequeueCount == 1
+            && applicationFetchBarrierEventDequeueDepth
+                == applicationEventFetchReturnRequestedDepth
             && applicationFetchBarrierEventDequeueInvocation
                 == applicationEventFetchReturnRequestedInvocation
             && applicationSettleEventCount == 0
             && ! applicationSettleEventPosted
             && ! applicationStopEventPosted
             && applicationStopEventCount == 0
-            && applicationEventFetchDepth == 1
+            && applicationEventFetchReturnRequestedDepth != 0
+            && applicationEventFetchDepth
+                == applicationEventFetchReturnRequestedDepth
             && applicationEventFetchContextRecorded
             && isRunnableApplicationEventContext();
         if (! postedFromReadyContext
@@ -895,9 +919,10 @@ bool NativeFilePanel::postBoundApplicationFetchBarrierEvent() noexcept
             && applicationEventFetchReturnRequested
             && applicationEventFetchReturnRequestCount == 1
             && applicationEventFetchReturnCount == 0
-            && applicationEventFetchReturnRequestedDepth == 1
+            && applicationEventFetchReturnRequestedDepth != 0
             && applicationEventFetchReturnRequestedInvocation != 0
-            && applicationEventFetchDepth == 1
+            && applicationEventFetchDepth
+                == applicationEventFetchReturnRequestedDepth
             && applicationEventFetchActiveInvocation
                 == applicationEventFetchReturnRequestedInvocation
             && applicationEventFetchDequeues
@@ -927,7 +952,7 @@ bool NativeFilePanel::requestApplicationEventFetchReturn() noexcept
             || ! isRunnableApplicationEventContext())
             return false;
 
-        const auto targetsActiveFetch = applicationEventFetchDepth == 1;
+        const auto targetsActiveFetch = applicationEventFetchDepth > 0;
 
         auto* runLoop = CFRunLoopGetCurrent();
         if (runLoop == nullptr || runLoop != CFRunLoopGetMain())
@@ -1021,8 +1046,11 @@ bool NativeFilePanel::applicationSettleEventWasHandled() noexcept
             && applicationFetchBarrierEventHandledWhileRunning
             && applicationFetchBarrierEventWasCurrentEvent
             && applicationFetchBarrierEventHandledWithoutModalWindow
-            && applicationFetchBarrierEventHandledAfterFetchReturn
             && applicationFetchBarrierEventDequeueCount == 1
+            && applicationFetchBarrierEventDequeueDepth
+                == applicationEventFetchReturnRequestedDepth
+            && applicationFetchBarrierEventHandlerDepth
+                < applicationFetchBarrierEventDequeueDepth
             && applicationFetchBarrierEventDequeueInvocation
                 == applicationEventFetchReturnRequestedInvocation
             && applicationSettleEventCount == 1
@@ -1030,8 +1058,9 @@ bool NativeFilePanel::applicationSettleEventWasHandled() noexcept
             && applicationSettleEventPostedFromReadyContext
             && applicationSettleEventWasCurrentEvent
             && applicationSettleEventHandledWithoutModalWindow
-            && applicationSettleEventHandledAfterFetchReturn
             && applicationSettleEventDequeueCount == 1
+            && applicationSettleEventHandlerDepth
+                < applicationSettleEventDequeueDepth
             && ! applicationEventFetchReturnRequested
             && applicationEventFetchReturnRequestCount == 1
             && applicationEventFetchReturnCount == 1
@@ -1081,8 +1110,8 @@ bool NativeFilePanel::applicationStopEventWasHandled() noexcept
             && applicationStopEventHandledWhileRunning
             && applicationStopEventWasCurrentEvent
             && applicationStopEventHandledWithoutModalWindow
-            && applicationStopEventHandledAfterFetchReturn
             && applicationStopEventDequeueCount == 1
+            && applicationStopEventHandlerDepth < applicationStopEventDequeueDepth
             && applicationStopEventDequeueInvocation > applicationSettleEventDequeueInvocation
             && applicationStopCallbackSucceeded;
     }
