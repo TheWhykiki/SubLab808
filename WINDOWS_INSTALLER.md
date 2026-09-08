@@ -202,8 +202,9 @@ Ein erfolgreicher Lauf führt vor der Ausgabe unter anderem diese Prüfungen aus
    `Directory`-Graph muss genau einen `TARGETDIR`-Wurzelpfad besitzen und frei von
    Zyklen und verwaisten Eltern sein. Jede 64-Bit-Komponente muss unter
    `INSTALLFOLDER` liegen und jeder `File`-Eintrag auf eine bekannte Komponente
-   zeigen. Im fertigen x64/Arm64-MSI muss WiX' Source-Alias
-   `CommonFiles6432Folder` dabei zu `CommonFiles64Folder` aufgelöst sein. Keine
+   zeigen. Weil ausschließlich 64-Bit-Pakete gebaut werden, verwendet bereits
+   die WiX-Quelle explizit `CommonFiles64Folder`; der adaptive
+   `CommonFiles6432Folder`-Bezeichner wird nicht akzeptiert. Keine
    `Property` darf `TARGETDIR`, `ROOTDRIVE` oder einen beliebigen
    `Directory`-Bezeichner überschreiben; auch vordefinierte pfadwertige
    Installer-Properties dürfen nicht als Payload-Unterverzeichnis wiederverwendet

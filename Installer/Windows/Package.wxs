@@ -31,7 +31,7 @@
     <Launch Condition="Installed OR NOT OTHERARCHITECTUREDETECTED"
             Message="The $(OtherArchitectureName) package is already installed. Uninstall it before changing Windows architectures." />
 
-    <StandardDirectory Id="CommonFiles6432Folder">
+    <StandardDirectory Id="CommonFiles64Folder">
       <Directory Id="VST3Folder" Name="VST3">
         <Directory Id="INSTALLFOLDER" Name="$(ProductName).vst3" />
       </Directory>

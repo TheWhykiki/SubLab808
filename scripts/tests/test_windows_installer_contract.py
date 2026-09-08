@@ -413,7 +413,7 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
     def test_target_and_complete_harvest_are_fixed(self) -> None:
         standard = self.elements("StandardDirectory")
         self.assertEqual(len(standard), 1)
-        self.assertEqual(standard[0].attrib["Id"], "CommonFiles6432Folder")
+        self.assertEqual(standard[0].attrib["Id"], "CommonFiles64Folder")
         directories = {item.attrib["Id"]: item for item in self.elements("Directory")}
         self.assertEqual(directories["VST3Folder"].attrib["Name"], "VST3")
         self.assertEqual(directories["INSTALLFOLDER"].attrib["Name"], "$(ProductName).vst3")
