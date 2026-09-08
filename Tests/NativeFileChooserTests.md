@@ -79,8 +79,8 @@ main loop, shutdown first requires three consecutive timer turns while `NSApplic
 is running without an AppKit modal window. JUCE may deliver those timer messages
 from any common run-loop mode, so posting does not depend on AppKit's transient
 `currentMode`; all four marked control events remain the supported
-ApplicationDefined type. Their private subtype/data signature, event code and retained
-posted-object identity are validated before the local monitor consumes one, and each
+ApplicationDefined type. Their private subtype, per-run random nonce and event code
+survive any AppKit event copy and are validated before the local monitor consumes one; each
 must be dequeued exactly once through the public AppKit fetch. On that final ready turn the coordinator arms
 an independent GCD watchdog and creates one shutdown request before SETTLE exists.
 The bounded 10 ms source remains active only until BARRIER is successfully queued.

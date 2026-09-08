@@ -1,7 +1,9 @@
 #include "NativeFilePanel.h"
 #include "MacModulePin.h"
+#include <cstdint>
 #include <cstdio>
 #include <stdexcept>
+#include <stdlib.h>
 #import <AppKit/AppKit.h>
 #import <objc/runtime.h>
 
@@ -85,31 +87,43 @@ static NSUInteger applicationStartEventDefaultModeDequeueCount = 0;
 static NSUInteger applicationFetchBarrierEventDequeueCount = 0;
 static NSUInteger applicationSettleEventDequeueCount = 0;
 static NSUInteger applicationStopEventDequeueCount = 0;
-static NSEvent* applicationStartEventIdentity = nil;
-static NSEvent* applicationFetchBarrierEventIdentity = nil;
-static NSEvent* applicationSettleEventIdentity = nil;
-static NSEvent* applicationStopEventIdentity = nil;
+static NSInteger applicationControlEventNonce = 0;
+static NSUInteger applicationControlEventPostedMask = 0;
 
 static constexpr short applicationControlEventSubtype = 0x574b;
-static constexpr NSInteger applicationControlEventMagic = 0x5748594b;
 static constexpr NSInteger applicationStartEventCode = 1;
 static constexpr NSInteger applicationFetchBarrierEventCode = 2;
 static constexpr NSInteger applicationSettleEventCode = 3;
 static constexpr NSInteger applicationStopEventCode = 4;
+static constexpr NSUInteger allApplicationControlEventsPostedMask = 0x0f;
 static constexpr NSUInteger maximumApplicationEventFetchUnwindEpisodes = 512;
 static constexpr NSUInteger maximumApplicationEventFetchStopAttempts = 1024;
 static constexpr NSUInteger maximumApplicationEventFetchStopAttemptsPerInvocation = 512;
 
-static NSEvent** applicationControlEventIdentitySlot(NSInteger code) noexcept
+static NSUInteger applicationControlEventPostedBit(NSInteger code) noexcept
 {
     switch (code)
     {
-        case applicationStartEventCode: return &applicationStartEventIdentity;
-        case applicationFetchBarrierEventCode: return &applicationFetchBarrierEventIdentity;
-        case applicationSettleEventCode: return &applicationSettleEventIdentity;
-        case applicationStopEventCode: return &applicationStopEventIdentity;
-        default: return nullptr;
+        case applicationStartEventCode: return 1u << 0;
+        case applicationFetchBarrierEventCode: return 1u << 1;
+        case applicationSettleEventCode: return 1u << 2;
+        case applicationStopEventCode: return 1u << 3;
+        default: return 0;
     }
+}
+
+static NSInteger createApplicationControlEventNonce() noexcept
+{
+    static_assert(sizeof(NSInteger) == sizeof(std::uint64_t),
+                  "native chooser tests require a 64-bit macOS target");
+    std::uint64_t value = 0;
+    do
+    {
+        arc4random_buf(&value, sizeof(value));
+        value &= (std::uint64_t { 1 } << 63) - 1;
+    }
+    while (value == 0);
+    return static_cast<NSInteger>(value);
 }
 
 static bool isMarkedApplicationControlEvent(NSEvent* event) noexcept
@@ -117,11 +131,22 @@ static bool isMarkedApplicationControlEvent(NSEvent* event) noexcept
     if (event == nil
         || [event type] != NSEventTypeApplicationDefined
         || [event subtype] != applicationControlEventSubtype
-        || [event data1] != applicationControlEventMagic)
+        || applicationControlEventNonce == 0
+        || [event data1] != applicationControlEventNonce)
         return false;
 
-    auto** identitySlot = applicationControlEventIdentitySlot([event data2]);
-    return identitySlot != nullptr && *identitySlot != nil && event == *identitySlot;
+    const auto postedBit = applicationControlEventPostedBit([event data2]);
+    return postedBit != 0
+        && (applicationControlEventPostedMask & postedBit) != 0;
+}
+
+static bool isSameMarkedApplicationControlEvent(NSEvent* first,
+                                                NSEvent* second) noexcept
+{
+    return isMarkedApplicationControlEvent(first)
+        && isMarkedApplicationControlEvent(second)
+        && [first data1] == [second data1]
+        && [first data2] == [second data2];
 }
 
 static bool currentApplicationEventFetchIsEligible() noexcept
@@ -498,8 +523,10 @@ bool postApplicationControlEvent(NSInteger code) noexcept
         if (![NSThread isMainThread] || NSApp == nil || applicationEventMonitor == nil)
             return false;
 
-        auto** identitySlot = applicationControlEventIdentitySlot(code);
-        if (identitySlot == nullptr || *identitySlot != nil)
+        const auto postedBit = applicationControlEventPostedBit(code);
+        if (applicationControlEventNonce == 0
+            || postedBit == 0
+            || (applicationControlEventPostedMask & postedBit) != 0)
             return false;
 
         auto* event = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
@@ -509,11 +536,11 @@ bool postApplicationControlEvent(NSInteger code) noexcept
                                      windowNumber:0
                                           context:nil
                                           subtype:applicationControlEventSubtype
-                                            data1:applicationControlEventMagic
+                                            data1:applicationControlEventNonce
                                             data2:code];
         if (event == nil)
             return false;
-        *identitySlot = [event retain];
+        applicationControlEventPostedMask |= postedBit;
         // Queue insertion is asynchronous. The caller supplies an explicit
         // event-fetch boundary when one is required; this helper never pumps.
         [NSApp postEvent:event atStart:YES];
@@ -944,11 +971,9 @@ void NativeFilePanel::prepareTestApplication(
             throw std::runtime_error("NATIVE_PANEL_SETUP: event monitor must be installed before the app loop");
         if (applicationEventMonitor != nil)
             throw std::runtime_error("NATIVE_PANEL_SETUP: application event monitor is already active");
-        if (applicationStartEventIdentity != nil
-            || applicationFetchBarrierEventIdentity != nil
-            || applicationSettleEventIdentity != nil
-            || applicationStopEventIdentity != nil)
-            throw std::runtime_error("NATIVE_PANEL_SETUP: control-event identity was not retired");
+        if (applicationControlEventNonce != 0
+            || applicationControlEventPostedMask != 0)
+            throw std::runtime_error("NATIVE_PANEL_SETUP: control-event token state was not retired");
 
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         if ([NSApp activationPolicy] != NSApplicationActivationPolicyRegular)
@@ -1049,6 +1074,8 @@ void NativeFilePanel::prepareTestApplication(
         applicationFetchBarrierEventDequeueCount = 0;
         applicationSettleEventDequeueCount = 0;
         applicationStopEventDequeueCount = 0;
+        applicationControlEventNonce = createApplicationControlEventNonce();
+        applicationControlEventPostedMask = 0;
         applicationEventMonitor = [NSEvent
             addLocalMonitorForEventsMatchingMask:NSEventMaskApplicationDefined
                                        handler:^NSEvent* (NSEvent* event)
@@ -1063,7 +1090,8 @@ void NativeFilePanel::prepareTestApplication(
                                                ++applicationStartEventCount;
                                                applicationStartEventHandledWhileRunning = running;
                                                applicationStartEventWasCurrentEvent =
-                                                   [NSApp currentEvent] == event;
+                                                   isSameMarkedApplicationControlEvent(
+                                                       [NSApp currentEvent], event);
                                                applicationStartEventHandledAfterFetchReturn =
                                                    applicationEventFetchDepth == 0;
                                                std::fprintf(stderr,
@@ -1082,7 +1110,8 @@ void NativeFilePanel::prepareTestApplication(
                                                ++applicationFetchBarrierEventCount;
                                                applicationFetchBarrierEventHandledWhileRunning = running;
                                                applicationFetchBarrierEventWasCurrentEvent =
-                                                   [NSApp currentEvent] == event;
+                                                   isSameMarkedApplicationControlEvent(
+                                                       [NSApp currentEvent], event);
                                                applicationFetchBarrierEventHandledWithoutModalWindow =
                                                    [NSApp modalWindow] == nil;
                                                applicationFetchBarrierEventHandlerDepth =
@@ -1104,7 +1133,8 @@ void NativeFilePanel::prepareTestApplication(
                                                ++applicationSettleEventCount;
                                                applicationSettleEventHandledWhileRunning = running;
                                                applicationSettleEventWasCurrentEvent =
-                                                   [NSApp currentEvent] == event;
+                                                   isSameMarkedApplicationControlEvent(
+                                                       [NSApp currentEvent], event);
                                                applicationSettleEventHandledWithoutModalWindow =
                                                    [NSApp modalWindow] == nil;
                                                applicationSettleEventHandlerDepth =
@@ -1144,7 +1174,8 @@ void NativeFilePanel::prepareTestApplication(
                                                ++applicationStopEventCount;
                                                applicationStopEventHandledWhileRunning = running;
                                                applicationStopEventWasCurrentEvent =
-                                                   [NSApp currentEvent] == event;
+                                                   isSameMarkedApplicationControlEvent(
+                                                       [NSApp currentEvent], event);
                                                applicationStopEventHandledWithoutModalWindow =
                                                    [NSApp modalWindow] == nil;
                                                applicationStopEventHandlerDepth =
@@ -1183,6 +1214,8 @@ void NativeFilePanel::prepareTestApplication(
             applicationStopCallback = nullptr;
             applicationFetchBoundCallback = nullptr;
             applicationFetchBoundContext = nullptr;
+            applicationControlEventNonce = 0;
+            applicationControlEventPostedMask = 0;
             throw std::runtime_error("NATIVE_PANEL_SETUP: cannot install application event monitor");
         }
     }
@@ -1651,6 +1684,8 @@ bool NativeFilePanel::applicationStopEventWasHandled() noexcept
             && applicationStopEventDequeueCount == 1
             && applicationStopEventHandlerDepth < applicationStopEventDequeueDepth
             && applicationStopEventDequeueInvocation > applicationSettleEventDequeueInvocation
+            && applicationControlEventPostedMask
+                == allApplicationControlEventsPostedMask
             && applicationStopCallbackSucceeded;
     }
 }
@@ -1672,14 +1707,8 @@ void NativeFilePanel::finishTestApplication() noexcept
             [NSEvent removeMonitor:applicationEventMonitor];
             applicationEventMonitor = nil;
         }
-        [applicationStartEventIdentity release];
-        [applicationFetchBarrierEventIdentity release];
-        [applicationSettleEventIdentity release];
-        [applicationStopEventIdentity release];
-        applicationStartEventIdentity = nil;
-        applicationFetchBarrierEventIdentity = nil;
-        applicationSettleEventIdentity = nil;
-        applicationStopEventIdentity = nil;
+        applicationControlEventNonce = 0;
+        applicationControlEventPostedMask = 0;
     }
 }
 void NativeFilePanel::disableAutomaticWindowAnimations(void* nativeView)
