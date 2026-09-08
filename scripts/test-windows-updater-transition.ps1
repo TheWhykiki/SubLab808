@@ -280,7 +280,7 @@ function Get-ExpectedPayloadContract {
         Assert-Condition ($sha256 -cmatch '^[0-9A-F]{64}$') `
             "Payload evidence contains a non-canonical SHA-256: $relative"
         $length = [long]$entry.size
-        Assert-Condition ($length -ge 0 -and ([string]$length -ceq ([string]$entry.size)) `
+        Assert-Condition ($length -ge 0 -and ([string]$length -ceq ([string]$entry.size))) `
             "Payload evidence contains a non-canonical size: $relative"
         $files.Add($relative, [pscustomobject]@{
             RelativePath = $relative
