@@ -702,9 +702,10 @@ private:
         // Stable readiness is established on clean main-thread timer turns.
         // JUCE delivers timer messages from a common-mode run-loop source, so
         // the posting precondition must not depend on a transient currentMode
-        // left behind by a closed native panel. SETTLE itself must still be
-        // dequeued in default mode. The final turn arms an independent watchdog
-        // and retires this recurring source before queueing SETTLE.
+        // left behind by a closed native panel. SETTLE itself must still pass
+        // through the public AppKit event fetch. The final turn arms an
+        // independent watchdog and retires this recurring source before
+        // queueing SETTLE.
         startTimer(10);
     }
 
@@ -742,7 +743,7 @@ private:
         std::fputs("NATIVE_APP_LOOP_RETURN_WATCHDOG_ARMED\n", stderr);
         std::fflush(stderr);
         // stopTimer() is synchronous inside its callback. The test application
-        // already bounds the outer nextEvent: wait, so this same-thread post
+        // already bounds the active nextEvent: wait, so this same-thread post
         // needs neither a worker nor a synthetic wake source.
         stopTimer();
         std::fputs("NATIVE_APP_LOOP_SETTLE_BEGIN\n", stderr);

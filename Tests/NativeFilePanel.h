@@ -16,7 +16,8 @@ public:
     [[nodiscard]] static bool applicationIsRunning() noexcept;
     // Private START/SETTLE/STOP events prove three distinct dispatches through
     // the real NSApplication event loop. The test application bounds only
-    // otherwise-long default-mode event waits; it never pumps or sends events.
+    // otherwise-long event waits; it preserves each supplied run-loop mode and
+    // never pumps or sends events.
     [[nodiscard]] static bool postApplicationStartEvent() noexcept;
     [[nodiscard]] static bool applicationStartEventWasHandled() noexcept;
     [[nodiscard]] static bool applicationIsReadyForSettleEvent() noexcept;
