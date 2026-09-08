@@ -34,17 +34,36 @@
 
 // The coordinator runs from JUCE's main-thread run-loop source, which can fire
 // while AppKit is blocked inside nextEventMatchingMask:. postEvent: only queues
-// an event, so the innermost eligible active fetch gets a marked BARRIER before
-// CFRunLoopStop requests exit from the innermost run-loop activation. Between
-// fetches, the next eligible fetch binds the request and queues BARRIER before
-// retrieval. Only the exact bound fetch may return BARRIER and queue SETTLE;
-// that return validates the active-path binding at runtime.
+// an event, so an eligible depth-one fetch gets a marked BARRIER before
+// CFRunLoopStop requests exit from the innermost run-loop activation. If the
+// active fetch stack is nested or its depth-one fetch excludes application-
+// defined events, a fail-closed stop-attempt cascade is tied to each observed
+// invocation return until the stack is empty. The next eligible depth-one fetch
+// then binds BARRIER before retrieval. Only that fetch may queue SETTLE.
 static NSUInteger applicationEventFetchDepth = 0;
+enum class ApplicationEventFetchReturnPath : unsigned char
+{
+    none,
+    nextEligible,
+    activeEligible,
+    activeUnwind,
+    nextEligibleAfterUnwind
+};
+
 static NSUInteger applicationEventFetchReturnRequestedDepth = 0;
+static NSUInteger applicationEventFetchReturnInitialDepth = 0;
+static NSUInteger applicationEventFetchReturnLastUnwindDepth = 0;
+static NSUInteger applicationEventFetchReturnUnwindInvocation = 0;
 static NSUInteger applicationEventFetchReturnRequestCount = 0;
 static NSUInteger applicationEventFetchReturnCount = 0;
 static NSUInteger applicationEventFetchReturnClaimCount = 0;
+static NSUInteger applicationEventFetchReturnUnwindReturnCount = 0;
 static NSUInteger applicationEventFetchRunLoopStopCount = 0;
+static NSUInteger applicationEventFetchReturnUnwindStopBase = 0;
+static NSUInteger applicationEventFetchReturnUnwindReturnBase = 0;
+static NSUInteger applicationEventFetchReturnUnwindInvocationStopBase = 0;
+static NSUInteger applicationEventFetchReturnUnwindEpisodeCount = 0;
+static NSUInteger applicationEventFetchWakeDriverStopCount = 0;
 static NSUInteger applicationEventFetchInvocationCount = 0;
 static NSUInteger applicationEventFetchActiveInvocation = 0;
 static NSUInteger applicationEventFetchReturnRequestedInvocation = 0;
@@ -55,8 +74,10 @@ static NSUInteger applicationFetchBarrierEventDequeueDepth = 0;
 static NSUInteger applicationSettleEventDequeueDepth = 0;
 static NSUInteger applicationStopEventDequeueDepth = 0;
 static bool applicationEventFetchReturnRequested = false;
-static bool applicationEventFetchReturnRequestTargetsActiveFetch = false;
+static ApplicationEventFetchReturnPath applicationEventFetchReturnPath =
+    ApplicationEventFetchReturnPath::none;
 static NSEventMask applicationEventFetchMask = 0;
+static NSRunLoopMode applicationEventFetchMode = nil;
 static bool applicationEventFetchDequeues = false;
 static bool applicationEventFetchModeSupplied = false;
 static bool applicationEventFetchContextRecorded = false;
@@ -64,6 +85,10 @@ static NSUInteger applicationStartEventDefaultModeDequeueCount = 0;
 static NSUInteger applicationFetchBarrierEventDequeueCount = 0;
 static NSUInteger applicationSettleEventDequeueCount = 0;
 static NSUInteger applicationStopEventDequeueCount = 0;
+static NSEvent* applicationStartEventIdentity = nil;
+static NSEvent* applicationFetchBarrierEventIdentity = nil;
+static NSEvent* applicationSettleEventIdentity = nil;
+static NSEvent* applicationStopEventIdentity = nil;
 
 static constexpr short applicationControlEventSubtype = 0x574b;
 static constexpr NSInteger applicationControlEventMagic = 0x5748594b;
@@ -71,6 +96,161 @@ static constexpr NSInteger applicationStartEventCode = 1;
 static constexpr NSInteger applicationFetchBarrierEventCode = 2;
 static constexpr NSInteger applicationSettleEventCode = 3;
 static constexpr NSInteger applicationStopEventCode = 4;
+static constexpr NSUInteger maximumApplicationEventFetchUnwindEpisodes = 512;
+static constexpr NSUInteger maximumApplicationEventFetchStopAttempts = 1024;
+static constexpr NSUInteger maximumApplicationEventFetchStopAttemptsPerInvocation = 512;
+
+static NSEvent** applicationControlEventIdentitySlot(NSInteger code) noexcept
+{
+    switch (code)
+    {
+        case applicationStartEventCode: return &applicationStartEventIdentity;
+        case applicationFetchBarrierEventCode: return &applicationFetchBarrierEventIdentity;
+        case applicationSettleEventCode: return &applicationSettleEventIdentity;
+        case applicationStopEventCode: return &applicationStopEventIdentity;
+        default: return nullptr;
+    }
+}
+
+static bool isMarkedApplicationControlEvent(NSEvent* event) noexcept
+{
+    if (event == nil
+        || [event type] != NSEventTypeApplicationDefined
+        || [event subtype] != applicationControlEventSubtype
+        || [event data1] != applicationControlEventMagic)
+        return false;
+
+    auto** identitySlot = applicationControlEventIdentitySlot([event data2]);
+    return identitySlot != nullptr && *identitySlot != nil && event == *identitySlot;
+}
+
+static bool currentApplicationEventFetchIsEligible() noexcept
+{
+    return applicationEventFetchDepth > 0
+        && applicationEventFetchActiveInvocation != 0
+        && applicationEventFetchDequeues
+        && applicationEventFetchModeSupplied
+        && applicationEventFetchMode != nil
+        && (applicationEventFetchMask & NSEventMaskApplicationDefined) != 0
+        && applicationEventFetchContextRecorded;
+}
+
+static bool currentRunLoopModeMatchesApplicationEventFetch(
+    CFRunLoopRef runLoop) noexcept
+{
+    if (runLoop == nullptr || applicationEventFetchMode == nil)
+        return false;
+    auto* currentMode = CFRunLoopCopyCurrentMode(runLoop);
+    if (currentMode == nullptr)
+        return false;
+    const auto matches = CFEqual(currentMode, (CFStringRef) applicationEventFetchMode);
+    CFRelease(currentMode);
+    return matches;
+}
+
+static const char* applicationEventFetchReturnPathName() noexcept
+{
+    switch (applicationEventFetchReturnPath)
+    {
+        case ApplicationEventFetchReturnPath::none: return "none";
+        case ApplicationEventFetchReturnPath::nextEligible: return "next-eligible";
+        case ApplicationEventFetchReturnPath::activeEligible: return "active-eligible";
+        case ApplicationEventFetchReturnPath::activeUnwind: return "active-unwind";
+        case ApplicationEventFetchReturnPath::nextEligibleAfterUnwind:
+            return "next-eligible-after-unwind";
+    }
+    return "invalid";
+}
+
+static bool applicationEventFetchCompletedUnwindEpisodesMatch() noexcept
+{
+    return applicationEventFetchReturnUnwindEpisodeCount > 0
+        && applicationEventFetchReturnInitialDepth > 0
+        && applicationEventFetchReturnLastUnwindDepth == 0
+        && applicationEventFetchReturnUnwindInvocation == 0
+        && applicationEventFetchRunLoopStopCount
+            >= applicationEventFetchReturnUnwindReturnCount
+        && applicationEventFetchRunLoopStopCount
+            >= applicationEventFetchReturnUnwindStopBase
+                + applicationEventFetchReturnInitialDepth
+        && applicationEventFetchReturnUnwindReturnCount
+            == applicationEventFetchReturnUnwindReturnBase
+                + applicationEventFetchReturnInitialDepth
+        && applicationEventFetchRunLoopStopCount
+            > applicationEventFetchReturnUnwindInvocationStopBase;
+}
+
+static bool applicationEventFetchBindingMatchesRequestPath() noexcept
+{
+    const auto noUnwindEpisode = applicationEventFetchReturnInitialDepth == 0
+        && applicationEventFetchReturnLastUnwindDepth == 0
+        && applicationEventFetchReturnUnwindInvocation == 0
+        && applicationEventFetchReturnUnwindReturnCount == 0
+        && applicationEventFetchRunLoopStopCount == 0
+        && applicationEventFetchReturnUnwindStopBase == 0
+        && applicationEventFetchReturnUnwindReturnBase == 0
+        && applicationEventFetchReturnUnwindInvocationStopBase == 0
+        && applicationEventFetchReturnUnwindEpisodeCount == 0;
+    const auto commonBinding = applicationEventFetchReturnRequestedDepth == 1
+        && applicationEventFetchWakeDriverStopCount == 0;
+    switch (applicationEventFetchReturnPath)
+    {
+        case ApplicationEventFetchReturnPath::nextEligible:
+            return commonBinding && noUnwindEpisode
+                && applicationEventFetchReturnClaimCount == 1;
+        case ApplicationEventFetchReturnPath::activeEligible:
+            return commonBinding && noUnwindEpisode
+                && applicationEventFetchReturnClaimCount == 0;
+        case ApplicationEventFetchReturnPath::nextEligibleAfterUnwind:
+            return commonBinding
+                && applicationEventFetchCompletedUnwindEpisodesMatch()
+                && applicationEventFetchReturnClaimCount == 1;
+        case ApplicationEventFetchReturnPath::none:
+        case ApplicationEventFetchReturnPath::activeUnwind:
+            return false;
+    }
+    return false;
+}
+
+static bool applicationEventFetchBoundaryWasProved() noexcept
+{
+    const auto wakeDriverWasStopped = applicationEventFetchWakeDriverStopCount == 1;
+    switch (applicationEventFetchReturnPath)
+    {
+        case ApplicationEventFetchReturnPath::nextEligible:
+            return wakeDriverWasStopped
+                && applicationEventFetchReturnInitialDepth == 0
+                && applicationEventFetchReturnLastUnwindDepth == 0
+                && applicationEventFetchReturnUnwindInvocation == 0
+                && applicationEventFetchReturnUnwindReturnCount == 0
+                && applicationEventFetchRunLoopStopCount == 0
+                && applicationEventFetchReturnUnwindStopBase == 0
+                && applicationEventFetchReturnUnwindReturnBase == 0
+                && applicationEventFetchReturnUnwindInvocationStopBase == 0
+                && applicationEventFetchReturnUnwindEpisodeCount == 0
+                && applicationEventFetchReturnClaimCount == 1;
+        case ApplicationEventFetchReturnPath::activeEligible:
+            return wakeDriverWasStopped
+                && applicationEventFetchReturnInitialDepth == 0
+                && applicationEventFetchReturnLastUnwindDepth == 0
+                && applicationEventFetchReturnUnwindInvocation == 0
+                && applicationEventFetchReturnUnwindReturnCount == 0
+                && applicationEventFetchRunLoopStopCount == 1
+                && applicationEventFetchReturnUnwindStopBase == 0
+                && applicationEventFetchReturnUnwindReturnBase == 0
+                && applicationEventFetchReturnUnwindInvocationStopBase == 0
+                && applicationEventFetchReturnUnwindEpisodeCount == 0
+                && applicationEventFetchReturnClaimCount == 0;
+        case ApplicationEventFetchReturnPath::nextEligibleAfterUnwind:
+            return wakeDriverWasStopped
+                && applicationEventFetchCompletedUnwindEpisodesMatch()
+                && applicationEventFetchReturnClaimCount == 1;
+        case ApplicationEventFetchReturnPath::none:
+        case ApplicationEventFetchReturnPath::activeUnwind:
+            return false;
+    }
+    return false;
+}
 
 @interface WhyKikiPresetTestApplication : NSApplication
 @end
@@ -83,21 +263,43 @@ static constexpr NSInteger applicationStopEventCode = 4;
 {
     const auto previousActiveInvocation = applicationEventFetchActiveInvocation;
     const auto previousMask = applicationEventFetchMask;
+    const auto previousMode = applicationEventFetchMode;
     const auto previousDequeues = applicationEventFetchDequeues;
     const auto previousModeSupplied = applicationEventFetchModeSupplied;
     const auto previousContextRecorded = applicationEventFetchContextRecorded;
     const auto fetchDepth = ++applicationEventFetchDepth;
     const auto fetchInvocation = ++applicationEventFetchInvocationCount;
     NSEvent* event = nil;
+    bool completedNormally = false;
     @try
     {
         // These fields describe the current innermost fetch. A nested fetch
         // restores its caller's context in @finally when it returns.
         applicationEventFetchActiveInvocation = fetchInvocation;
         applicationEventFetchMask = mask;
+        applicationEventFetchMode = mode;
         applicationEventFetchDequeues = dequeue == YES;
         applicationEventFetchModeSupplied = mode != nil;
         applicationEventFetchContextRecorded = true;
+
+        if (applicationEventFetchReturnPath
+                == ApplicationEventFetchReturnPath::activeUnwind
+            && fetchDepth > applicationEventFetchReturnLastUnwindDepth)
+        {
+            std::fputs("NATIVE_APP_LOOP_FETCH_UNWIND_REENTRY\n", stderr);
+            std::fflush(stderr);
+            std::terminate();
+        }
+
+        if (applicationEventFetchReturnRequested
+            && applicationEventFetchReturnRequestedDepth != 0
+            && applicationEventFetchReturnRequestedInvocation != 0
+            && fetchDepth > applicationEventFetchReturnRequestedDepth)
+        {
+            std::fputs("NATIVE_APP_LOOP_BOUND_FETCH_REENTRY\n", stderr);
+            std::fflush(stderr);
+            std::terminate();
+        }
 
         // A shutdown request made between AppKit fetches has no invocation to
         // bind yet. The first eligible fetch claims it and queues BARRIER
@@ -105,6 +307,11 @@ static constexpr NSInteger applicationStopEventCode = 4;
         if (applicationEventFetchReturnRequested
             && applicationEventFetchReturnRequestedDepth == 0
             && applicationEventFetchReturnRequestedInvocation == 0
+            && (applicationEventFetchReturnPath
+                    == ApplicationEventFetchReturnPath::nextEligible
+                || applicationEventFetchReturnPath
+                    == ApplicationEventFetchReturnPath::nextEligibleAfterUnwind)
+            && fetchDepth == 1
             && dequeue == YES
             && mode != nil
             && (mask & NSEventMaskApplicationDefined) != 0)
@@ -134,16 +341,14 @@ static constexpr NSInteger applicationStopEventCode = 4;
 
         const bool markedControlEvent = dequeue
             && mode != nil
-            && event != nil
-            && [event type] == NSEventTypeApplicationDefined
-            && [event subtype] == applicationControlEventSubtype
-            && [event data1] == applicationControlEventMagic;
+            && isMarkedApplicationControlEvent(event);
         if (markedControlEvent)
         {
             const auto* modeName = [mode UTF8String];
             std::fprintf(stderr,
-                         "NATIVE_APP_LOOP_CONTROL_DEQUEUED code=%ld depth=%lu invocation=%lu mode=%s\n",
+                         "NATIVE_APP_LOOP_CONTROL_DEQUEUED code=%ld type=%ld depth=%lu invocation=%lu mode=%s\n",
                          static_cast<long>([event data2]),
+                         static_cast<long>([event type]),
                          static_cast<unsigned long>(fetchDepth),
                          static_cast<unsigned long>(fetchInvocation),
                          modeName != nullptr ? modeName : "<unavailable>");
@@ -209,15 +414,32 @@ static constexpr NSInteger applicationStopEventCode = 4;
             std::fputs("NATIVE_APP_LOOP_SETTLE_POSTED\n", stderr);
             std::fflush(stderr);
         }
+        completedNormally = true;
     }
     @finally
     {
         --applicationEventFetchDepth;
         applicationEventFetchActiveInvocation = previousActiveInvocation;
         applicationEventFetchMask = previousMask;
+        applicationEventFetchMode = previousMode;
         applicationEventFetchDequeues = previousDequeues;
         applicationEventFetchModeSupplied = previousModeSupplied;
         applicationEventFetchContextRecorded = previousContextRecorded;
+        if (! completedNormally
+            && applicationEventFetchReturnPath != ApplicationEventFetchReturnPath::none)
+        {
+            std::fputs("NATIVE_APP_LOOP_FETCH_EXCEPTION_DURING_RETURN_REQUEST\n", stderr);
+            std::fflush(stderr);
+            std::terminate();
+        }
+        if (completedNormally
+            && ! NativeFilePanel::continueApplicationEventFetchReturnRequest(
+                fetchDepth, fetchInvocation))
+        {
+            std::fputs("NATIVE_APP_LOOP_FETCH_UNWIND_FAILED\n", stderr);
+            std::fflush(stderr);
+            std::terminate();
+        }
     }
     return event;
 }
@@ -232,6 +454,8 @@ BeginWithCompletionHandler originalBeginWithCompletionHandler = nullptr;
 NSMutableSet* activeCompletionObservations = nil;
 id applicationEventMonitor = nil;
 NativeFilePanel::ApplicationStopCallback applicationStopCallback = nullptr;
+NativeFilePanel::ApplicationFetchBoundCallback applicationFetchBoundCallback = nullptr;
+void* applicationFetchBoundContext = nullptr;
 NSUInteger applicationStartEventCount = 0;
 NSUInteger applicationFetchBarrierEventCount = 0;
 NSUInteger applicationSettleEventCount = 0;
@@ -274,6 +498,10 @@ bool postApplicationControlEvent(NSInteger code) noexcept
         if (![NSThread isMainThread] || NSApp == nil || applicationEventMonitor == nil)
             return false;
 
+        auto** identitySlot = applicationControlEventIdentitySlot(code);
+        if (identitySlot == nullptr || *identitySlot != nil)
+            return false;
+
         auto* event = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
                                          location:NSZeroPoint
                                     modifierFlags:0
@@ -285,11 +513,141 @@ bool postApplicationControlEvent(NSInteger code) noexcept
                                             data2:code];
         if (event == nil)
             return false;
+        *identitySlot = [event retain];
         // Queue insertion is asynchronous. The caller supplies an explicit
         // event-fetch boundary when one is required; this helper never pumps.
         [NSApp postEvent:event atStart:YES];
         return true;
     }
+}
+
+bool stopApplicationEventFetchWakeDriver() noexcept
+{
+    if (![NSThread isMainThread]
+        || applicationFetchBoundCallback == nullptr
+        || applicationFetchBoundContext == nullptr
+        || applicationEventFetchWakeDriverStopCount != 0
+        || ! applicationFetchBoundCallback(applicationFetchBoundContext))
+        return false;
+    ++applicationEventFetchWakeDriverStopCount;
+    std::fputs("NATIVE_APP_LOOP_FETCH_WAKE_DRIVER_STOPPED\n", stderr);
+    std::fflush(stderr);
+    return true;
+}
+
+bool stopCurrentApplicationEventFetchUnwindInvocation() noexcept
+{
+    if (![NSThread isMainThread]
+        || applicationEventFetchReturnPath != ApplicationEventFetchReturnPath::activeUnwind
+        || ! applicationEventFetchReturnRequested
+        || applicationEventFetchReturnRequestedDepth != 0
+        || applicationEventFetchReturnRequestedInvocation != 0
+        || applicationEventFetchReturnInitialDepth == 0
+        || applicationEventFetchReturnLastUnwindDepth == 0
+        || applicationEventFetchDepth != applicationEventFetchReturnLastUnwindDepth
+        || applicationEventFetchActiveInvocation
+            != applicationEventFetchReturnUnwindInvocation
+        || ! applicationEventFetchModeSupplied
+        || applicationEventFetchMode == nil
+        || ! applicationEventFetchContextRecorded
+        || applicationEventFetchRunLoopStopCount
+            < applicationEventFetchReturnUnwindInvocationStopBase
+        || applicationEventFetchRunLoopStopCount
+            >= maximumApplicationEventFetchStopAttempts
+        || applicationEventFetchRunLoopStopCount
+                - applicationEventFetchReturnUnwindInvocationStopBase
+            >= maximumApplicationEventFetchStopAttemptsPerInvocation)
+        return false;
+
+    auto* runLoop = CFRunLoopGetCurrent();
+    if (runLoop == nullptr || runLoop != CFRunLoopGetMain()
+        || ! currentRunLoopModeMatchesApplicationEventFetch(runLoop))
+        return false;
+
+    ++applicationEventFetchRunLoopStopCount;
+    std::fprintf(stderr,
+                 "NATIVE_APP_LOOP_FETCH_UNWIND_STOP episode=%lu depth=%lu invocation=%lu invocationAttempt=%lu totalAttempts=%lu returns=%lu\n",
+                 static_cast<unsigned long>(applicationEventFetchReturnUnwindEpisodeCount),
+                 static_cast<unsigned long>(applicationEventFetchDepth),
+                 static_cast<unsigned long>(applicationEventFetchReturnUnwindInvocation),
+                 static_cast<unsigned long>(applicationEventFetchRunLoopStopCount
+                     - applicationEventFetchReturnUnwindInvocationStopBase),
+                 static_cast<unsigned long>(applicationEventFetchRunLoopStopCount),
+                 static_cast<unsigned long>(applicationEventFetchReturnUnwindReturnCount));
+    std::fflush(stderr);
+    CFRunLoopStop(runLoop);
+    return true;
+}
+
+bool beginApplicationEventFetchUnwindEpisode() noexcept
+{
+    const auto waitsForEligibleFetch =
+        applicationEventFetchReturnPath == ApplicationEventFetchReturnPath::nextEligible
+        || applicationEventFetchReturnPath
+            == ApplicationEventFetchReturnPath::nextEligibleAfterUnwind;
+    const auto hasNoPriorEpisode =
+        applicationEventFetchReturnPath == ApplicationEventFetchReturnPath::nextEligible
+        && applicationEventFetchReturnInitialDepth == 0
+        && applicationEventFetchReturnLastUnwindDepth == 0
+        && applicationEventFetchReturnUnwindInvocation == 0
+        && applicationEventFetchReturnUnwindReturnCount == 0
+        && applicationEventFetchRunLoopStopCount == 0
+        && applicationEventFetchReturnUnwindStopBase == 0
+        && applicationEventFetchReturnUnwindReturnBase == 0
+        && applicationEventFetchReturnUnwindInvocationStopBase == 0
+        && applicationEventFetchReturnUnwindEpisodeCount == 0;
+    const auto priorEpisodesCompleted =
+        applicationEventFetchReturnPath
+            == ApplicationEventFetchReturnPath::nextEligibleAfterUnwind
+        && applicationEventFetchCompletedUnwindEpisodesMatch();
+    if (![NSThread isMainThread]
+        || ! waitsForEligibleFetch
+        || (! hasNoPriorEpisode && ! priorEpisodesCompleted)
+        || ! applicationEventFetchReturnRequested
+        || applicationEventFetchReturnRequestCount != 1
+        || applicationEventFetchReturnCount != 0
+        || applicationEventFetchReturnClaimCount != 0
+        || applicationEventFetchReturnRequestedDepth != 0
+        || applicationEventFetchReturnRequestedInvocation != 0
+        || applicationEventFetchDepth == 0
+        || applicationEventFetchActiveInvocation == 0
+        || ! applicationEventFetchModeSupplied
+        || applicationEventFetchMode == nil
+        || ! applicationEventFetchContextRecorded
+        || applicationEventFetchWakeDriverStopCount != 0
+        || applicationFetchBarrierEventPosted
+        || applicationFetchBarrierEventCount != 0
+        || applicationFetchBarrierEventDequeueCount != 0
+        || applicationEventFetchReturnUnwindEpisodeCount
+            >= maximumApplicationEventFetchUnwindEpisodes)
+        return false;
+
+    auto* runLoop = CFRunLoopGetCurrent();
+    if (runLoop == nullptr || runLoop != CFRunLoopGetMain()
+        || ! currentRunLoopModeMatchesApplicationEventFetch(runLoop))
+        return false;
+
+    applicationEventFetchReturnInitialDepth = applicationEventFetchDepth;
+    applicationEventFetchReturnLastUnwindDepth = applicationEventFetchDepth;
+    applicationEventFetchReturnUnwindInvocation =
+        applicationEventFetchActiveInvocation;
+    applicationEventFetchReturnUnwindStopBase =
+        applicationEventFetchRunLoopStopCount;
+    applicationEventFetchReturnUnwindReturnBase =
+        applicationEventFetchReturnUnwindReturnCount;
+    applicationEventFetchReturnUnwindInvocationStopBase =
+        applicationEventFetchRunLoopStopCount;
+    ++applicationEventFetchReturnUnwindEpisodeCount;
+    applicationEventFetchReturnPath = ApplicationEventFetchReturnPath::activeUnwind;
+    std::fprintf(stderr,
+                 "NATIVE_APP_LOOP_FETCH_UNWIND_EPISODE_STARTED episode=%lu depth=%lu invocation=%lu attemptBase=%lu returnBase=%lu\n",
+                 static_cast<unsigned long>(applicationEventFetchReturnUnwindEpisodeCount),
+                 static_cast<unsigned long>(applicationEventFetchDepth),
+                 static_cast<unsigned long>(applicationEventFetchReturnUnwindInvocation),
+                 static_cast<unsigned long>(applicationEventFetchReturnUnwindStopBase),
+                 static_cast<unsigned long>(applicationEventFetchReturnUnwindReturnBase));
+    std::fflush(stderr);
+    return stopCurrentApplicationEventFetchUnwindInvocation();
 }
 
 bool resolvedExactlyOnce(const WhyKikiNativePanelSessionObservation* state)
@@ -565,7 +923,10 @@ void NativeFilePanel::installTestApplication()
             throw std::runtime_error("NATIVE_PANEL_SETUP: test application was not installed before JUCE");
     }
 }
-void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallback)
+void NativeFilePanel::prepareTestApplication(
+    ApplicationStopCallback stopCallback,
+    ApplicationFetchBoundCallback fetchBoundCallback,
+    void* fetchBoundContext)
 {
     // ScopedJuceInitialiser_GUI in a console test does not provide an active
     // regular app. Create and configure one here; the coordinator independently
@@ -574,14 +935,20 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
     {
         if (![NSThread isMainThread])
             throw std::runtime_error("NATIVE_PANEL_SETUP: native chooser tests require the main thread");
-        if (stopCallback == nullptr)
-            throw std::runtime_error("NATIVE_PANEL_SETUP: application stop callback is missing");
+        if (stopCallback == nullptr || fetchBoundCallback == nullptr
+            || fetchBoundContext == nullptr)
+            throw std::runtime_error("NATIVE_PANEL_SETUP: application callbacks are missing");
         if ([NSApp class] != [WhyKikiPresetTestApplication class])
             throw std::runtime_error("NATIVE_PANEL_SETUP: instrumented test application is not installed");
         if ([NSApp isRunning])
             throw std::runtime_error("NATIVE_PANEL_SETUP: event monitor must be installed before the app loop");
         if (applicationEventMonitor != nil)
             throw std::runtime_error("NATIVE_PANEL_SETUP: application event monitor is already active");
+        if (applicationStartEventIdentity != nil
+            || applicationFetchBarrierEventIdentity != nil
+            || applicationSettleEventIdentity != nil
+            || applicationStopEventIdentity != nil)
+            throw std::runtime_error("NATIVE_PANEL_SETUP: control-event identity was not retired");
 
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         if ([NSApp activationPolicy] != NSApplicationActivationPolicyRegular)
@@ -619,6 +986,8 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
         // Install last, after every other setup operation that can throw. The
         // caller's scope guard removes this monitor exactly once after the loop.
         applicationStopCallback = stopCallback;
+        applicationFetchBoundCallback = fetchBoundCallback;
+        applicationFetchBoundContext = fetchBoundContext;
         applicationStartEventCount = 0;
         applicationFetchBarrierEventCount = 0;
         applicationSettleEventCount = 0;
@@ -647,10 +1016,19 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
         applicationStopEventPosted = false;
         applicationEventFetchDepth = 0;
         applicationEventFetchReturnRequestedDepth = 0;
+        applicationEventFetchReturnInitialDepth = 0;
+        applicationEventFetchReturnLastUnwindDepth = 0;
+        applicationEventFetchReturnUnwindInvocation = 0;
         applicationEventFetchReturnRequestCount = 0;
         applicationEventFetchReturnCount = 0;
         applicationEventFetchReturnClaimCount = 0;
+        applicationEventFetchReturnUnwindReturnCount = 0;
         applicationEventFetchRunLoopStopCount = 0;
+        applicationEventFetchReturnUnwindStopBase = 0;
+        applicationEventFetchReturnUnwindReturnBase = 0;
+        applicationEventFetchReturnUnwindInvocationStopBase = 0;
+        applicationEventFetchReturnUnwindEpisodeCount = 0;
+        applicationEventFetchWakeDriverStopCount = 0;
         applicationEventFetchInvocationCount = 0;
         applicationEventFetchActiveInvocation = 0;
         applicationEventFetchReturnRequestedInvocation = 0;
@@ -661,8 +1039,9 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
         applicationSettleEventDequeueDepth = 0;
         applicationStopEventDequeueDepth = 0;
         applicationEventFetchReturnRequested = false;
-        applicationEventFetchReturnRequestTargetsActiveFetch = false;
+        applicationEventFetchReturnPath = ApplicationEventFetchReturnPath::none;
         applicationEventFetchMask = 0;
+        applicationEventFetchMode = nil;
         applicationEventFetchDequeues = false;
         applicationEventFetchModeSupplied = false;
         applicationEventFetchContextRecorded = false;
@@ -674,9 +1053,7 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
             addLocalMonitorForEventsMatchingMask:NSEventMaskApplicationDefined
                                        handler:^NSEvent* (NSEvent* event)
                                        {
-                                           if ([event type] != NSEventTypeApplicationDefined
-                                               || [event subtype] != applicationControlEventSubtype
-                                               || [event data1] != applicationControlEventMagic)
+                                           if (! isMarkedApplicationControlEvent(event))
                                                return event;
 
                                            const auto handlerDepth = applicationEventFetchDepth;
@@ -804,6 +1181,8 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
         if (applicationEventMonitor == nil)
         {
             applicationStopCallback = nullptr;
+            applicationFetchBoundCallback = nullptr;
+            applicationFetchBoundContext = nullptr;
             throw std::runtime_error("NATIVE_PANEL_SETUP: cannot install application event monitor");
         }
     }
@@ -842,15 +1221,18 @@ bool NativeFilePanel::applicationIsReadyForSettleEvent() noexcept
 {
     @autoreleasepool
     {
+        auto* runLoop = CFRunLoopGetCurrent();
         const auto betweenFetches = applicationEventFetchDepth == 0
             && applicationEventFetchActiveInvocation == 0
             && ! applicationEventFetchContextRecorded;
-        const auto eligibleActiveFetch = applicationEventFetchDepth > 0
+        const auto activeFetchContext = applicationEventFetchDepth > 0
             && applicationEventFetchActiveInvocation != 0
-            && applicationEventFetchDequeues
             && applicationEventFetchModeSupplied
-            && (applicationEventFetchMask & NSEventMaskApplicationDefined) != 0
-            && applicationEventFetchContextRecorded;
+            && applicationEventFetchMode != nil
+            && applicationEventFetchContextRecorded
+            && runLoop != nullptr
+            && runLoop == CFRunLoopGetMain()
+            && currentRunLoopModeMatchesApplicationEventFetch(runLoop);
         return applicationStartEventWasHandled()
             && ! applicationSettleEventPosted
             && applicationSettleEventCount == 0
@@ -860,7 +1242,7 @@ bool NativeFilePanel::applicationIsReadyForSettleEvent() noexcept
             && ! applicationStopEventPosted
             && applicationStopEventCount == 0
             && ! applicationEventFetchReturnRequested
-            && (betweenFetches || eligibleActiveFetch)
+            && (betweenFetches || activeFetchContext)
             && isRunnableApplicationEventContext();
     }
 }
@@ -868,12 +1250,7 @@ bool NativeFilePanel::postApplicationSettleEvent() noexcept
 {
     @autoreleasepool
     {
-        const auto fetchBoundaryWasProved =
-            applicationEventFetchReturnRequestTargetsActiveFetch
-                ? applicationEventFetchReturnClaimCount == 0
-                    && applicationEventFetchRunLoopStopCount == 1
-                : applicationEventFetchReturnClaimCount == 1
-                    && applicationEventFetchRunLoopStopCount == 0;
+        const auto fetchBoundaryWasProved = applicationEventFetchBoundaryWasProved();
         const auto postedFromReadyContext = [NSThread isMainThread]
             && applicationFetchBarrierEventPosted
             && applicationFetchBarrierEventDequeueCount == 1
@@ -908,14 +1285,8 @@ bool NativeFilePanel::postBoundApplicationFetchBarrierEvent() noexcept
 {
     @autoreleasepool
     {
-        const auto bindingMatchesRequestPath =
-            applicationEventFetchReturnRequestTargetsActiveFetch
-                ? applicationEventFetchReturnClaimCount == 0
-                    && applicationEventFetchRunLoopStopCount == 0
-                : applicationEventFetchReturnClaimCount == 1
-                    && applicationEventFetchRunLoopStopCount == 0;
         const auto boundEligibleFetch = [NSThread isMainThread]
-            && bindingMatchesRequestPath
+            && applicationEventFetchBindingMatchesRequestPath()
             && applicationEventFetchReturnRequested
             && applicationEventFetchReturnRequestCount == 1
             && applicationEventFetchReturnCount == 0
@@ -925,10 +1296,7 @@ bool NativeFilePanel::postBoundApplicationFetchBarrierEvent() noexcept
                 == applicationEventFetchReturnRequestedDepth
             && applicationEventFetchActiveInvocation
                 == applicationEventFetchReturnRequestedInvocation
-            && applicationEventFetchDequeues
-            && applicationEventFetchModeSupplied
-            && (applicationEventFetchMask & NSEventMaskApplicationDefined) != 0
-            && applicationEventFetchContextRecorded
+            && currentApplicationEventFetchIsEligible()
             && ! applicationFetchBarrierEventPosted
             && applicationFetchBarrierEventCount == 0
             && applicationFetchBarrierEventDequeueCount == 0
@@ -937,7 +1305,85 @@ bool NativeFilePanel::postBoundApplicationFetchBarrierEvent() noexcept
             return false;
         applicationFetchBarrierEventPosted =
             postApplicationControlEvent(applicationFetchBarrierEventCode);
+        if (applicationFetchBarrierEventPosted
+            && ! stopApplicationEventFetchWakeDriver())
+        {
+            std::fputs("NATIVE_APP_LOOP_FETCH_WAKE_DRIVER_STOP_FAILED\n", stderr);
+            std::fflush(stderr);
+            std::terminate();
+        }
         return applicationFetchBarrierEventPosted;
+    }
+}
+bool NativeFilePanel::continueApplicationEventFetchReturnRequest(
+    std::size_t exitingDepthValue, std::size_t exitingInvocationValue) noexcept
+{
+    @autoreleasepool
+    {
+        if (applicationEventFetchReturnPath
+            != ApplicationEventFetchReturnPath::activeUnwind)
+            return true;
+        const auto exitingDepth = static_cast<NSUInteger>(exitingDepthValue);
+        const auto exitingInvocation = static_cast<NSUInteger>(exitingInvocationValue);
+        if (![NSThread isMainThread]
+            || ! applicationEventFetchReturnRequested
+            || applicationEventFetchReturnRequestedDepth != 0
+            || applicationEventFetchReturnRequestedInvocation != 0
+            || applicationEventFetchReturnInitialDepth == 0
+            || applicationEventFetchReturnLastUnwindDepth == 0
+            || applicationEventFetchReturnUnwindEpisodeCount == 0
+            || exitingDepth != applicationEventFetchReturnLastUnwindDepth
+            || exitingInvocation != applicationEventFetchReturnUnwindInvocation
+            || applicationEventFetchDepth + 1 != exitingDepth
+            || applicationEventFetchReturnInitialDepth < exitingDepth
+            || applicationEventFetchReturnUnwindReturnCount
+                != applicationEventFetchReturnUnwindReturnBase
+                    + applicationEventFetchReturnInitialDepth - exitingDepth
+            || applicationEventFetchRunLoopStopCount
+                < applicationEventFetchReturnUnwindStopBase
+                    + applicationEventFetchReturnInitialDepth - exitingDepth + 1
+            || applicationEventFetchRunLoopStopCount
+                <= applicationEventFetchReturnUnwindInvocationStopBase)
+            return false;
+
+        ++applicationEventFetchReturnUnwindReturnCount;
+        applicationEventFetchReturnLastUnwindDepth = applicationEventFetchDepth;
+        if (applicationEventFetchDepth == 0)
+        {
+            if (applicationEventFetchActiveInvocation != 0
+                || applicationEventFetchContextRecorded
+                || applicationEventFetchMode != nil
+                || applicationEventFetchRunLoopStopCount
+                    < applicationEventFetchReturnUnwindStopBase
+                        + applicationEventFetchReturnInitialDepth
+                || applicationEventFetchReturnUnwindReturnCount
+                    != applicationEventFetchReturnUnwindReturnBase
+                        + applicationEventFetchReturnInitialDepth)
+                return false;
+            applicationEventFetchReturnPath =
+                ApplicationEventFetchReturnPath::nextEligibleAfterUnwind;
+            applicationEventFetchReturnUnwindInvocation = 0;
+            std::fprintf(stderr,
+                         "NATIVE_APP_LOOP_FETCH_UNWOUND_TO_NEXT_ELIGIBLE episode=%lu exitingInvocation=%lu stops=%lu returns=%lu\n",
+                         static_cast<unsigned long>(applicationEventFetchReturnUnwindEpisodeCount),
+                         static_cast<unsigned long>(exitingInvocation),
+                         static_cast<unsigned long>(applicationEventFetchRunLoopStopCount),
+                         static_cast<unsigned long>(applicationEventFetchReturnUnwindReturnCount));
+            std::fflush(stderr);
+            return true;
+        }
+
+        if (applicationEventFetchActiveInvocation == 0
+            || applicationEventFetchActiveInvocation >= exitingInvocation
+            || ! applicationEventFetchModeSupplied
+            || applicationEventFetchMode == nil
+            || ! applicationEventFetchContextRecorded)
+            return false;
+        applicationEventFetchReturnUnwindInvocation =
+            applicationEventFetchActiveInvocation;
+        applicationEventFetchReturnUnwindInvocationStopBase =
+            applicationEventFetchRunLoopStopCount;
+        return stopCurrentApplicationEventFetchUnwindInvocation();
     }
 }
 bool NativeFilePanel::requestApplicationEventFetchReturn() noexcept
@@ -949,63 +1395,151 @@ bool NativeFilePanel::requestApplicationEventFetchReturn() noexcept
             || applicationEventFetchReturnRequested
             || applicationEventFetchReturnRequestCount != 0
             || applicationEventFetchReturnCount != 0
+            || applicationEventFetchReturnClaimCount != 0
+            || applicationEventFetchReturnUnwindReturnCount != 0
+            || applicationEventFetchRunLoopStopCount != 0
+            || applicationEventFetchReturnInitialDepth != 0
+            || applicationEventFetchReturnLastUnwindDepth != 0
+            || applicationEventFetchReturnUnwindInvocation != 0
+            || applicationEventFetchReturnUnwindStopBase != 0
+            || applicationEventFetchReturnUnwindReturnBase != 0
+            || applicationEventFetchReturnUnwindInvocationStopBase != 0
+            || applicationEventFetchReturnUnwindEpisodeCount != 0
+            || applicationEventFetchWakeDriverStopCount != 0
             || ! isRunnableApplicationEventContext())
             return false;
 
-        const auto targetsActiveFetch = applicationEventFetchDepth > 0;
+        const auto hasActiveFetch = applicationEventFetchDepth > 0;
+        const auto targetsCurrentFetch = applicationEventFetchDepth == 1
+            && currentApplicationEventFetchIsEligible();
 
         auto* runLoop = CFRunLoopGetCurrent();
         if (runLoop == nullptr || runLoop != CFRunLoopGetMain())
             return false;
         CFStringRef mode = nullptr;
-        if (targetsActiveFetch)
+        if (hasActiveFetch)
         {
             mode = CFRunLoopCopyCurrentMode(runLoop);
-            if (mode == nullptr)
+            if (mode == nullptr || applicationEventFetchMode == nil
+                || ! CFEqual(mode, (CFStringRef) applicationEventFetchMode))
+            {
+                if (mode != nullptr)
+                    CFRelease(mode);
                 return false;
+            }
         }
 
         applicationEventFetchReturnRequested = true;
-        applicationEventFetchReturnRequestTargetsActiveFetch = targetsActiveFetch;
+        applicationEventFetchReturnPath = targetsCurrentFetch
+            ? ApplicationEventFetchReturnPath::activeEligible
+            : ApplicationEventFetchReturnPath::nextEligible;
         applicationEventFetchReturnRequestedDepth =
-            targetsActiveFetch ? applicationEventFetchDepth : 0;
+            targetsCurrentFetch ? applicationEventFetchDepth : 0;
         applicationEventFetchReturnRequestedInvocation =
-            targetsActiveFetch ? applicationEventFetchActiveInvocation : 0;
+            targetsCurrentFetch ? applicationEventFetchActiveInvocation : 0;
         ++applicationEventFetchReturnRequestCount;
-        if (targetsActiveFetch && ! postBoundApplicationFetchBarrierEvent())
+        const auto pathStarted = targetsCurrentFetch
+            ? postBoundApplicationFetchBarrierEvent()
+            : ! hasActiveFetch || beginApplicationEventFetchUnwindEpisode();
+        if (! pathStarted)
         {
             applicationEventFetchReturnRequested = false;
-            applicationEventFetchReturnRequestTargetsActiveFetch = false;
+            applicationEventFetchReturnPath = ApplicationEventFetchReturnPath::none;
             applicationEventFetchReturnRequestedDepth = 0;
+            applicationEventFetchReturnInitialDepth = 0;
+            applicationEventFetchReturnLastUnwindDepth = 0;
+            applicationEventFetchReturnUnwindInvocation = 0;
             applicationEventFetchReturnRequestedInvocation = 0;
             applicationEventFetchReturnRequestCount = 0;
+            applicationEventFetchReturnClaimCount = 0;
+            applicationEventFetchReturnUnwindReturnCount = 0;
+            applicationEventFetchRunLoopStopCount = 0;
+            applicationEventFetchReturnUnwindStopBase = 0;
+            applicationEventFetchReturnUnwindReturnBase = 0;
+            applicationEventFetchReturnUnwindInvocationStopBase = 0;
+            applicationEventFetchReturnUnwindEpisodeCount = 0;
+            applicationEventFetchWakeDriverStopCount = 0;
             if (mode != nullptr)
                 CFRelease(mode);
             return false;
         }
         const auto* modeName = mode != nullptr ? [(NSString*) mode UTF8String] : nullptr;
         std::fprintf(stderr,
-                     "NATIVE_APP_LOOP_FETCH_RETURN_REQUESTED target=%s depth=%lu invocation=%lu mode=%s mask=0x%llx dequeue=%d\n",
-                     targetsActiveFetch ? "active" : "next-eligible",
+                     "NATIVE_APP_LOOP_FETCH_RETURN_REQUESTED path=%s initialDepth=%lu targetDepth=%lu invocation=%lu mode=%s mask=0x%llx dequeue=%d\n",
+                     applicationEventFetchReturnPathName(),
+                     static_cast<unsigned long>(applicationEventFetchReturnInitialDepth),
                      static_cast<unsigned long>(applicationEventFetchReturnRequestedDepth),
                      static_cast<unsigned long>(applicationEventFetchReturnRequestedInvocation),
                      modeName != nullptr ? modeName : "<between-fetches>",
                      static_cast<unsigned long long>(applicationEventFetchMask),
                      applicationEventFetchDequeues ? 1 : 0);
         std::fflush(stderr);
-        if (targetsActiveFetch)
+        if (targetsCurrentFetch)
         {
             std::fputs("NATIVE_APP_LOOP_FETCH_BARRIER_POSTED\n", stderr);
             std::fflush(stderr);
         }
         if (mode != nullptr)
             CFRelease(mode);
-        if (targetsActiveFetch)
+        if (targetsCurrentFetch)
         {
             ++applicationEventFetchRunLoopStopCount;
+            std::fprintf(stderr,
+                         "NATIVE_APP_LOOP_FETCH_RUN_LOOP_STOP path=%s depth=%lu invocation=%lu stops=%lu\n",
+                         applicationEventFetchReturnPathName(),
+                         static_cast<unsigned long>(applicationEventFetchDepth),
+                         static_cast<unsigned long>(applicationEventFetchActiveInvocation),
+                         static_cast<unsigned long>(applicationEventFetchRunLoopStopCount));
+            std::fflush(stderr);
             CFRunLoopStop(runLoop);
         }
         return true;
+    }
+}
+bool NativeFilePanel::driveApplicationEventFetchReturnRequest() noexcept
+{
+    @autoreleasepool
+    {
+        if (![NSThread isMainThread]
+            || ! applicationEventFetchReturnRequested
+            || applicationEventFetchReturnRequestCount != 1
+            || applicationEventFetchReturnCount != 0
+            || applicationEventFetchWakeDriverStopCount != 0
+            || ! isRunnableApplicationEventContext())
+            return false;
+
+        if (applicationEventFetchReturnPath
+            == ApplicationEventFetchReturnPath::activeUnwind)
+        {
+            auto* runLoop = CFRunLoopGetCurrent();
+            if (runLoop == nullptr || runLoop != CFRunLoopGetMain())
+                return false;
+            if (! currentRunLoopModeMatchesApplicationEventFetch(runLoop))
+                return true;
+            return stopCurrentApplicationEventFetchUnwindInvocation();
+        }
+
+        if (applicationEventFetchReturnRequestedDepth != 0
+            || applicationEventFetchReturnRequestedInvocation != 0
+            || applicationEventFetchDepth == 0)
+            return true;
+
+        const auto waitsForEligibleFetch =
+            applicationEventFetchReturnPath
+                == ApplicationEventFetchReturnPath::nextEligible
+            || applicationEventFetchReturnPath
+                == ApplicationEventFetchReturnPath::nextEligibleAfterUnwind;
+        if (! waitsForEligibleFetch
+            || (applicationEventFetchDepth == 1
+                && currentApplicationEventFetchIsEligible()))
+            return false;
+
+        auto* runLoop = CFRunLoopGetCurrent();
+        if (runLoop == nullptr || runLoop != CFRunLoopGetMain())
+            return false;
+        if (! currentRunLoopModeMatchesApplicationEventFetch(runLoop))
+            return true;
+        return beginApplicationEventFetchUnwindEpisode();
     }
 }
 void NativeFilePanel::logApplicationSettleReadiness() noexcept
@@ -1013,7 +1547,7 @@ void NativeFilePanel::logApplicationSettleReadiness() noexcept
     @autoreleasepool
     {
         std::fprintf(stderr,
-                     "NATIVE_APP_LOOP_SETTLE_READINESS depth=%lu activeInvocation=%lu context=%d mask=0x%llx dequeue=%d mode=%d request=%d targetActive=%d claims=%lu runLoopStops=%lu start=%d running=%d modalWindow=%d\n",
+                     "NATIVE_APP_LOOP_SETTLE_READINESS depth=%lu activeInvocation=%lu context=%d mask=0x%llx dequeue=%d mode=%d request=%d path=%s initialDepth=%lu lastUnwindDepth=%lu unwindInvocation=%lu episodes=%lu unwindStopBase=%lu unwindReturnBase=%lu invocationStopBase=%lu unwindReturns=%lu claims=%lu runLoopStops=%lu wakeDriverStops=%lu start=%d running=%d modalWindow=%d\n",
                      static_cast<unsigned long>(applicationEventFetchDepth),
                      static_cast<unsigned long>(applicationEventFetchActiveInvocation),
                      applicationEventFetchContextRecorded ? 1 : 0,
@@ -1021,9 +1555,18 @@ void NativeFilePanel::logApplicationSettleReadiness() noexcept
                      applicationEventFetchDequeues ? 1 : 0,
                      applicationEventFetchModeSupplied ? 1 : 0,
                      applicationEventFetchReturnRequested ? 1 : 0,
-                     applicationEventFetchReturnRequestTargetsActiveFetch ? 1 : 0,
+                     applicationEventFetchReturnPathName(),
+                     static_cast<unsigned long>(applicationEventFetchReturnInitialDepth),
+                     static_cast<unsigned long>(applicationEventFetchReturnLastUnwindDepth),
+                     static_cast<unsigned long>(applicationEventFetchReturnUnwindInvocation),
+                     static_cast<unsigned long>(applicationEventFetchReturnUnwindEpisodeCount),
+                     static_cast<unsigned long>(applicationEventFetchReturnUnwindStopBase),
+                     static_cast<unsigned long>(applicationEventFetchReturnUnwindReturnBase),
+                     static_cast<unsigned long>(applicationEventFetchReturnUnwindInvocationStopBase),
+                     static_cast<unsigned long>(applicationEventFetchReturnUnwindReturnCount),
                      static_cast<unsigned long>(applicationEventFetchReturnClaimCount),
                      static_cast<unsigned long>(applicationEventFetchRunLoopStopCount),
+                     static_cast<unsigned long>(applicationEventFetchWakeDriverStopCount),
                      applicationStartEventWasHandled() ? 1 : 0,
                      [NSApp isRunning] ? 1 : 0,
                      [NSApp modalWindow] == nil ? 0 : 1);
@@ -1034,12 +1577,7 @@ bool NativeFilePanel::applicationSettleEventWasHandled() noexcept
 {
     @autoreleasepool
     {
-        const auto fetchBoundaryWasProved =
-            applicationEventFetchReturnRequestTargetsActiveFetch
-                ? applicationEventFetchReturnClaimCount == 0
-                    && applicationEventFetchRunLoopStopCount == 1
-                : applicationEventFetchReturnClaimCount == 1
-                    && applicationEventFetchRunLoopStopCount == 0;
+        const auto fetchBoundaryWasProved = applicationEventFetchBoundaryWasProved();
         return [NSThread isMainThread] && applicationSettleEventPosted
             && applicationFetchBarrierEventPosted
             && applicationFetchBarrierEventCount == 1
@@ -1123,14 +1661,25 @@ void NativeFilePanel::finishTestApplication() noexcept
         if (![NSThread isMainThread])
             return;
         applicationEventFetchReturnRequested = false;
-        if (applicationEventMonitor == nil)
-            return;
-        // JUCE's macOS stop path uses periodic events to release
-        // NSApplication::run. Retire that wake before framework teardown.
-        [NSEvent stopPeriodicEvents];
-        [NSEvent removeMonitor:applicationEventMonitor];
-        applicationEventMonitor = nil;
         applicationStopCallback = nullptr;
+        applicationFetchBoundCallback = nullptr;
+        applicationFetchBoundContext = nullptr;
+        if (applicationEventMonitor != nil)
+        {
+            // JUCE's macOS stop path uses periodic events to release
+            // NSApplication::run. Retire that wake before framework teardown.
+            [NSEvent stopPeriodicEvents];
+            [NSEvent removeMonitor:applicationEventMonitor];
+            applicationEventMonitor = nil;
+        }
+        [applicationStartEventIdentity release];
+        [applicationFetchBarrierEventIdentity release];
+        [applicationSettleEventIdentity release];
+        [applicationStopEventIdentity release];
+        applicationStartEventIdentity = nil;
+        applicationFetchBarrierEventIdentity = nil;
+        applicationSettleEventIdentity = nil;
+        applicationStopEventIdentity = nil;
     }
 }
 void NativeFilePanel::disableAutomaticWindowAnimations(void* nativeView)

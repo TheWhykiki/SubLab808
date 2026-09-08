@@ -64,7 +64,8 @@ suite. While the native harness is active, its public
 deadline, mode and dequeue flag unchanged. It records only marked control-event
 dequeues and the targeted fetch returning after the shutdown request.
 
-Before entering that loop the harness posts a private START `NSEvent`; the timer-driven
+Before entering that loop the harness posts a private ApplicationDefined START
+`NSEvent`; the timer-driven
 state machine remains dormant until a local AppKit monitor sees that event in the real
 `NSApplication.sendEvent:` path while the application is running. The subclass also
 records that the same marked event came from a default-mode dequeue. This proves that
@@ -77,23 +78,39 @@ JUCE dispatch loop. Because `NSApplication.stop` called from a timer does not st
 main loop, shutdown first requires three consecutive timer turns while `NSApplication`
 is running without an AppKit modal window. JUCE may deliver those timer messages
 from any common run-loop mode, so posting does not depend on AppKit's transient
-`currentMode`; the marked BARRIER, SETTLE and STOP events themselves must be dequeued
-exactly once through the public AppKit fetch. On that final ready turn the
-coordinator arms an independent GCD watchdog, stops the recurring 10 ms timer, and creates
-one shutdown request before SETTLE exists. If an eligible AppKit fetch is active,
+`currentMode`; all four marked control events remain the supported
+ApplicationDefined type. Their private subtype/data signature, event code and retained
+posted-object identity are validated before the local monitor consumes one, and each
+must be dequeued exactly once through the public AppKit fetch. On that final ready turn the coordinator arms
+an independent GCD watchdog and creates one shutdown request before SETTLE exists.
+The bounded 10 ms source remains active only until BARRIER is successfully queued.
+If the current AppKit fetch is an eligible outermost depth-one fetch,
 the harness posts one private prioritized BARRIER event and calls public `CFRunLoopStop`
 once on the current main run loop;
-CoreFoundation returns only its innermost active run-loop activation, so the harness
-binds the request to the current innermost eligible fetch even when AppKit has nested
-event-fetch frames; the exact BARRIER return subsequently validates that binding at
-runtime. If the timer fires
-between fetches, the next fetch whose supplied mask, mode and dequeue flag can
-retrieve BARRIER claims the pending request and posts BARRIER before entering AppKit. In either path that
+the exact BARRIER return subsequently validates that binding at runtime. AppKit may
+nest tracking fetches or use a fetch which deliberately excludes ApplicationDefined events. In that
+case the harness does not synthesize a reserved system event or broaden the supplied
+mask. It requests that the current CoreFoundation run-loop activation stop. After
+the exact fetch's `super nextEventMatchingMask:...` returns and the override restores
+its parent context, the harness requests the next stop, repeating until the active
+fetch stack is empty. Strictly decreasing depths and matching invocation tokens
+validate the observed AppKit unwind. One or more bounded physical stop attempts are
+permitted for the same unchanged invocation before its single logical return; every
+attempt requires the current CoreFoundation mode to equal that exact fetch's supplied
+mode. The harness does not infer a one-to-one identity between AppKit fetches and
+CoreFoundation activations. If another active fetch stack forms before an eligible
+outer fetch appears, a later timer turn begins another independently tokened episode.
+Episode/attempt caps and the five-second watchdog bound this wake process and fail
+closed if an eligible outer fetch never emerges. The first fresh depth-one fetch whose supplied
+mask, mode and dequeue flag can retrieve BARRIER claims the pending request and posts
+BARRIER before entering AppKit. In every path that
 exact public fetch must dequeue and return BARRIER once. Only in its return path does the
 test application post one private prioritized SETTLE event. AppKit then dispatches
 BARRIER before a later public fetch can dequeue SETTLE in a non-null supplied mode.
-Stopping the recurring timer prevents further coordinator-timer messages. Exact request,
-claim and `CFRunLoopStop` counters distinguish the two paths, while invocation IDs prove
+Immediately after BARRIER is queued, a test callback synchronously stops the recurring
+timer before the bound fetch enters AppKit, preventing coordinator messages from entering
+the BARRIER/SETTLE/STOP sequence. Exact request, claim, episode and `CFRunLoopStop`
+counters distinguish the three paths, while invocation IDs prove
 the BARRIER/SETTLE/STOP separation. Each event also records its dequeue and handler
 depth; the handler depth must be lower, proving that the exact fetch which dequeued
 the event returned before AppKit dispatched it without requiring unrelated outer

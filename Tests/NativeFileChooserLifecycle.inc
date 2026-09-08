@@ -163,9 +163,23 @@ public:
         require(! cases.empty(), "WHYKIKI_PRESET_TEST_NATIVE_CASE names a supported native chooser case");
     }
 
+    static bool stopApplicationFetchWakeDriver(void* context) noexcept
+    {
+        auto* coordinator = static_cast<NativeChooserCoordinator*>(context);
+        auto* messageManager = juce::MessageManager::getInstanceWithoutCreating();
+        if (coordinator == nullptr || messageManager == nullptr
+            || ! messageManager->isThisTheMessageThread()
+            || ! coordinator->shutdownStarted
+            || ! coordinator->isTimerRunning())
+            return false;
+        coordinator->stopTimer();
+        return ! coordinator->isTimerRunning();
+    }
+
     ~NativeChooserCoordinator() override
     {
-        // The normal shutdown path stops this timer before posting BARRIER.
+        // The normal shutdown path stops this timer immediately after posting
+        // BARRIER and before its bound fetch enters AppKit.
         // Keep an idempotent most-derived guard before
         // retained case members are destroyed and the Timer base is reached.
         stopTimer();
@@ -700,10 +714,9 @@ private:
         std::fputs("NATIVE_APP_LOOP_STOP_READY_BEGIN\n", stderr);
         std::fflush(stderr);
         // Stable readiness is established on clean main-thread timer turns.
-        // The final turn retires this recurring source and creates one request.
-        // If an eligible AppKit fetch is active, it receives BARRIER before
-        // CoreFoundation is asked to return it; otherwise the next eligible
-        // fetch claims the request and then queues BARRIER before retrieval.
+        // The final readiness turn creates one request. This bounded source
+        // remains active until BARRIER is posted, allowing another complete
+        // non-bindable fetch stack to be released if AppKit creates one first.
         startTimer(10);
     }
 
@@ -744,10 +757,9 @@ private:
         }
         std::fputs("NATIVE_APP_LOOP_RETURN_WATCHDOG_ARMED\n", stderr);
         std::fflush(stderr);
-        // stopTimer() is synchronous inside its callback. Queue BARRIER before
-        // SETTLE exists. An active eligible fetch is stopped; between fetches,
-        // the next eligible fetch binds and returns BARRIER itself.
-        stopTimer();
+        // Queue BARRIER before SETTLE exists when the current depth-one fetch is
+        // eligible. Otherwise unwind each active fetch invocation before a
+        // fresh eligible depth-one fetch binds and returns BARRIER itself.
         nativeApplicationSettleDispatchRequested =
             NativeFilePanel::requestApplicationEventFetchReturn();
         if (! nativeApplicationSettleDispatchRequested)
@@ -762,9 +774,15 @@ private:
         enter(Phase::awaitApplicationReturn);
     }
 
-    [[noreturn]] void awaitApplicationReturn() const noexcept
+    void awaitApplicationReturn() noexcept
     {
-        shutdownTimeout("timer-fired-after-fetch-return-request");
+        if (! NativeFilePanel::driveApplicationEventFetchReturnRequest())
+        {
+            NativeFilePanel::logApplicationSettleReadiness();
+            std::fputs("NATIVE_APP_LOOP_FETCH_RETURN_DRIVE_FAILED\n", stderr);
+            std::fflush(stderr);
+            std::terminate();
+        }
     }
 
     void failDuringShutdown(const char* message) noexcept
@@ -896,7 +914,7 @@ int runNativeFileChooserLifecycles(const juce::File& root, const juce::String& r
             nativeFileChooserHarnessEnabled = false;
             NativeFilePanel::finishTestApplication();
         }
-    } applicationCleanup;
+    };
 
     require(juce::MessageManager::getInstance()->isThisTheMessageThread(),
             "native chooser tests start on the message thread");
@@ -904,7 +922,12 @@ int runNativeFileChooserLifecycles(const juce::File& root, const juce::String& r
             "native chooser tests require an active macOS desktop session");
     require(juce::FileChooser::isPlatformDialogAvailable(),
             "native chooser platform implementation is available");
-    NativeFilePanel::prepareTestApplication(stopJuceApplicationLoopFromEvent);
+    NativeChooserCoordinator coordinator(root, requestedCase);
+    ApplicationCleanup applicationCleanup;
+    NativeFilePanel::prepareTestApplication(
+        stopJuceApplicationLoopFromEvent,
+        NativeChooserCoordinator::stopApplicationFetchWakeDriver,
+        &coordinator);
     nativeApplicationLoopReturned.store(false, std::memory_order_release);
     nativeApplicationReturnWatchdogArmed.store(false, std::memory_order_release);
     nativeApplicationShutdownStage.store(NativeApplicationShutdownStage::idle,
@@ -913,7 +936,6 @@ int runNativeFileChooserLifecycles(const juce::File& root, const juce::String& r
     nativeApplicationSettleDispatchRequested = false;
     nativeApplicationWasRunningAtStop = false;
     nativeFileChooserHarnessEnabled = true;
-    NativeChooserCoordinator coordinator(root, requestedCase);
     nativeApplicationStartEventPosted = NativeFilePanel::postApplicationStartEvent();
     require(nativeApplicationStartEventPosted,
             "native chooser could not post its AppKit start event");
