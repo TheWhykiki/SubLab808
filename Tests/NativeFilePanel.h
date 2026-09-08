@@ -14,14 +14,15 @@ public:
     static void installTestApplication();
     static void prepareTestApplication(ApplicationStopCallback);
     [[nodiscard]] static bool applicationIsRunning() noexcept;
-    // Private START/SETTLE/STOP events prove three distinct dispatches through
-    // the real NSApplication event loop. The test application bounds only
-    // otherwise-long event waits; it preserves each supplied run-loop mode and
-    // never pumps or sends events.
+    // Private START/BARRIER/SETTLE/STOP events prove distinct dispatches through
+    // the real NSApplication event loop. BARRIER plus CFRunLoopStop returns the
+    // active fetch; only its return path queues SETTLE for a later fetch. The
+    // test never pumps or sends an event itself.
     [[nodiscard]] static bool postApplicationStartEvent() noexcept;
     [[nodiscard]] static bool applicationStartEventWasHandled() noexcept;
     [[nodiscard]] static bool applicationIsReadyForSettleEvent() noexcept;
     [[nodiscard]] static bool postApplicationSettleEvent() noexcept;
+    [[nodiscard]] static bool requestApplicationEventFetchReturn() noexcept;
     [[nodiscard]] static bool applicationSettleEventWasHandled() noexcept;
     [[nodiscard]] static bool applicationIsReadyForStopEvent() noexcept;
     [[nodiscard]] static bool postApplicationStopEvent() noexcept;

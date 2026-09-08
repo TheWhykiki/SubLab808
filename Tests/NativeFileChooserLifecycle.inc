@@ -56,7 +56,7 @@ struct NativeChooserCaseState
 };
 
 bool nativeApplicationStartEventPosted = false;
-bool nativeApplicationSettleEventPosted = false;
+bool nativeApplicationSettleDispatchRequested = false;
 bool nativeApplicationWasRunningAtStop = false;
 std::atomic<bool> nativeApplicationLoopReturned { false };
 std::atomic<bool> nativeApplicationReturnWatchdogArmed { false };
@@ -65,7 +65,7 @@ enum class NativeApplicationShutdownStage
 {
     idle,
     watchdogArmed,
-    settlePosted,
+    fetchReturnRequested,
     stopAccepted,
     loopReturned
 };
@@ -80,7 +80,7 @@ const char* shutdownStageName(NativeApplicationShutdownStage stage) noexcept
     {
         case NativeApplicationShutdownStage::idle: return "idle";
         case NativeApplicationShutdownStage::watchdogArmed: return "watchdog-armed";
-        case NativeApplicationShutdownStage::settlePosted: return "settle-posted";
+        case NativeApplicationShutdownStage::fetchReturnRequested: return "fetch-return-requested";
         case NativeApplicationShutdownStage::stopAccepted: return "stop-accepted";
         case NativeApplicationShutdownStage::loopReturned: return "loop-returned";
     }
@@ -165,7 +165,7 @@ public:
 
     ~NativeChooserCoordinator() override
     {
-        // The normal shutdown path stops this timer before posting SETTLE.
+        // The normal shutdown path stops this timer before posting BARRIER.
         // Keep an idempotent most-derived guard before
         // retained case members are destroyed and the Timer base is reached.
         stopTimer();
@@ -700,12 +700,10 @@ private:
         std::fputs("NATIVE_APP_LOOP_STOP_READY_BEGIN\n", stderr);
         std::fflush(stderr);
         // Stable readiness is established on clean main-thread timer turns.
-        // JUCE delivers timer messages from a common-mode run-loop source, so
-        // the posting precondition must not depend on a transient currentMode
-        // left behind by a closed native panel. SETTLE itself must still pass
-        // through the public AppKit event fetch. The final turn arms an
-        // independent watchdog and retires this recurring source before
-        // queueing SETTLE.
+        // The final turn retires this recurring source, queues a marked
+        // BARRIER, and asks CoreFoundation to return the active AppKit
+        // event-fetch activation. That fetch must return BARRIER; only then
+        // does the test application queue SETTLE for a later fetch.
         startTimer(10);
     }
 
@@ -742,28 +740,27 @@ private:
         }
         std::fputs("NATIVE_APP_LOOP_RETURN_WATCHDOG_ARMED\n", stderr);
         std::fflush(stderr);
-        // stopTimer() is synchronous inside its callback. The test application
-        // already bounds the active nextEvent: wait, so this same-thread post
-        // needs neither a worker nor a synthetic wake source.
+        // stopTimer() is synchronous inside its callback. Queue BARRIER and
+        // request a return from the innermost run-loop activation before
+        // SETTLE exists; the returning fetch will queue SETTLE afterwards.
         stopTimer();
-        std::fputs("NATIVE_APP_LOOP_SETTLE_BEGIN\n", stderr);
-        nativeApplicationSettleEventPosted = NativeFilePanel::postApplicationSettleEvent();
-        if (! nativeApplicationSettleEventPosted)
+        nativeApplicationSettleDispatchRequested =
+            NativeFilePanel::requestApplicationEventFetchReturn();
+        if (! nativeApplicationSettleDispatchRequested)
         {
-            std::fputs("NATIVE_APP_LOOP_SETTLE_POST_FAILED\n", stderr);
+            std::fputs("NATIVE_APP_LOOP_FETCH_RETURN_REQUEST_FAILED\n", stderr);
             std::fflush(stderr);
             std::terminate();
         }
-        nativeApplicationShutdownStage.store(NativeApplicationShutdownStage::settlePosted,
-                                             std::memory_order_release);
-        std::fputs("NATIVE_APP_LOOP_SETTLE_POSTED\n", stderr);
-        std::fflush(stderr);
+        nativeApplicationShutdownStage.store(
+            NativeApplicationShutdownStage::fetchReturnRequested,
+            std::memory_order_release);
         enter(Phase::awaitApplicationReturn);
     }
 
     [[noreturn]] void awaitApplicationReturn() const noexcept
     {
-        shutdownTimeout("timer-fired-after-settle");
+        shutdownTimeout("timer-fired-after-fetch-return-request");
     }
 
     void failDuringShutdown(const char* message) noexcept
@@ -909,7 +906,7 @@ int runNativeFileChooserLifecycles(const juce::File& root, const juce::String& r
     nativeApplicationShutdownStage.store(NativeApplicationShutdownStage::idle,
                                          std::memory_order_release);
     nativeApplicationStartEventPosted = false;
-    nativeApplicationSettleEventPosted = false;
+    nativeApplicationSettleDispatchRequested = false;
     nativeApplicationWasRunningAtStop = false;
     nativeFileChooserHarnessEnabled = true;
     NativeChooserCoordinator coordinator(root, requestedCase);
@@ -936,8 +933,8 @@ int runNativeFileChooserLifecycles(const juce::File& root, const juce::String& r
             "native chooser AppKit start event was not handled once in the running application loop");
     require(nativeApplicationWasRunningAtStop,
             "native chooser requested shutdown before the AppKit event loop was running");
-    require(nativeApplicationSettleEventPosted,
-            "native chooser application loop stopped without its AppKit settle event");
+    require(nativeApplicationSettleDispatchRequested,
+            "native chooser application loop stopped without requesting SETTLE dispatch");
     require(settleEventWasHandled,
             "native chooser AppKit settle event was not handled once in the AppKit dispatch path");
     require(stopEventWasPosted,
