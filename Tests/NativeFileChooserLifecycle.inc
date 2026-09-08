@@ -165,9 +165,9 @@ public:
 
     ~NativeChooserCoordinator() override
     {
-        // The normal handshake stops this timer before posting SETTLE. Keep an
-        // idempotent most-derived guard before retained case members are
-        // destroyed and only later juce::Timer's base destructor is reached.
+        // The normal shutdown path stops this timer before posting SETTLE.
+        // Keep an idempotent most-derived guard before
+        // retained case members are destroyed and the Timer base is reached.
         stopTimer();
     }
 
@@ -190,6 +190,8 @@ public:
         require(failure.empty(), "native chooser final audit requires a successful lifecycle");
         require(shutdownStarted && current == nullptr && caseIndex == cases.size(),
                 "native chooser reached run-loop return from the completed shutdown state");
+        require(NativeFilePanel::applicationStopEventWasHandled(),
+                "native chooser stop event ran exactly once in a valid clean context");
         auditRetiredCases();
         auditGlobalState();
     }
@@ -697,9 +699,9 @@ private:
         enter(Phase::awaitApplicationStopReady, 5000.0);
         std::fputs("NATIVE_APP_LOOP_STOP_READY_BEGIN\n", stderr);
         std::fflush(stderr);
-        // Stable readiness is established on timer turns. The final turn arms
-        // an independent watchdog and retires this recurring timer before the
-        // bridge starts its bounded native-event wake and queues SETTLE.
+        // Stable readiness is established on default-mode timer turns. The
+        // final turn arms an independent watchdog and retires this recurring
+        // source before queueing SETTLE for the outer application loop.
         startTimer(10);
     }
 
@@ -736,9 +738,9 @@ private:
         }
         std::fputs("NATIVE_APP_LOOP_RETURN_WATCHDOG_ARMED\n", stderr);
         std::fflush(stderr);
-        // Retire the recurring timer before arming the native-event wake and
-        // enqueuing SETTLE. stopTimer() is synchronous and supported from
-        // inside this callback; neither operation dispatches re-entrantly.
+        // stopTimer() is synchronous inside its callback. The test application
+        // already bounds the outer nextEvent: wait, so this same-thread post
+        // needs neither a worker nor a synthetic wake source.
         stopTimer();
         std::fputs("NATIVE_APP_LOOP_SETTLE_BEGIN\n", stderr);
         nativeApplicationSettleEventPosted = NativeFilePanel::postApplicationSettleEvent();

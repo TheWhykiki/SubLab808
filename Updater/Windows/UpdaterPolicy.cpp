@@ -38,6 +38,20 @@ bool isLowerHex(char value)
     return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f');
 }
 
+bool equalAsciiInsensitive(std::string_view left, std::string_view right)
+{
+    if (left.size() != right.size()) return false;
+    return std::equal(left.begin(), left.end(), right.begin(), [] (unsigned char a, unsigned char b)
+    {
+        const auto upper = [] (unsigned char value)
+        {
+            return static_cast<unsigned char>(value >= 'a' && value <= 'z'
+                                                   ? value - ('a' - 'A') : value);
+        };
+        return upper(a) == upper(b);
+    });
+}
+
 std::optional<std::uint8_t> hexNibble(char value)
 {
     if (value >= '0' && value <= '9') return static_cast<std::uint8_t>(value - '0');
@@ -325,7 +339,14 @@ bool isForbiddenMsiSideEffectTable(std::string_view table)
 {
     constexpr std::array forbidden {
         std::string_view { "CustomAction" }, std::string_view { "Binary" },
+        std::string_view { "MsiEmbeddedUI" }, std::string_view { "MsiEmbeddedChainer" },
+        std::string_view { "AppSearch" }, std::string_view { "CompLocator" },
+        std::string_view { "RegLocator" }, std::string_view { "IniLocator" },
+        std::string_view { "DrLocator" }, std::string_view { "Signature" },
+        std::string_view { "Control" }, std::string_view { "ControlEvent" },
         std::string_view { "ServiceInstall" }, std::string_view { "ServiceControl" },
+        std::string_view { "MsiServiceConfig" },
+        std::string_view { "MsiServiceConfigFailureActions" },
         std::string_view { "Registry" }, std::string_view { "RemoveRegistry" },
         std::string_view { "SelfReg" }, std::string_view { "TypeLib" },
         std::string_view { "Class" }, std::string_view { "ProgId" },
@@ -334,7 +355,10 @@ bool isForbiddenMsiSideEffectTable(std::string_view table)
         std::string_view { "ODBCDriver" }, std::string_view { "ODBCTranslator" },
         std::string_view { "IniFile" }, std::string_view { "RemoveIniFile" },
         std::string_view { "Environment" }, std::string_view { "RemoveFile" },
-        std::string_view { "MoveFiles" }, std::string_view { "DuplicateFile" },
+        // MoveFile is the table.  MoveFiles is a standard action and is a no-op
+        // when this table is empty, so banning that action would reject harmless
+        // standard sequencing without strengthening this table-level contract.
+        std::string_view { "MoveFile" }, std::string_view { "DuplicateFile" },
         std::string_view { "CreateFolder" }, std::string_view { "Shortcut" },
         std::string_view { "ReserveCost" }, std::string_view { "BindImage" },
         std::string_view { "Font" }, std::string_view { "IsolatedComponent" },
@@ -342,10 +366,97 @@ bool isForbiddenMsiSideEffectTable(std::string_view table)
         std::string_view { "PublishComponent" }, std::string_view { "Complus" },
         std::string_view { "Verb" }, std::string_view { "ODBCAttribute" },
         std::string_view { "LockPermissions" }, std::string_view { "MsiLockPermissionsEx" },
+        std::string_view { "Permission" }, std::string_view { "PermissionEx" },
         std::string_view { "Patch" }, std::string_view { "PatchPackage" },
+        std::string_view { "MsiPatchCertificate" },
         std::string_view { "SFPCatalog" }
     };
     return std::find(forbidden.begin(), forbidden.end(), table) != forbidden.end();
+}
+
+bool isForbiddenMsiSequenceAction(std::string_view action)
+{
+    constexpr std::array forbidden {
+        std::string_view { "ForceReboot" }, std::string_view { "ScheduleReboot" },
+        std::string_view { "DisableRollback" }
+    };
+    return std::find(forbidden.begin(), forbidden.end(), action) != forbidden.end();
+}
+
+bool isForbiddenMsiProperty(std::string_view property)
+{
+    constexpr std::array forbidden {
+        std::string_view { "DISABLEROLLBACK" }, std::string_view { "TARGETDIR" },
+        std::string_view { "ROOTDRIVE" }, std::string_view { "TRANSFORMS" },
+        std::string_view { "TRANSFORMSATSOURCE" }, std::string_view { "TRANSFORMSSECURE" }
+    };
+    return std::any_of(forbidden.begin(), forbidden.end(), [property] (const auto candidate)
+    {
+        return equalAsciiInsensitive(property, candidate);
+    });
+}
+
+bool hasMsiDirectoryPropertyOverride(
+    const std::map<std::string, std::string>& properties,
+    const std::map<std::string, std::string>& directoryParents)
+{
+    for (const auto& [property, ignoredValue] : properties)
+    {
+        (void) ignoredValue;
+        for (const auto& [directory, ignoredParent] : directoryParents)
+        {
+            (void) ignoredParent;
+            if (equalAsciiInsensitive(property, directory)) return true;
+        }
+    }
+    return false;
+}
+
+bool isPredefinedMsiPathProperty(std::string_view property)
+{
+    // Windows Installer initializes these properties to absolute directories or
+    // paths independently of the authored Directory_Parent graph.  A payload
+    // Directory row must not reuse one of these identifiers below INSTALLFOLDER.
+    constexpr std::array predefined {
+        std::string_view { "OriginalDatabase" }, std::string_view { "ParentOriginalDatabase" },
+        std::string_view { "SourceDir" }, std::string_view { "TARGETDIR" },
+        std::string_view { "ROOTDRIVE" }, std::string_view { "CCP_DRIVE" },
+        std::string_view { "PrimaryVolumePath" }, std::string_view { "MsiLogFileLocation" },
+        std::string_view { "AdminToolsFolder" }, std::string_view { "AppDataFolder" },
+        std::string_view { "CommonAppDataFolder" }, std::string_view { "CommonFilesFolder" },
+        std::string_view { "CommonFiles64Folder" }, std::string_view { "CommonFiles6432Folder" },
+        std::string_view { "DesktopFolder" }, std::string_view { "FavoritesFolder" },
+        std::string_view { "FontsFolder" }, std::string_view { "LocalAppDataFolder" },
+        std::string_view { "MyPicturesFolder" }, std::string_view { "NetHoodFolder" },
+        std::string_view { "PersonalFolder" }, std::string_view { "PrintHoodFolder" },
+        std::string_view { "ProgramFilesFolder" }, std::string_view { "ProgramFiles64Folder" },
+        std::string_view { "ProgramFiles6432Folder" }, std::string_view { "PerUserProgramFilesFolder" },
+        std::string_view { "ProgramMenuFolder" },
+        std::string_view { "RecentFolder" }, std::string_view { "SendToFolder" },
+        std::string_view { "StartMenuFolder" }, std::string_view { "StartupFolder" },
+        std::string_view { "System16Folder" }, std::string_view { "SystemFolder" },
+        std::string_view { "System64Folder" }, std::string_view { "System6432Folder" },
+        std::string_view { "TempFolder" }, std::string_view { "TemplateFolder" },
+        std::string_view { "WindowsFolder" }, std::string_view { "WindowsVolume" }
+    };
+    return std::any_of(predefined.begin(), predefined.end(), [property] (const auto candidate)
+    {
+        return equalAsciiInsensitive(property, candidate);
+    });
+}
+
+bool msiDirectoryIdentifiersAreSafe(
+    const std::map<std::string, std::string>& directoryParents,
+    std::string_view expectedSystemFolderAnchor)
+{
+    for (const auto& [identifier, ignoredParent] : directoryParents)
+    {
+        (void) ignoredParent;
+        if (identifier != "TARGETDIR" && identifier != expectedSystemFolderAnchor
+            && isPredefinedMsiPathProperty(identifier))
+            return false;
+    }
+    return true;
 }
 
 bool hasExactUpgradeContract(const std::vector<MsiUpgradeRow>& rows,
@@ -426,7 +537,9 @@ bool componentDirectoriesAreInsideInstallFolder(
     const std::map<std::string, std::string>& directoryParents,
     const std::vector<std::string>& componentDirectories)
 {
-    if (componentDirectories.empty()) return false;
+    const auto root = directoryParents.find("TARGETDIR");
+    if (componentDirectories.empty() || root == directoryParents.end() || ! root->second.empty())
+        return false;
     // Validate the complete graph, not only the paths used by current
     // components.  A disconnected cyclic or dangling Directory subtree is not
     // part of the narrowly authored package and therefore fails closed.
@@ -435,8 +548,9 @@ bool componentDirectoriesAreInsideInstallFolder(
         (void) ignoredParent;
         auto directory = identifier;
         std::set<std::string> visited;
-        while (! directory.empty())
+        while (directory != "TARGETDIR")
         {
+            if (directory.empty()) return false;
             if (! visited.insert(directory).second) return false;
             const auto parent = directoryParents.find(directory);
             if (parent == directoryParents.end()) return false;

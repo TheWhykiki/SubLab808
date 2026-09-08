@@ -246,18 +246,54 @@ int main()
     require(! hasExactLaunchConditions({ "1 OR NOT WIX_DOWNGRADE_DETECTED",
                                          "Installed OR NOT OTHERARCHITECTUREDETECTED" }),
             "bypassed downgrade condition rejected");
-    require(isForbiddenMsiSideEffectTable("CustomAction")
-                && isForbiddenMsiSideEffectTable("ServiceInstall")
-                && isForbiddenMsiSideEffectTable("MoveFiles")
-                && ! isForbiddenMsiSideEffectTable("File"),
+    for (const auto table : { "CustomAction", "MsiEmbeddedUI", "MsiEmbeddedChainer",
+                              "AppSearch", "RegLocator", "Control", "ControlEvent",
+                              "ServiceInstall", "MsiServiceConfig",
+                              "MsiServiceConfigFailureActions", "MoveFile",
+                              "Permission", "PermissionEx", "MsiPatchCertificate" })
+        require(isForbiddenMsiSideEffectTable(table),
+                "dangerous MSI side-effect table mutation rejected");
+    require(! isForbiddenMsiSideEffectTable("File"),
             "dangerous MSI side-effect table policy");
+    for (const auto action : { "ForceReboot", "ScheduleReboot", "DisableRollback" })
+        require(isForbiddenMsiSequenceAction(action),
+                "dangerous MSI sequence action mutation rejected");
+    require(! isForbiddenMsiSequenceAction("InstallFiles")
+                && ! isForbiddenMsiSequenceAction("MoveFiles")
+                && ! isForbiddenMsiSequenceAction("MsiConfigureServices"),
+            "table-dependent MSI standard actions remain allowed");
+    for (const auto property : { "DISABLEROLLBACK", "TARGETDIR", "ROOTDRIVE",
+                                 "TRANSFORMS", "TRANSFORMSATSOURCE", "TRANSFORMSSECURE" })
+        require(isForbiddenMsiProperty(property),
+                "dangerous MSI control Property mutation rejected");
+    require(isForbiddenMsiProperty("targetdir")
+                && ! isForbiddenMsiProperty("ProductName"),
+            "MSI control Property comparison is case-insensitive");
 
     const std::map<std::string, std::string> directories {
         { "Contents", "INSTALLFOLDER" }, { "Resources", "Contents" },
         { "Binary", "Contents" }, { "INSTALLFOLDER", "VST3Folder" },
-        { "VST3Folder", "TARGETDIR" }, { "WindowsFolder", "TARGETDIR" },
+        { "VST3Folder", "CommonFiles64Folder" }, { "CommonFiles64Folder", "TARGETDIR" },
         { "TARGETDIR", "" }
     };
+    const std::map<std::string, std::string> safeProperties {
+        { "ProductName", "Example" }, { "Manufacturer", "Example" }
+    };
+    require(! hasMsiDirectoryPropertyOverride(safeProperties, directories),
+            "unrelated MSI properties do not override Directory identifiers");
+    auto directoryOverride = safeProperties;
+    directoryOverride["installfolder"] = "C:\\Windows";
+    require(hasMsiDirectoryPropertyOverride(directoryOverride, directories),
+            "case-insensitive MSI Directory Property override rejected");
+    require(isPredefinedMsiPathProperty("WindowsFolder")
+                && isPredefinedMsiPathProperty("sourcedir")
+                && ! isPredefinedMsiPathProperty("Contents")
+                && msiDirectoryIdentifiersAreSafe(directories, "CommonFiles64Folder"),
+            "predefined MSI path Property identifiers are classified");
+    auto engineRedirect = directories;
+    engineRedirect["WindowsFolder"] = "INSTALLFOLDER";
+    require(! msiDirectoryIdentifiersAreSafe(engineRedirect, "CommonFiles64Folder"),
+            "engine-defined WindowsFolder child escape rejected");
     require(componentDirectoriesAreInsideInstallFolder(directories, { "Resources", "Binary" }),
             "all payload components descend from INSTALLFOLDER");
     require(! componentDirectoriesAreInsideInstallFolder(directories, { "Resources", "WindowsFolder" }),
@@ -271,6 +307,10 @@ int main()
     dangling["Unused"] = "MissingParent";
     require(! componentDirectoriesAreInsideInstallFolder(dangling, { "Resources", "Binary" }),
             "dangling directory parent rejected");
+    auto extraRoot = directories;
+    extraRoot["OtherRoot"] = "";
+    require(! componentDirectoriesAreInsideInstallFolder(extraRoot, { "Resources", "Binary" }),
+            "non-TARGETDIR Directory root rejected");
 
     std::cout << "PASS: Windows updater portable policy\n";
     return 0;

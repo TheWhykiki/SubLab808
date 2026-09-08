@@ -94,6 +94,15 @@ struct MsiUpgradeRow
 };
 
 bool isForbiddenMsiSideEffectTable(std::string_view table);
+bool isForbiddenMsiSequenceAction(std::string_view action);
+bool isForbiddenMsiProperty(std::string_view property);
+bool hasMsiDirectoryPropertyOverride(
+    const std::map<std::string, std::string>& properties,
+    const std::map<std::string, std::string>& directoryParents);
+bool isPredefinedMsiPathProperty(std::string_view property);
+bool msiDirectoryIdentifiersAreSafe(
+    const std::map<std::string, std::string>& directoryParents,
+    std::string_view expectedSystemFolderAnchor);
 bool hasExactUpgradeContract(const std::vector<MsiUpgradeRow>& rows,
                              std::string_view currentUpgradeCode,
                              std::string_view otherUpgradeCode,

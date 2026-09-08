@@ -32,6 +32,61 @@
 - (void)completionDidReturn;
 @end
 
+// NSApplication's public event retrieval method treats nil as an immediate
+// poll. Preserve that behavior, and only shorten later default-mode deadlines.
+static bool boundedApplicationEventPollingEnabled = false;
+static NSUInteger applicationStartEventDefaultModeDequeueCount = 0;
+static NSUInteger applicationSettleEventDefaultModeDequeueCount = 0;
+static NSUInteger applicationStopEventDefaultModeDequeueCount = 0;
+
+static constexpr short applicationControlEventSubtype = 0x574b;
+static constexpr NSInteger applicationControlEventMagic = 0x5748594b;
+static constexpr NSInteger applicationStartEventCode = 1;
+static constexpr NSInteger applicationSettleEventCode = 2;
+static constexpr NSInteger applicationStopEventCode = 3;
+
+@interface WhyKikiPresetTestApplication : NSApplication
+@end
+
+@implementation WhyKikiPresetTestApplication
+- (NSEvent*)nextEventMatchingMask:(NSEventMask)mask
+                        untilDate:(NSDate*)expiration
+                           inMode:(NSRunLoopMode)mode
+                          dequeue:(BOOL)dequeue
+{
+    NSDate* boundedExpiration = expiration;
+    if (boundedApplicationEventPollingEnabled
+        && expiration != nil
+        && [mode isEqualToString:NSDefaultRunLoopMode])
+    {
+        auto* maximumExpiration = [NSDate dateWithTimeIntervalSinceNow:0.01];
+        if ([expiration compare:maximumExpiration] == NSOrderedDescending)
+            boundedExpiration = maximumExpiration;
+    }
+    auto* event = [super nextEventMatchingMask:mask
+                                     untilDate:boundedExpiration
+                                        inMode:mode
+                                       dequeue:dequeue];
+    if (boundedApplicationEventPollingEnabled
+        && dequeue
+        && [mode isEqualToString:NSDefaultRunLoopMode]
+        && event != nil
+        && [event type] == NSEventTypeApplicationDefined
+        && [event subtype] == applicationControlEventSubtype
+        && [event data1] == applicationControlEventMagic)
+    {
+        switch ([event data2])
+        {
+            case applicationStartEventCode: ++applicationStartEventDefaultModeDequeueCount; break;
+            case applicationSettleEventCode: ++applicationSettleEventDefaultModeDequeueCount; break;
+            case applicationStopEventCode: ++applicationStopEventDefaultModeDequeueCount; break;
+            default: break;
+        }
+    }
+    return event;
+}
+@end
+
 namespace
 {
 using CompletionHandler = void (^)(NSModalResponse);
@@ -45,6 +100,7 @@ NSUInteger applicationStartEventCount = 0;
 NSUInteger applicationSettleEventCount = 0;
 NSUInteger applicationStopEventCount = 0;
 bool applicationStartEventHandledWhileRunning = false;
+bool applicationStartEventWasCurrentEvent = false;
 bool applicationSettleEventHandledWhileRunning = false;
 bool applicationSettleEventPostedFromReadyContext = false;
 bool applicationSettleEventWasCurrentEvent = false;
@@ -57,22 +113,19 @@ bool applicationStopCallbackSucceeded = false;
 bool applicationStartEventPosted = false;
 bool applicationSettleEventPosted = false;
 bool applicationStopEventPosted = false;
-bool applicationShutdownWakeStarted = false;
-bool applicationShutdownWakeActive = false;
-bool applicationShutdownWakeStoppedBeforeStop = false;
 NSUInteger globalLateCompletionEntryCount = 0;
 char completionObservationKey;
-
-constexpr short applicationControlEventSubtype = 0x574b;
-constexpr NSInteger applicationControlEventMagic = 0x5748594b;
-constexpr NSInteger applicationStartEventCode = 1;
-constexpr NSInteger applicationSettleEventCode = 2;
-constexpr NSInteger applicationStopEventCode = 3;
 
 bool isRunnableApplicationEventContext() noexcept
 {
     return [NSThread isMainThread] && NSApp != nil && [NSApp isRunning]
         && [NSApp modalWindow] == nil;
+}
+
+bool isDefaultApplicationRunLoopMode() noexcept
+{
+    auto* mode = [[NSRunLoop currentRunLoop] currentMode];
+    return mode != nil && [mode isEqualToString:NSDefaultRunLoopMode];
 }
 
 bool postApplicationControlEvent(NSInteger code) noexcept
@@ -93,66 +146,11 @@ bool postApplicationControlEvent(NSInteger code) noexcept
                                             data2:code];
         if (event == nil)
             return false;
-        // Front insertion is asynchronous and does not itself guarantee that
-        // an in-flight nextEventMatchingMask: wait revisits the queue. The
-        // local monitor below must still observe this exact event through
-        // NSApplication's real dispatch path.
+        // Queue insertion is asynchronous. The test NSApplication's bounded
+        // outer retrieval wait makes this event visible without a nested pump.
         [NSApp postEvent:event atStart:YES];
         return true;
     }
-}
-
-bool startApplicationShutdownWake() noexcept
-{
-    if (applicationShutdownWakeStarted || applicationShutdownWakeActive
-        || applicationShutdownWakeStoppedBeforeStop)
-        return false;
-
-    @try
-    {
-        // postEvent: only queues an event. A short test-owned periodic stream
-        // supplies an AppKit-generated wake stimulus so a waiting
-        // nextEventMatchingMask: call must revisit that queue. Periodic events
-        // themselves are not the oracle.
-        [NSEvent startPeriodicEventsAfterDelay:0.0 withPeriod:0.1];
-    }
-    @catch (NSException* exception)
-    {
-        const auto* name = [[exception name] UTF8String];
-        const auto* reason = [[exception reason] UTF8String];
-        std::fprintf(stderr,
-                     "NATIVE_APP_LOOP_WAKE_START_FAILED: %s: %s\n",
-                     name != nullptr ? name : "unknown exception",
-                     reason != nullptr ? reason : "no reason");
-        std::fflush(stderr);
-        return false;
-    }
-
-    applicationShutdownWakeStarted = true;
-    applicationShutdownWakeActive = true;
-    std::fputs("NATIVE_APP_LOOP_WAKE_STARTED\n", stderr);
-    std::fflush(stderr);
-    return true;
-}
-
-void cancelApplicationShutdownWake() noexcept
-{
-    if (! applicationShutdownWakeActive)
-        return;
-    [NSEvent stopPeriodicEvents];
-    applicationShutdownWakeActive = false;
-}
-
-bool stopApplicationShutdownWakeBeforeStop() noexcept
-{
-    if (! applicationShutdownWakeActive)
-        return false;
-    [NSEvent stopPeriodicEvents];
-    applicationShutdownWakeActive = false;
-    applicationShutdownWakeStoppedBeforeStop = true;
-    std::fputs("NATIVE_APP_LOOP_WAKE_STOPPED\n", stderr);
-    std::fflush(stderr);
-    return true;
 }
 
 bool resolvedExactlyOnce(const WhyKikiNativePanelSessionObservation* state)
@@ -416,6 +414,18 @@ bool NativeFilePanel::isAlive() const
         return resolvePanel(panel, observation) != nil;
     }
 }
+void NativeFilePanel::installTestApplication()
+{
+    @autoreleasepool
+    {
+        if (![NSThread isMainThread])
+            throw std::runtime_error("NATIVE_PANEL_SETUP: test application requires the main thread");
+        if (NSApp == nil)
+            [WhyKikiPresetTestApplication sharedApplication];
+        if ([NSApp class] != [WhyKikiPresetTestApplication class])
+            throw std::runtime_error("NATIVE_PANEL_SETUP: test application was not installed before JUCE");
+    }
+}
 void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallback)
 {
     // ScopedJuceInitialiser_GUI in a console test does not provide an active
@@ -427,7 +437,8 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
             throw std::runtime_error("NATIVE_PANEL_SETUP: native chooser tests require the main thread");
         if (stopCallback == nullptr)
             throw std::runtime_error("NATIVE_PANEL_SETUP: application stop callback is missing");
-        [NSApplication sharedApplication];
+        if ([NSApp class] != [WhyKikiPresetTestApplication class])
+            throw std::runtime_error("NATIVE_PANEL_SETUP: bounded test application is not installed");
         if ([NSApp isRunning])
             throw std::runtime_error("NATIVE_PANEL_SETUP: event monitor must be installed before the app loop");
         if (applicationEventMonitor != nil)
@@ -473,6 +484,7 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
         applicationSettleEventCount = 0;
         applicationStopEventCount = 0;
         applicationStartEventHandledWhileRunning = false;
+        applicationStartEventWasCurrentEvent = false;
         applicationSettleEventHandledWhileRunning = false;
         applicationSettleEventPostedFromReadyContext = false;
         applicationSettleEventWasCurrentEvent = false;
@@ -485,9 +497,9 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
         applicationStartEventPosted = false;
         applicationSettleEventPosted = false;
         applicationStopEventPosted = false;
-        applicationShutdownWakeStarted = false;
-        applicationShutdownWakeActive = false;
-        applicationShutdownWakeStoppedBeforeStop = false;
+        applicationStartEventDefaultModeDequeueCount = 0;
+        applicationSettleEventDefaultModeDequeueCount = 0;
+        applicationStopEventDefaultModeDequeueCount = 0;
         applicationEventMonitor = [NSEvent
             addLocalMonitorForEventsMatchingMask:NSEventMaskApplicationDefined
                                        handler:^NSEvent* (NSEvent* event)
@@ -502,10 +514,14 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
                                            {
                                                ++applicationStartEventCount;
                                                applicationStartEventHandledWhileRunning = running;
+                                               applicationStartEventWasCurrentEvent =
+                                                   [NSApp currentEvent] == event;
                                                std::fprintf(stderr,
-                                                            "NATIVE_APP_LOOP_START_HANDLED count=%lu running=%d\n",
+                                                            "NATIVE_APP_LOOP_START_HANDLED count=%lu running=%d currentEvent=%d defaultDequeues=%lu\n",
                                                             static_cast<unsigned long>(applicationStartEventCount),
-                                                            running ? 1 : 0);
+                                                            running ? 1 : 0,
+                                                            applicationStartEventWasCurrentEvent ? 1 : 0,
+                                                            static_cast<unsigned long>(applicationStartEventDefaultModeDequeueCount));
                                                std::fflush(stderr);
                                                // START is a private dispatch barrier, not app input.
                                                return nil;
@@ -519,13 +535,13 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
                                                applicationSettleEventHandledWithoutModalWindow =
                                                    [NSApp modalWindow] == nil;
                                                std::fprintf(stderr,
-                                                            "NATIVE_APP_LOOP_SETTLE_HANDLED count=%lu running=%d postedFromReady=%d currentEvent=%d modalWindow=%d wakeActive=%d\n",
+                                                            "NATIVE_APP_LOOP_SETTLE_HANDLED count=%lu running=%d postedFromReady=%d currentEvent=%d modalWindow=%d defaultDequeues=%lu\n",
                                                             static_cast<unsigned long>(applicationSettleEventCount),
                                                             running ? 1 : 0,
                                                             applicationSettleEventPostedFromReadyContext ? 1 : 0,
                                                             applicationSettleEventWasCurrentEvent ? 1 : 0,
                                                             applicationSettleEventHandledWithoutModalWindow ? 0 : 1,
-                                                            applicationShutdownWakeActive ? 1 : 0);
+                                                            static_cast<unsigned long>(applicationSettleEventDefaultModeDequeueCount));
                                                std::fflush(stderr);
                                                if (! NativeFilePanel::applicationSettleEventWasHandled())
                                                {
@@ -533,8 +549,9 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
                                                    std::fflush(stderr);
                                                    std::terminate();
                                                }
-                                               // postEvent: only enqueues. STOP cannot be retrieved
-                                               // until this distinct SETTLE monitor call returns.
+                                               // STOP is only queued here. This SETTLE sendEvent:
+                                               // invocation must return before the outer loop can
+                                               // retrieve and dispatch STOP separately.
                                                if (! NativeFilePanel::postApplicationStopEvent())
                                                {
                                                    std::fputs("NATIVE_APP_LOOP_STOP_POST_FAILED\n", stderr);
@@ -553,35 +570,27 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
                                                    [NSApp currentEvent] == event;
                                                applicationStopEventHandledWithoutModalWindow =
                                                    [NSApp modalWindow] == nil;
-                                               const bool settleWasValid =
-                                                   NativeFilePanel::applicationSettleEventWasHandled();
-                                               const bool wakeWasStopped =
-                                                   stopApplicationShutdownWakeBeforeStop();
                                                applicationStopCallbackSucceeded = applicationStopEventCount == 1
-                                                   && settleWasValid
+                                                   && NativeFilePanel::applicationSettleEventWasHandled()
                                                    && running
                                                    && applicationStopEventPostedFromReadyContext
                                                    && applicationStopEventWasCurrentEvent
                                                    && applicationStopEventHandledWithoutModalWindow
-                                                   && wakeWasStopped
+                                                   && applicationStopEventDefaultModeDequeueCount == 1
                                                    && applicationStopCallback != nullptr
                                                    && applicationStopCallback();
                                                std::fprintf(stderr,
-                                                            "NATIVE_APP_LOOP_STOP_HANDLED count=%lu running=%d postedFromReady=%d currentEvent=%d modalWindow=%d wakeStopped=%d callback=%d\n",
+                                                            "NATIVE_APP_LOOP_STOP_HANDLED count=%lu running=%d postedFromReady=%d currentEvent=%d modalWindow=%d defaultDequeues=%lu callback=%d\n",
                                                             static_cast<unsigned long>(applicationStopEventCount),
                                                             running ? 1 : 0,
                                                             applicationStopEventPostedFromReadyContext ? 1 : 0,
                                                             applicationStopEventWasCurrentEvent ? 1 : 0,
                                                             applicationStopEventHandledWithoutModalWindow ? 0 : 1,
-                                                            wakeWasStopped ? 1 : 0,
+                                                            static_cast<unsigned long>(applicationStopEventDefaultModeDequeueCount),
                                                             applicationStopCallbackSucceeded ? 1 : 0);
                                                std::fflush(stderr);
-                                               // STOP is private control input and has already
-                                               // provided the required real event-handler boundary.
-                                               // Do not send it through NSApplication after stop:.
                                                return nil;
                                            }
-                                           std::fflush(stderr);
                                            return event;
                                        }];
         if (applicationEventMonitor == nil)
@@ -589,6 +598,7 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
             applicationStopCallback = nullptr;
             throw std::runtime_error("NATIVE_PANEL_SETUP: cannot install application event monitor");
         }
+        boundedApplicationEventPollingEnabled = true;
     }
 }
 bool NativeFilePanel::applicationIsRunning() noexcept
@@ -615,14 +625,23 @@ bool NativeFilePanel::applicationStartEventWasHandled() noexcept
     {
         return [NSThread isMainThread] && applicationStartEventPosted
             && applicationStartEventCount == 1
-            && applicationStartEventHandledWhileRunning;
+            && applicationStartEventHandledWhileRunning
+            && applicationStartEventWasCurrentEvent
+            && applicationStartEventDefaultModeDequeueCount == 1;
     }
 }
 bool NativeFilePanel::applicationIsReadyForSettleEvent() noexcept
 {
     @autoreleasepool
     {
-        return isRunnableApplicationEventContext();
+        return applicationStartEventWasHandled()
+            && boundedApplicationEventPollingEnabled
+            && ! applicationSettleEventPosted
+            && applicationSettleEventCount == 0
+            && ! applicationStopEventPosted
+            && applicationStopEventCount == 0
+            && isRunnableApplicationEventContext()
+            && isDefaultApplicationRunLoopMode();
     }
 }
 bool NativeFilePanel::postApplicationSettleEvent() noexcept
@@ -630,18 +649,9 @@ bool NativeFilePanel::postApplicationSettleEvent() noexcept
     @autoreleasepool
     {
         const auto postedFromReadyContext = applicationIsReadyForSettleEvent();
-        if (! postedFromReadyContext || applicationSettleEventPosted
-            || applicationSettleEventCount != 0 || applicationStopEventPosted
-            || applicationStopEventCount != 0)
-            return false;
-        if (! startApplicationShutdownWake())
+        if (! postedFromReadyContext)
             return false;
         applicationSettleEventPosted = postApplicationControlEvent(applicationSettleEventCode);
-        if (! applicationSettleEventPosted)
-        {
-            cancelApplicationShutdownWake();
-            return false;
-        }
         applicationSettleEventPostedFromReadyContext =
             postedFromReadyContext && applicationSettleEventPosted;
         return applicationSettleEventPosted;
@@ -657,7 +667,7 @@ bool NativeFilePanel::applicationSettleEventWasHandled() noexcept
             && applicationSettleEventPostedFromReadyContext
             && applicationSettleEventWasCurrentEvent
             && applicationSettleEventHandledWithoutModalWindow
-            && applicationShutdownWakeStarted;
+            && applicationSettleEventDefaultModeDequeueCount == 1;
     }
 }
 bool NativeFilePanel::applicationIsReadyForStopEvent() noexcept
@@ -665,7 +675,8 @@ bool NativeFilePanel::applicationIsReadyForStopEvent() noexcept
     @autoreleasepool
     {
         return applicationSettleEventWasHandled()
-            && applicationShutdownWakeActive
+            && ! applicationStopEventPosted
+            && applicationStopEventCount == 0
             && isRunnableApplicationEventContext();
     }
 }
@@ -674,8 +685,7 @@ bool NativeFilePanel::postApplicationStopEvent() noexcept
     @autoreleasepool
     {
         const auto postedFromReadyContext = applicationIsReadyForStopEvent();
-        if (! postedFromReadyContext || applicationStopEventPosted
-            || applicationStopEventCount != 0)
+        if (! postedFromReadyContext || applicationStopCallback == nullptr)
             return false;
         applicationStopEventPosted = postApplicationControlEvent(applicationStopEventCode);
         applicationStopEventPostedFromReadyContext =
@@ -695,13 +705,12 @@ bool NativeFilePanel::applicationStopEventWasHandled() noexcept
 {
     @autoreleasepool
     {
-        return [NSThread isMainThread] && applicationStopEventPosted
+        return applicationStopEventWasPosted()
             && applicationStopEventCount == 1
             && applicationStopEventHandledWhileRunning
-            && applicationStopEventPostedFromReadyContext
             && applicationStopEventWasCurrentEvent
             && applicationStopEventHandledWithoutModalWindow
-            && applicationShutdownWakeStoppedBeforeStop
+            && applicationStopEventDefaultModeDequeueCount == 1
             && applicationStopCallbackSucceeded;
     }
 }
@@ -709,13 +718,14 @@ void NativeFilePanel::finishTestApplication() noexcept
 {
     @autoreleasepool
     {
-        if (![NSThread isMainThread] || applicationEventMonitor == nil)
+        if (![NSThread isMainThread])
             return;
-        // STOP normally retires the test-owned stream before JUCE starts its
-        // own periodic wake. This also covers an incomplete handshake, and
-        // retires JUCE's wake after NSApplication::run has returned.
+        boundedApplicationEventPollingEnabled = false;
+        if (applicationEventMonitor == nil)
+            return;
+        // JUCE's macOS stop path uses periodic events to release
+        // NSApplication::run. Retire that wake before framework teardown.
         [NSEvent stopPeriodicEvents];
-        applicationShutdownWakeActive = false;
         [NSEvent removeMonitor:applicationEventMonitor];
         applicationEventMonitor = nil;
         applicationStopCallback = nullptr;

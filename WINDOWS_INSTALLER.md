@@ -10,8 +10,8 @@ verwendet.
 
 | Aufruf | VST3-Payload | MSI-Plattform | Ziel |
 | --- | --- | --- | --- |
-| `-Architecture x64` | `Contents\x86_64-win` | `x64` | `CommonFiles6432Folder\VST3\<Product>.vst3` |
-| `-Architecture arm64ec` | `Contents\arm64ec-win` | `arm64` | `CommonFiles6432Folder\VST3\<Product>.vst3` |
+| `-Architecture x64` | `Contents\x86_64-win` | `x64` | `CommonFiles64Folder\VST3\<Product>.vst3` |
+| `-Architecture arm64ec` | `Contents\arm64ec-win` | `arm64` | `CommonFiles64Folder\VST3\<Product>.vst3` |
 
 ARM64EC ist die Windows-on-Arm-Ausprägung des VST3-Plug-ins. Windows Installer
 kennt dafür keine eigene ARM64EC-Plattform; das MSI ist daher ein Arm64-Paket,
@@ -202,11 +202,24 @@ Ein erfolgreicher Lauf führt vor der Ausgabe unter anderem diese Prüfungen aus
    `Directory`-Graph muss genau einen `TARGETDIR`-Wurzelpfad besitzen und frei von
    Zyklen und verwaisten Eltern sein. Jede 64-Bit-Komponente muss unter
    `INSTALLFOLDER` liegen und jeder `File`-Eintrag auf eine bekannte Komponente
-   zeigen. Side-Effect-Tabellen werden vollständig abgelehnt; dazu gehören unter
-   anderem `CustomAction`, `Binary`, Service-, Registry-, `RemoveFile`-,
-   `MoveFiles`-, `DuplicateFile`-, `Shortcut`- und Permission-Tabellen. In allen
+   zeigen. Im fertigen x64/Arm64-MSI muss WiX' Source-Alias
+   `CommonFiles6432Folder` dabei zu `CommonFiles64Folder` aufgelöst sein. Keine
+   `Property` darf `TARGETDIR`, `ROOTDRIVE` oder einen beliebigen
+   `Directory`-Bezeichner überschreiben; auch vordefinierte pfadwertige
+   Installer-Properties dürfen nicht als Payload-Unterverzeichnis wiederverwendet
+   werden. Side-Effect- und Umleitungs-Tabellen werden vollständig abgelehnt; dazu gehören unter
+   anderem `CustomAction`, `Binary`, `MsiEmbeddedUI`, `MsiEmbeddedChainer`,
+   `AppSearch` samt Locator-Tabellen, `Control`/`ControlEvent`, Service-
+   einschließlich `MsiServiceConfig*`-, Registry-, `RemoveFile`-,
+   `MoveFile`-, `DuplicateFile`-, `Shortcut`-, Permission- und
+   `MsiPatchCertificate`-Tabellen. In allen
    vorhandenen Install-, Admin- und Advertise-Sequenzen sind `ForceReboot`,
-   `ScheduleReboot` und `DisableRollback` verboten.
+   `ScheduleReboot` und `DisableRollback` verboten. Die tabellenabhängigen
+   Standardaktionen `MoveFiles` und `MsiConfigureServices` bleiben ohne ihre
+   jeweils strikt verbotenen Datentabellen harmlose No-ops. `DISABLEROLLBACK`
+   und die Transform-Properties `TRANSFORMS*` werden abgelehnt; `_Storages` muss
+   leer sein, damit kein eingebetteter Transform den geprüften Tabellenvertrag
+   erst zur Installationszeit verändern kann.
    `ProductName`, `Manufacturer`, `ProductLanguage`,
    `MSIDEPLOYMENTCOMPLIANT=1`, die normalisierte Menge der beiden LaunchConditions
    und `SecureCustomProperties` als exakt die drei Upgrade-Erkennungsvariablen

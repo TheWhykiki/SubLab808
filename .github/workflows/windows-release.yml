@@ -1449,8 +1449,12 @@ jobs:
           test "$public_verified" = true
           staged_verified=true
           printf 'staged_verified=true\n' >> "$GITHUB_OUTPUT"
-          printf 'Immutable prerelease ID %s is public with eight verified assets; Latest is unchanged.\n' \
-            "$created_release_id" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Immutable prerelease ID %s is public with eight verified assets; Latest is unchanged.\n\nPhysical receipt binding: runId=%s runAttempt=%s releaseId=%s tag=%s commit=%s assetManifestSha256=%s\n\nInstallable artifact digests:\n' \
+            "$created_release_id" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            "$created_release_id" "$tag" "$tag_commit" "$asset_manifest_sha256" \
+            >> "$GITHUB_STEP_SUMMARY"
+          jq -r '.assets[] | select(.name | test("[.](msi|pkg|zip)$")) | "- `\(.name)`: `\(.digest)`"' \
+            "$candidate_metadata" | LC_ALL=C sort >> "$GITHUB_STEP_SUMMARY"
           rm -f -- "$candidate_metadata"
 
   accept-windows-upgrade:
@@ -1595,9 +1599,142 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  finalize-release:
-    name: Promote accepted immutable prerelease or leave it quarantined
+  physical-daw-acceptance:
+    name: Physical Cubase/Reaper receipt for immutable release ${{ needs.stage-release.outputs.release_id }}
     needs: [authorize_windows_release, stage-release, accept-windows-upgrade]
+    if: >-
+      needs.authorize_windows_release.result == 'success' &&
+      needs.stage-release.result == 'success' &&
+      needs.stage-release.outputs.staged_verified == 'true' &&
+      needs.accept-windows-upgrade.result == 'success' &&
+      inputs.confirm_release == true &&
+      github.repository == 'TheWhykiki/SubLab808' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: physical-daw-release
+      url: https://github.com/${{ github.repository }}/releases/tag/${{ inputs.tag }}
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      receipt_sha256: ${{ steps.physical_receipt.outputs.receipt_sha256 }}
+      receipt_base64: ${{ steps.physical_receipt.outputs.receipt_base64 }}
+      reviewer: ${{ steps.physical_receipt.outputs.reviewer }}
+      reviewer_id: ${{ steps.physical_receipt.outputs.reviewer_id }}
+    env:
+      PRODUCT: SubLab808
+      WK_PHYSICAL_ENVIRONMENT: physical-daw-release
+      WK_INPUT_TAG: ${{ inputs.tag }}
+      WK_WORKFLOW_SHA: ${{ github.sha }}
+      WK_CANDIDATE_RELEASE_ID: ${{ needs.stage-release.outputs.release_id }}
+      WK_CANDIDATE_COMMIT: ${{ needs.stage-release.outputs.candidate_commit }}
+      WK_ASSET_MANIFEST_SHA256: ${{ needs.stage-release.outputs.asset_manifest_sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Validate protected-environment review and exact physical DAW receipt
+        id: physical_receipt
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          [[ "$WK_CANDIDATE_RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$WK_CANDIDATE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$WK_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$WK_ASSET_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          gate_directory="$(mktemp -d "$RUNNER_TEMP/whykiki-physical-daw.XXXXXX")"
+          cleanup_gate() {
+            status=$?
+            trap - EXIT
+            case "$gate_directory" in
+              "$RUNNER_TEMP"/whykiki-physical-daw.*) rm -rf -- "$gate_directory" ;;
+              *) status=1 ;;
+            esac
+            exit "$status"
+          }
+          trap cleanup_gate EXIT
+          gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/environments/$WK_PHYSICAL_ENVIRONMENT" \
+            > "$gate_directory/environment.json"
+          gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/approvals" \
+            > "$gate_directory/reviews.json"
+          gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            > "$gate_directory/workflow-run.json"
+          default_branch_uri="$(jq -er \
+            '.repository.default_branch | select(type == "string" and length > 0 and length <= 255) | @uri' \
+            "$gate_directory/workflow-run.json")"
+          [[ -n "$default_branch_uri" ]]
+          gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/branches/$default_branch_uri" \
+            > "$gate_directory/branch.json"
+          observed_branch_commit="$(jq -er \
+            '.commit.sha | select(type == "string" and test("^[0-9a-f]{40}$"))' \
+            "$gate_directory/branch.json")"
+          gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/compare/$WK_CANDIDATE_COMMIT...$observed_branch_commit" \
+            --jq '{status,base_commit:{sha:.base_commit.sha},merge_base_commit:{sha:.merge_base_commit.sha}}' \
+            > "$gate_directory/candidate-compare.json"
+          gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/compare/$WK_WORKFLOW_SHA...$observed_branch_commit" \
+            --jq '{status,base_commit:{sha:.base_commit.sha},merge_base_commit:{sha:.merge_base_commit.sha}}' \
+            > "$gate_directory/workflow-compare.json"
+          gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/$WK_CANDIDATE_RELEASE_ID" \
+            > "$gate_directory/release.json"
+          receipt_path="$RUNNER_TEMP/physical-daw-release-receipt.json"
+          receipt_sha256="$(python3 -B scripts/validate-physical-daw-release-receipt.py \
+            --environment-json "$gate_directory/environment.json" \
+            --reviews-json "$gate_directory/reviews.json" \
+            --workflow-run-json "$gate_directory/workflow-run.json" \
+            --branch-json "$gate_directory/branch.json" \
+            --candidate-compare-json "$gate_directory/candidate-compare.json" \
+            --workflow-compare-json "$gate_directory/workflow-compare.json" \
+            --release-json "$gate_directory/release.json" \
+            --repository "$GITHUB_REPOSITORY" --product "$PRODUCT" \
+            --environment "$WK_PHYSICAL_ENVIRONMENT" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --workflow-sha "$WK_WORKFLOW_SHA" \
+            --release-id "$WK_CANDIDATE_RELEASE_ID" --tag "$WK_INPUT_TAG" \
+            --commit "$WK_CANDIDATE_COMMIT" \
+            --asset-manifest-sha256 "$WK_ASSET_MANIFEST_SHA256" \
+            --output "$receipt_path")"
+          [[ "$receipt_sha256" =~ ^[0-9a-f]{64}$ ]]
+          reviewer="$(jq -r '.review.user // empty' "$receipt_path")"
+          reviewer_id="$(jq -r '.review.userId // empty' "$receipt_path")"
+          [[ "$reviewer" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]]
+          [[ "$reviewer_id" =~ ^[1-9][0-9]*$ ]]
+          receipt_base64="$(base64 "$receipt_path" | tr -d '\n')"
+          [[ -n "$receipt_base64" && ${#receipt_base64} -le 32768 ]]
+          [[ "$receipt_base64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
+          printf 'receipt_sha256=%s\nreceipt_base64=%s\nreviewer=%s\nreviewer_id=%s\n' \
+            "$receipt_sha256" "$receipt_base64" "$reviewer" "$reviewer_id" \
+            >> "$GITHUB_OUTPUT"
+          printf 'Protected physical DAW review by @%s (GitHub user ID %s) binds run %s attempt %s, immutable release ID %s, tag commit %s and asset manifest %s. Receipt SHA-256: %s.\n' \
+            "$reviewer" "$reviewer_id" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            "$WK_CANDIDATE_RELEASE_ID" "$WK_CANDIDATE_COMMIT" \
+            "$WK_ASSET_MANIFEST_SHA256" "$receipt_sha256" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload validated physical DAW receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: SubLab808-PHYSICAL-DAW-ACCEPTED-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/physical-daw-release-receipt.json
+          if-no-files-found: error
+          retention-days: 90
+
+  finalize-release:
+    name: Promote automatically and physically accepted immutable prerelease or leave it quarantined
+    needs: [authorize_windows_release, stage-release, accept-windows-upgrade, physical-daw-acceptance]
     if: >-
       always() &&
       needs.authorize_windows_release.result == 'success' &&
@@ -1616,6 +1753,11 @@ jobs:
       WK_INITIAL_RELEASE_STATE_SHA256: ${{ needs.authorize_windows_release.outputs.release_state_sha256 }}
       WK_STAGE_RESULT: ${{ needs.stage-release.result }}
       WK_ACCEPTANCE_RESULT: ${{ needs.accept-windows-upgrade.result }}
+      WK_PHYSICAL_ACCEPTANCE_RESULT: ${{ needs.physical-daw-acceptance.result }}
+      WK_PHYSICAL_RECEIPT_SHA256: ${{ needs.physical-daw-acceptance.outputs.receipt_sha256 }}
+      WK_PHYSICAL_RECEIPT_BASE64: ${{ needs.physical-daw-acceptance.outputs.receipt_base64 }}
+      WK_PHYSICAL_REVIEWER: ${{ needs.physical-daw-acceptance.outputs.reviewer }}
+      WK_PHYSICAL_REVIEWER_ID: ${{ needs.physical-daw-acceptance.outputs.reviewer_id }}
       WK_RELEASE_ID: ${{ needs.stage-release.outputs.release_id }}
       WK_CANDIDATE_COMMIT: ${{ needs.stage-release.outputs.candidate_commit }}
       WK_ASSET_MANIFEST_SHA256: ${{ needs.stage-release.outputs.asset_manifest_sha256 }}
@@ -1748,14 +1890,95 @@ jobs:
             quarantine 'release-state snapshot digest changed before promotion'
 
           if [[ "$WK_STAGE_RESULT" != success || "$WK_STAGED_VERIFIED" != true ||
-                "$WK_ACCEPTANCE_RESULT" != success ]]; then
-            quarantine "stage=$WK_STAGE_RESULT stagedVerified=$WK_STAGED_VERIFIED windowsGates=$WK_ACCEPTANCE_RESULT"
+                "$WK_ACCEPTANCE_RESULT" != success ||
+                "$WK_PHYSICAL_ACCEPTANCE_RESULT" != success ]]; then
+            quarantine "stage=$WK_STAGE_RESULT stagedVerified=$WK_STAGED_VERIFIED windowsGates=$WK_ACCEPTANCE_RESULT physicalDawGate=$WK_PHYSICAL_ACCEPTANCE_RESULT"
           fi
+          [[ "$WK_PHYSICAL_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]] || \
+            quarantine 'physical DAW receipt SHA-256 is malformed'
+          [[ "$WK_PHYSICAL_REVIEWER" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]] || \
+            quarantine 'physical DAW reviewer identity is malformed'
+          [[ "$WK_PHYSICAL_REVIEWER_ID" =~ ^[1-9][0-9]*$ ]] || \
+            quarantine 'physical DAW reviewer ID is malformed'
+          [[ -n "$WK_PHYSICAL_RECEIPT_BASE64" && ${#WK_PHYSICAL_RECEIPT_BASE64} -le 32768 ]] || \
+            quarantine 'physical DAW receipt encoding is missing or oversized'
+          physical_receipt="$(mktemp "$RUNNER_TEMP/whykiki-physical-receipt.XXXXXX")"
+          if ! printf '%s' "$WK_PHYSICAL_RECEIPT_BASE64" | base64 --decode > "$physical_receipt"; then
+            quarantine 'physical DAW receipt encoding is invalid'
+          fi
+          [[ "$(sha256sum "$physical_receipt" | awk '{print $1}')" == "$WK_PHYSICAL_RECEIPT_SHA256" ]] || \
+            quarantine 'physical DAW receipt digest changed after environment approval'
+          jq -e --arg environment 'physical-daw-release' \
+            --arg reviewer "$WK_PHYSICAL_REVIEWER" --arg repository "$GITHUB_REPOSITORY" \
+            --arg defaultBranch "$GITHUB_REF_NAME" \
+            --arg workflowSha "$GITHUB_SHA" --argjson reviewerId "$WK_PHYSICAL_REVIEWER_ID" \
+            --arg product "$PRODUCT" --arg tag "$tag" --arg commit "$WK_CANDIDATE_COMMIT" \
+            --arg manifest "$WK_ASSET_MANIFEST_SHA256" --argjson run "$GITHUB_RUN_ID" \
+            --argjson attempt "$GITHUB_RUN_ATTEMPT" --argjson release "$release_id" '
+              type == "object" and
+              (keys == ["branchProtection", "environment", "environmentId", "receipt", "review", "schemaVersion"]) and
+              .schemaVersion == 1 and .environment == $environment and
+              (.environmentId | type == "number" and . > 0 and floor == .) and
+              (.branchProtection | type == "object" and
+                (keys == ["candidateAncestor", "name", "observedCommit", "protected", "workflowAncestor"]) and
+                .name == $defaultBranch and .protected == true and
+                .candidateAncestor == $commit and .workflowAncestor == $workflowSha and
+                (.observedCommit | type == "string" and test("^[0-9a-f]{40}$"))) and
+              .review == {state:"approved",user:$reviewer,userId:$reviewerId} and
+              .receipt.repository == $repository and .receipt.product == $product and
+              .receipt.runId == $run and .receipt.runAttempt == $attempt and
+              .receipt.releaseId == $release and .receipt.tag == $tag and
+              .receipt.commit == $commit and .receipt.assetManifestSha256 == $manifest
+            ' "$physical_receipt" >/dev/null || quarantine 'physical DAW receipt identity is not exact'
+
+          current_repository="$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY")" || \
+            quarantine 'repository metadata cannot be re-read before promotion'
+          current_default_branch="$(jq -er --arg repository "$GITHUB_REPOSITORY" \
+            --arg branch "$GITHUB_REF_NAME" '
+              select(type == "object" and .full_name == $repository and
+                .default_branch == $branch) | .default_branch
+            ' <<< "$current_repository")" || \
+            quarantine 'repository default branch changed before promotion'
+          current_default_branch_uri="$(jq -rn --arg value "$current_default_branch" \
+            '$value | select(length > 0 and length <= 255) | @uri')" || \
+            quarantine 'repository default branch is malformed before promotion'
+          current_branch="$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/branches/$current_default_branch_uri")" || \
+            quarantine 'repository default branch cannot be re-read before promotion'
+          current_tip="$(jq -er --arg branch "$current_default_branch" '
+              select(type == "object" and .name == $branch and .protected == true) |
+              .commit.sha | select(type == "string" and test("^[0-9a-f]{40}$"))
+            ' <<< "$current_branch")" || \
+            quarantine 'repository default branch is not protected before promotion'
+
+          verify_current_ancestor() {
+            local ancestor label comparison
+            ancestor="$1"
+            label="$2"
+            comparison="$(mktemp "$RUNNER_TEMP/whykiki-final-compare.XXXXXX")"
+            gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/compare/$ancestor...$current_tip" \
+              --jq '{status,base_commit:{sha:.base_commit.sha},merge_base_commit:{sha:.merge_base_commit.sha}}' \
+              > "$comparison" || quarantine "$label ancestry cannot be re-read before promotion"
+            jq -e --arg ancestor "$ancestor" '
+                type == "object" and
+                (keys == ["base_commit", "merge_base_commit", "status"]) and
+                (.status == "ahead" or .status == "identical") and
+                .base_commit == {sha:$ancestor} and
+                .merge_base_commit == {sha:$ancestor}
+              ' "$comparison" >/dev/null || \
+              quarantine "$label is no longer an ancestor of the protected default branch"
+            rm -f -- "$comparison"
+          }
+          verify_current_ancestor "$WK_CANDIDATE_COMMIT" 'candidate commit'
+          verify_current_ancestor "$GITHUB_SHA" 'workflow commit'
 
           promotion_attempted=true
-          stable_body="$(printf '%s\n\n<!-- %s -->' \
-            'Signed Windows x64 and native ARM64EC installers plus the signed, notarized universal macOS VST3 package and archive. Both native Windows transition gates passed.' \
-            "$marker")"
+          stable_body="$(printf '%s\n\n%s\n\n<!-- whykiki-physical-daw-receipt-v1:%s -->\n<!-- %s -->' \
+            'Signed Windows x64 and native ARM64EC installers plus the signed, notarized universal macOS VST3 package and archive. Both native Windows transition gates and the protected physical Cubase/Reaper gate passed.' \
+            "Physical DAW receipt: reviewer @$WK_PHYSICAL_REVIEWER (GitHub user ID $WK_PHYSICAL_REVIEWER_ID), workflow run $GITHUB_RUN_ID attempt $GITHUB_RUN_ATTEMPT, SHA-256 $WK_PHYSICAL_RECEIPT_SHA256." \
+            "$WK_PHYSICAL_RECEIPT_BASE64" "$marker")"
           promotion_request_succeeded=false
           if gh api --method PATCH -H 'X-GitHub-Api-Version: 2026-03-10' \
                "repos/$GITHUB_REPOSITORY/releases/$release_id" \
@@ -1819,5 +2042,5 @@ jobs:
             fail_after_promotion 'post-promotion baseline/history snapshot is not byte-identical to authorization'
           [[ "$(printf '%s' "$final_state" | sha256sum | awk '{print $1}')" == "$WK_INITIAL_RELEASE_STATE_SHA256" ]] || \
             fail_after_promotion 'post-promotion release-state digest is not byte-identical to authorization'
-          printf 'Release `%s` (ID `%s`) is the immutable stable Latest release after both native Windows gates passed.\n' \
+          printf 'Release `%s` (ID `%s`) is the immutable stable Latest release after native Windows and protected physical Cubase/Reaper gates passed.\n' \
             "$tag" "$release_id" >> "$GITHUB_STEP_SUMMARY"

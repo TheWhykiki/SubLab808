@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import datetime as dt
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -72,6 +73,10 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "windows_release_validator", "validate-windows-release-assets.py"
         )
         cls.macos_validator = load_module("macos_release_assets", "macos-release-assets.py")
+        cls.physical_receipt = load_module(
+            "physical_daw_release_receipt",
+            "validate-physical-daw-release-receipt.py",
+        )
 
     def test_dispatch_is_confirmed_default_branch_and_existing_tag_only(self) -> None:
         self.assertIn("workflow_dispatch:", self.release)
@@ -189,7 +194,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
         )
         self.assertEqual(self.release.count("$defaultBranch = $env:WK_DEFAULT_BRANCH"), 1)
         self.assertEqual(self.release.count('default_branch="$WK_DEFAULT_BRANCH"'), 3)
-        allowed_prefixes = ("run-name:", "ref:", "WK_INPUT_TAG:")
+        allowed_prefixes = ("run-name:", "ref:", "url:", "WK_INPUT_TAG:")
         unsafe_lines = [
             line
             for line in self.release.splitlines()
@@ -482,7 +487,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
 
     def test_native_transition_gate_binds_public_n_to_exact_candidate(self) -> None:
         start = self.release.index("  accept-windows-upgrade:")
-        end = self.release.index("\n  finalize-release:", start)
+        end = self.release.index("\n  physical-daw-acceptance:", start)
         acceptance = self.release[start:end]
         for token in (
             "runner: windows-2022",
@@ -628,8 +633,13 @@ class WindowsReleaseContractTests(unittest.TestCase):
         finalizer = self.release[start:]
         for token in (
             "always()",
-            "needs: [authorize_windows_release, stage-release, accept-windows-upgrade]",
+            "needs: [authorize_windows_release, stage-release, accept-windows-upgrade, physical-daw-acceptance]",
             "WK_ACCEPTANCE_RESULT: ${{ needs.accept-windows-upgrade.result }}",
+            "WK_PHYSICAL_ACCEPTANCE_RESULT: ${{ needs.physical-daw-acceptance.result }}",
+            "WK_PHYSICAL_RECEIPT_SHA256: ${{ needs.physical-daw-acceptance.outputs.receipt_sha256 }}",
+            "WK_PHYSICAL_RECEIPT_BASE64: ${{ needs.physical-daw-acceptance.outputs.receipt_base64 }}",
+            "physicalDawGate=$WK_PHYSICAL_ACCEPTANCE_RESULT",
+            "whykiki-physical-daw-receipt-v1",
             "WK_ASSET_MANIFEST_SHA256",
             "fail_unknown()",
             "quarantine()",
@@ -659,6 +669,315 @@ class WindowsReleaseContractTests(unittest.TestCase):
         self.assertLess(quarantine, unknown)
         self.assertLess(unknown, post_state)
         self.assertNotIn("--method DELETE", finalizer)
+
+    def test_physical_daw_gate_is_protected_exact_and_fail_closed(self) -> None:
+        start = self.release.index("  physical-daw-acceptance:")
+        end = self.release.index("\n  finalize-release:", start)
+        gate = self.release[start:end]
+        for token in (
+            "needs: [authorize_windows_release, stage-release, accept-windows-upgrade]",
+            "needs.accept-windows-upgrade.result == 'success'",
+            "name: physical-daw-release",
+            "actions: read",
+            "contents: read",
+            "validate-physical-daw-release-receipt.py",
+            '"repos/$GITHUB_REPOSITORY/environments/$WK_PHYSICAL_ENVIRONMENT"',
+            '"repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/approvals"',
+            '"repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"',
+            '"repos/$GITHUB_REPOSITORY/branches/$default_branch_uri"',
+            '"repos/$GITHUB_REPOSITORY/compare/$WK_CANDIDATE_COMMIT...$observed_branch_commit"',
+            '"repos/$GITHUB_REPOSITORY/compare/$WK_WORKFLOW_SHA...$observed_branch_commit"',
+            '"repos/$GITHUB_REPOSITORY/releases/$WK_CANDIDATE_RELEASE_ID"',
+            "--branch-json \"$gate_directory/branch.json\"",
+            "--candidate-compare-json \"$gate_directory/candidate-compare.json\"",
+            "--workflow-compare-json \"$gate_directory/workflow-compare.json\"",
+            "--run-attempt \"$GITHUB_RUN_ATTEMPT\"",
+            "--asset-manifest-sha256 \"$WK_ASSET_MANIFEST_SHA256\"",
+            "Upload validated physical DAW receipt",
+            "retention-days: 90",
+        ):
+            self.assertIn(token, gate)
+        self.assertNotIn("WINDOWS_CODE_SIGNING_PFX_BASE64", gate)
+        self.assertNotIn("MACOS_NOTARY_PRIVATE_KEY_P8_BASE64", gate)
+        self.assertNotIn("WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64", gate)
+        finalizer = self.release[end:]
+        receipt_check = finalizer.index('"$WK_PHYSICAL_ACCEPTANCE_RESULT" != success')
+        promotion = finalizer.index("if gh api --method PATCH")
+        self.assertLess(receipt_check, promotion)
+        self.assertIn("physical DAW receipt digest changed after environment approval", finalizer)
+        for token in (
+            "WK_PHYSICAL_REVIEWER_ID",
+            '"repos/$GITHUB_REPOSITORY/branches/$current_default_branch_uri"',
+            "verify_current_ancestor \"$WK_CANDIDATE_COMMIT\" 'candidate commit'",
+            "verify_current_ancestor \"$GITHUB_SHA\" 'workflow commit'",
+        ):
+            self.assertIn(token, finalizer)
+        self.assertLess(
+            finalizer.index("verify_current_ancestor \"$GITHUB_SHA\""),
+            promotion,
+        )
+
+    def _physical_receipt_fixture(self) -> dict[str, object]:
+        version = "1.2.3"
+        tag = f"v{version}"
+        run_id = 123456789
+        run_attempt = 1
+        release_id = 987654321
+        workflow_sha = "2" * 40
+        environment_id = 41
+        reviewer_id = 42
+        names = (
+            f"{PRODUCT}-{version}-Windows-x64.msi",
+            f"{PRODUCT}-{version}-Windows-x64.evidence.json",
+            f"{PRODUCT}-{version}-Windows-arm64ec.msi",
+            f"{PRODUCT}-{version}-Windows-arm64ec.evidence.json",
+            f"{PRODUCT}-{version}-macOS-universal.pkg",
+            f"{PRODUCT}-{version}-macOS-universal-VST3.zip",
+            f"{PRODUCT}-{version}-macOS-universal.evidence.json",
+            f"{PRODUCT}-{version}-SHA256SUMS.txt",
+        )
+        assets = [
+            {
+                "digest": f"sha256:{index:064x}",
+                "id": 1000 + index,
+                "name": name,
+                "size": 2000 + index,
+                "state": "uploaded",
+            }
+            for index, name in enumerate(names, start=1)
+        ]
+        manifest_sha256 = self.physical_receipt._manifest_sha256(assets)
+        receipt = {
+            "schemaVersion": 1,
+            "repository": f"TheWhykiki/{PRODUCT}",
+            "product": PRODUCT,
+            "runId": run_id,
+            "runAttempt": run_attempt,
+            "releaseId": release_id,
+            "tag": tag,
+            "commit": TAG_COMMIT,
+            "assetManifestSha256": manifest_sha256,
+            "artifacts": {
+                name: next(asset["digest"] for asset in assets if asset["name"] == name)
+                for name in (
+                    f"{PRODUCT}-{version}-Windows-x64.msi",
+                    f"{PRODUCT}-{version}-Windows-arm64ec.msi",
+                    f"{PRODUCT}-{version}-macOS-universal.pkg",
+                    f"{PRODUCT}-{version}-macOS-universal-VST3.zip",
+                )
+            },
+            "checks": [
+                {
+                    "platform": platform,
+                    "host": host,
+                    "hostVersion": "13.0.50" if host == "Cubase" else "7.50",
+                    "osVersion": "Windows 11 24H2" if platform.startswith("windows") else "macOS 15.6",
+                    "machine": f"qa-{platform}",
+                    "tester": "qa-operator",
+                    "testedAt": "2026-09-08T12:00:00Z",
+                    "result": "pass",
+                }
+                for platform in (
+                    "windows-x64-msi",
+                    "windows-arm64ec-msi",
+                    "macos-universal-pkg",
+                    "macos-universal-zip",
+                )
+                for host in ("Cubase", "Reaper")
+            ],
+        }
+        environment = {
+            "id": environment_id,
+            "name": "physical-daw-release",
+            "deployment_branch_policy": {
+                "protected_branches": True,
+                "custom_branch_policies": False,
+            },
+            "protection_rules": [
+                {
+                    "type": "required_reviewers",
+                    "prevent_self_review": True,
+                    "reviewers": [
+                        {
+                            "type": "User",
+                            "reviewer": {"id": reviewer_id, "login": "qa-reviewer"},
+                        }
+                    ],
+                }
+            ],
+        }
+        reviews = [
+            {
+                "state": "approved",
+                "comment": json.dumps(receipt),
+                "environments": [
+                    {"id": environment_id, "name": "physical-daw-release"}
+                ],
+                "user": {"id": reviewer_id, "login": "qa-reviewer"},
+            }
+        ]
+        workflow_run = {
+            "id": run_id,
+            "run_attempt": run_attempt,
+            "event": "workflow_dispatch",
+            "head_sha": workflow_sha,
+            "head_branch": "main",
+            "repository": {
+                "full_name": f"TheWhykiki/{PRODUCT}",
+                "default_branch": "main",
+            },
+            "actor": {"id": 7, "login": "release-operator"},
+            "triggering_actor": {"id": 8, "login": "rerun-operator"},
+        }
+        branch = {
+            "name": "main",
+            "protected": True,
+            "commit": {"sha": workflow_sha},
+        }
+        candidate_compare = {
+            "status": "ahead",
+            "base_commit": {"sha": TAG_COMMIT},
+            "merge_base_commit": {"sha": TAG_COMMIT},
+        }
+        workflow_compare = {
+            "status": "identical",
+            "base_commit": {"sha": workflow_sha},
+            "merge_base_commit": {"sha": workflow_sha},
+        }
+        release = {
+            "id": release_id,
+            "tag_name": tag,
+            "target_commitish": TAG_COMMIT,
+            "draft": False,
+            "prerelease": True,
+            "immutable": True,
+            "body": (
+                f"whykiki-release-run:TheWhykiki/{PRODUCT}:"
+                f"{run_id}:{run_attempt}:{TAG_COMMIT}"
+            ),
+            "published_at": "2026-09-08T11:00:00Z",
+            "assets": assets,
+        }
+        return {
+            "environment": environment,
+            "reviews": reviews,
+            "workflow_run": workflow_run,
+            "branch": branch,
+            "candidate_compare": candidate_compare,
+            "workflow_compare": workflow_compare,
+            "release": release,
+            "repository": f"TheWhykiki/{PRODUCT}",
+            "product": PRODUCT,
+            "environment_name": "physical-daw-release",
+            "run_id": run_id,
+            "run_attempt": run_attempt,
+            "workflow_sha": workflow_sha,
+            "release_id": release_id,
+            "tag": tag,
+            "commit": TAG_COMMIT,
+            "asset_manifest_sha256": manifest_sha256,
+            "now": dt.datetime(2026, 9, 8, 13, 0, tzinfo=dt.timezone.utc),
+        }
+
+    def test_physical_receipt_cli_hashes_exact_written_bytes(self) -> None:
+        fixture = self._physical_receipt_fixture()
+        envelope = self.physical_receipt.validate(**fixture)
+        self.assertEqual(envelope["environmentId"], 41)
+        self.assertEqual(envelope["review"]["userId"], 42)
+        self.assertEqual(envelope["branchProtection"]["candidateAncestor"], TAG_COMMIT)
+        self.assertEqual(
+            envelope["branchProtection"]["workflowAncestor"], fixture["workflow_sha"]
+        )
+        expected = json.dumps(
+            envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            paths = {}
+            for key in (
+                "environment",
+                "reviews",
+                "workflow_run",
+                "branch",
+                "candidate_compare",
+                "workflow_compare",
+                "release",
+            ):
+                path = directory / f"{key}.json"
+                path.write_text(json.dumps(fixture[key]), encoding="utf-8")
+                paths[key] = path
+            output = directory / "receipt.json"
+            command = [
+                "python3",
+                str(ROOT / "scripts" / "validate-physical-daw-release-receipt.py"),
+                "--environment-json", str(paths["environment"]),
+                "--reviews-json", str(paths["reviews"]),
+                "--workflow-run-json", str(paths["workflow_run"]),
+                "--branch-json", str(paths["branch"]),
+                "--candidate-compare-json", str(paths["candidate_compare"]),
+                "--workflow-compare-json", str(paths["workflow_compare"]),
+                "--release-json", str(paths["release"]),
+                "--repository", str(fixture["repository"]),
+                "--product", str(fixture["product"]),
+                "--environment", str(fixture["environment_name"]),
+                "--run-id", str(fixture["run_id"]),
+                "--run-attempt", str(fixture["run_attempt"]),
+                "--workflow-sha", str(fixture["workflow_sha"]),
+                "--release-id", str(fixture["release_id"]),
+                "--tag", str(fixture["tag"]),
+                "--commit", str(fixture["commit"]),
+                "--asset-manifest-sha256", str(fixture["asset_manifest_sha256"]),
+                "--output", str(output),
+            ]
+            completed = subprocess.run(command, check=False, capture_output=True, text=True)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(output.read_bytes(), expected)
+            self.assertEqual(completed.stdout.strip(), hashlib.sha256(expected).hexdigest())
+
+    def test_physical_receipt_rejects_bypass_and_incomplete_matrix(self) -> None:
+        for mutation in (
+            "foreign-reviewer",
+            "actor-id-reuse",
+            "unprotected-environment",
+            "unprotected-default-branch",
+            "candidate-diverged",
+            "workflow-not-ancestor",
+            "nondefault-branch",
+            "extra-review",
+            "missing-reaper",
+            "digest",
+        ):
+            with self.subTest(mutation=mutation):
+                fixture = self._physical_receipt_fixture()
+                if mutation == "foreign-reviewer":
+                    fixture["reviews"][0]["user"] = {"id": 77, "login": "admin-bypass"}
+                elif mutation == "actor-id-reuse":
+                    fixture["workflow_run"]["actor"]["id"] = fixture["reviews"][0]["user"]["id"]
+                elif mutation == "unprotected-environment":
+                    fixture["environment"]["deployment_branch_policy"] = {
+                        "protected_branches": False,
+                        "custom_branch_policies": False,
+                    }
+                elif mutation == "unprotected-default-branch":
+                    fixture["branch"]["protected"] = False
+                elif mutation == "candidate-diverged":
+                    fixture["candidate_compare"]["status"] = "diverged"
+                elif mutation == "workflow-not-ancestor":
+                    fixture["workflow_compare"]["merge_base_commit"]["sha"] = "3" * 40
+                elif mutation == "nondefault-branch":
+                    fixture["workflow_run"]["head_branch"] = "release-candidate"
+                elif mutation == "extra-review":
+                    fixture["reviews"].append(json.loads(json.dumps(fixture["reviews"][0])))
+                else:
+                    receipt = json.loads(fixture["reviews"][0]["comment"])
+                    if mutation == "missing-reaper":
+                        receipt["checks"].pop()
+                    else:
+                        first_name = next(iter(receipt["artifacts"]))
+                        receipt["artifacts"][first_name] = f"sha256:{'f' * 64}"
+                    fixture["reviews"][0]["comment"] = json.dumps(receipt)
+                with self.assertRaises(self.physical_receipt.ContractError):
+                    self.physical_receipt.validate(**fixture)
 
     def test_macos_candidate_is_signed_notarized_and_required_for_publish(self) -> None:
         product_prefix = PRODUCT.upper()
@@ -1238,6 +1557,14 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "confirm_release",
             "ARM64EC",
             "Draft",
+            "physical-daw-release",
+            "Prevent self-review",
+            "Allow administrators to bypass configured protection rules",
+            "GET /repos/{owner}/{repo}/actions/runs/{run_id}/approvals",
+            "Cubase",
+            "Reaper",
+            "macos-universal-pkg",
+            "macos-universal-zip",
         ):
             self.assertIn(token, self.docs)
         self.assertIn("veröffentlicht jetzt nichts", self.docs)

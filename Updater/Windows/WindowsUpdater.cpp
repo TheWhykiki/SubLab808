@@ -1761,8 +1761,16 @@ void verifyMsiDatabase(const Path& path, const SemVersion& version)
         require(msiRows(database.get(), query.c_str()).empty(),
                 "Dangerous MSI table is not empty: " + table);
     }
+    require(msiRows(database.get(), L"SELECT `Name` FROM `_Storages`").empty(),
+            "MSI contains an embedded transform or nested storage");
 
     const auto properties = msiProperties(database.get());
+    for (const auto& [name, value] : properties)
+    {
+        (void) value;
+        require(! isForbiddenMsiProperty(name),
+                "MSI contains a forbidden control Property: " + name);
+    }
     const auto property = [&] (const char* name) -> const std::string&
     {
         const auto found = properties.find(name);
@@ -1820,6 +1828,11 @@ void verifyMsiDatabase(const Path& path, const SemVersion& version)
                 "MSI Directory table contains an unsafe path component");
         directories.emplace(row[0], std::pair { row[1], row[2] });
     }
+    std::map<std::string, std::string> directoryParents;
+    for (const auto& [identifier, value] : directories)
+        directoryParents.emplace(identifier, value.first);
+    require(! hasMsiDirectoryPropertyOverride(properties, directoryParents),
+            "MSI Property table overrides a Directory identifier");
     require(directories.contains("VST3Folder") && directories.contains("INSTALLFOLDER"),
             "MSI VST3 directories are missing");
     const auto longName = [] (const std::string& value)
@@ -1827,13 +1840,15 @@ void verifyMsiDatabase(const Path& path, const SemVersion& version)
         const auto pipe = value.rfind('|');
         return pipe == std::string::npos ? value : value.substr(pipe + 1);
     };
-    require((directories.at("VST3Folder").first == "CommonFiles6432Folder"
-                || directories.at("VST3Folder").first == "CommonFiles64Folder")
+    const auto& vst3Parent = directories.at("VST3Folder").first;
+    require(vst3Parent == "CommonFiles64Folder"
                 && longName(directories.at("VST3Folder").second) == "VST3",
             "MSI VST3Folder is not the 64-bit Common Files VST3 directory");
     require(directories.at("INSTALLFOLDER").first == "VST3Folder"
                 && longName(directories.at("INSTALLFOLDER").second) == std::string(kProduct) + ".vst3",
             "MSI install directory does not identify the exact product bundle");
+    require(msiDirectoryIdentifiersAreSafe(directoryParents, vst3Parent),
+            "MSI payload Directory reuses a predefined path Property");
 
     std::set<std::string> componentIds;
     std::vector<std::string> componentDirectories;
@@ -1850,8 +1865,6 @@ void verifyMsiDatabase(const Path& path, const SemVersion& version)
         componentDirectories.push_back(row[1]);
     }
     require(! componentIds.empty(), "MSI has no payload components");
-    std::map<std::string, std::string> directoryParents;
-    for (const auto& [identifier, value] : directories) directoryParents.emplace(identifier, value.first);
     require(componentDirectoriesAreInsideInstallFolder(directoryParents, componentDirectories),
             "MSI component directory does not descend from INSTALLFOLDER");
     const auto files = msiRows(database.get(),
@@ -1923,9 +1936,8 @@ void verifyMsiDatabase(const Path& path, const SemVersion& version)
         if (! tables.contains(sequenceTable)) continue;
         const auto query = widen("SELECT `Action` FROM `" + std::string(sequenceTable) + "`");
         for (const auto& row : msiRows(database.get(), query.c_str()))
-            require(row.size() == 1 && row[0] != "ForceReboot" && row[0] != "ScheduleReboot"
-                        && row[0] != "DisableRollback",
-                    std::string("MSI contains a forbidden reboot/rollback action in ") + sequenceTable);
+            require(row.size() == 1 && ! isForbiddenMsiSequenceAction(row[0]),
+                    std::string("MSI contains a forbidden side-effect action in ") + sequenceTable);
     }
 
     std::map<std::string, int> sequence;

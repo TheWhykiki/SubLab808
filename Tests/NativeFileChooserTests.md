@@ -56,11 +56,21 @@ temporary directory containing an input preset and an initially nonexistent expo
 destination; it never confirms a file operation. No DAW, installed bundle, or user
 preset library is modified.
 
-The console target runs one genuine top-level `MessageManager`/`NSApplication` loop
-for the complete native suite. Before entering that loop it posts a private START
-`NSEvent`; the timer-driven state machine remains dormant until a local AppKit monitor
-sees that event in the real `NSApplication.sendEvent:` path while the application is
-running. This proves that launch has yielded to top-level event dispatch. It then
+The console target installs a test-only `NSApplication` subclass before
+`ScopedJuceInitialiser_GUI` can create AppKit's process singleton, then runs one
+genuine top-level `MessageManager`/`NSApplication` loop for the complete native
+suite. While the native harness is active, its public
+`nextEventMatchingMask:untilDate:inMode:dequeue:` override leaves the supplied mask,
+mode and dequeue flag unchanged. For default-mode calls it shortens only a non-null
+expiration later than `now + 10 ms`; null, expired and earlier deadlines retain their
+original semantics. Thus AppKit's outer event fetch returns at a documented deadline
+and revisits its queue without relying on an undocumented wake coupling.
+
+Before entering that loop the harness posts a private START `NSEvent`; the timer-driven
+state machine remains dormant until a local AppKit monitor sees that event in the real
+`NSApplication.sendEvent:` path while the application is running. The subclass also
+records that the same marked event came from a default-mode dequeue. This proves that
+launch has yielded to top-level event dispatch. It then
 performs at most one bounded action per callback and returns after every asynchronous boundary:
 activation, menu dismissal, panel presentation, owner transition, panel retirement,
 editor reopen and control probe.
@@ -70,22 +80,20 @@ main loop, shutdown first requires three consecutive timer turns while `NSApplic
 is running without an AppKit modal window. On that final ready turn the coordinator arms
 an independent GCD watchdog, stops the recurring 10 ms timer, and posts one private
 prioritized SETTLE event at the front of AppKit's queue. Stopping the recurring timer
-prevents further coordinator-timer messages. Since `postEvent:` does not itself guarantee
-that a waiting `nextEventMatchingMask:` revisits AppKit's queue, the bridge starts one
-bounded, test-owned AppKit periodic-event stream before posting SETTLE. The periodic events
-are a wake stimulus only and are not counted as dispatch proof. The local monitor must confirm
-that AppKit retrieved the exact SETTLE event while the application was running without a
-modal window. Only then does that handler post prioritized STOP before consuming SETTLE,
-while the wake stream remains active.
-`postEvent:` is asynchronous, so STOP can be retrieved only as a subsequent, distinct
-AppKit event. Its monitor validates the same context, stops the test-owned periodic stream,
-and only then invokes JUCE's stop request from that real event-handler boundary; this leaves
-JUCE free to start its own periodic wake for `NSApplication.stop`. START, SETTLE and STOP
-must each be handled exactly once.
+prevents further coordinator-timer messages. The bounded outer fetch must dequeue SETTLE
+in default mode and the local monitor must observe it while the application is running
+without a modal window. Only then does that handler post prioritized STOP and return.
+Because there is no manual event pump, STOP can be retrieved only by a subsequent outer
+fetch and dispatched by a distinct `sendEvent:` call. Its monitor validates the same
+dequeue and application context, then invokes JUCE's stop request exactly once from that
+real event-handler boundary. START, SETTLE and STOP must each be handled exactly once.
+No worker, `CFRunLoopWakeUp`, direct `nextEvent`/`sendEvent` call, or test-owned periodic
+stream participates in this proof.
 An atomic return acknowledgement lets the independent GCD watchdog require SETTLE delivery,
-STOP delivery and `[NSApp run]` return to complete within five seconds.
-The coordinator destructor retains an idempotent timer stop, and the harness retires JUCE's
-periodic AppKit wake events after the loop returns. Final state/files/global-modal audits
+STOP delivery and `[NSApp run]` return to complete within five seconds. JUCE's own macOS
+stop implementation may start a periodic event after calling `NSApplication.stop`; the
+harness retires that framework-owned stream after the loop returns. The coordinator
+destructor retains an idempotent timer stop. Final state/files/global-modal audits
 run immediately before the timer is retired and again after run-loop return, before the
 monitor is removed exactly once. It does not assume
 that AppKit invokes, discards, or releases a modeless panel completion after a programmatic

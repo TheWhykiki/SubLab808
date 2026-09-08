@@ -25,6 +25,9 @@ class WindowsInstallerContractTests(unittest.TestCase):
         cls.script = (ROOT / "scripts" / "build-windows-installer.ps1").read_text(
             encoding="utf-8"
         )
+        cls.runtime_policy = (
+            ROOT / "Updater" / "Windows" / "UpdaterPolicy.cpp"
+        ).read_text(encoding="utf-8")
         cls.acceptance = (ROOT / "scripts" / "test-windows-installer.ps1").read_text(
             encoding="utf-8"
         )
@@ -284,16 +287,21 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
         self.assertEqual(
             forbidden_tables,
             {
-                "CustomAction", "Binary", "ServiceInstall", "ServiceControl",
+                "CustomAction", "Binary", "MsiEmbeddedUI", "MsiEmbeddedChainer",
+                "AppSearch", "CompLocator", "RegLocator", "IniLocator",
+                "DrLocator", "Signature", "Control", "ControlEvent",
+                "ServiceInstall", "ServiceControl", "MsiServiceConfig",
+                "MsiServiceConfigFailureActions",
                 "Registry", "RemoveRegistry", "SelfReg", "TypeLib", "Class",
                 "ProgId", "Extension", "MIME", "AppId", "ODBCDataSource",
                 "ODBCDriver", "ODBCTranslator", "IniFile", "RemoveIniFile",
-                "Environment", "RemoveFile", "MoveFiles", "DuplicateFile",
+                "Environment", "RemoveFile", "MoveFile", "DuplicateFile",
                 "CreateFolder", "Shortcut", "ReserveCost", "BindImage", "Font",
                 "IsolatedComponent", "MsiAssembly", "MsiAssemblyName",
                 "PublishComponent", "Complus", "Verb", "ODBCAttribute",
                 "LockPermissions", "MsiLockPermissionsEx", "Permission",
-                "PermissionEx", "Patch", "PatchPackage", "SFPCatalog",
+                "PermissionEx", "Patch", "PatchPackage", "MsiPatchCertificate",
+                "SFPCatalog",
             },
         )
 
@@ -303,7 +311,61 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
         self.assertIsNotNone(action_match)
         self.assertEqual(
             set(re.findall(r"'([^']+)'", action_match.group(1))),
-            {"ForceReboot", "ScheduleReboot", "DisableRollback"},
+            {
+                "ForceReboot", "ScheduleReboot", "DisableRollback",
+            },
+        )
+        property_match = re.search(
+            r"\$forbiddenProperties\s*=\s*@\((.*?)\)", self.script, re.DOTALL
+        )
+        self.assertIsNotNone(property_match)
+        self.assertEqual(
+            set(re.findall(r"'([^']+)'", property_match.group(1))),
+            {
+                "DISABLEROLLBACK", "TARGETDIR", "ROOTDRIVE", "TRANSFORMS",
+                "TRANSFORMSATSOURCE", "TRANSFORMSSECURE",
+            },
+        )
+
+        runtime_tables = self.runtime_policy[
+            self.runtime_policy.index("bool isForbiddenMsiSideEffectTable") :
+            self.runtime_policy.index("bool isForbiddenMsiSequenceAction")
+        ]
+        self.assertEqual(
+            set(re.findall(r'string_view \{ "([^"]+)" \}', runtime_tables)),
+            forbidden_tables,
+        )
+        runtime_actions = self.runtime_policy[
+            self.runtime_policy.index("bool isForbiddenMsiSequenceAction") :
+            self.runtime_policy.index("bool isForbiddenMsiProperty")
+        ]
+        self.assertEqual(
+            set(re.findall(r'string_view \{ "([^"]+)" \}', runtime_actions)),
+            {
+                "ForceReboot", "ScheduleReboot", "DisableRollback",
+            },
+        )
+        self.assertIn("hasMsiDirectoryPropertyOverride", self.runtime_policy)
+        self.assertIn("msiDirectoryIdentifiersAreSafe", self.runtime_policy)
+        self.assertIn(
+            "SELECT `Name` FROM `_Storages`", self.script
+        )
+        predefined_match = re.search(
+            r"foreach \(\$pathProperty in @\((.*?)\)\) \{",
+            self.script,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(predefined_match)
+        predefined_properties = set(
+            re.findall(r"'([^']+)'", predefined_match.group(1))
+        )
+        runtime_predefined = self.runtime_policy[
+            self.runtime_policy.index("bool isPredefinedMsiPathProperty") :
+            self.runtime_policy.index("bool msiDirectoryIdentifiersAreSafe")
+        ]
+        self.assertEqual(
+            set(re.findall(r'string_view \{ "([^"]+)" \}', runtime_predefined)),
+            predefined_properties,
         )
         sequence_match = re.search(
             r"foreach \(\$sequenceTable in @\((.*?)\)\) \{",
@@ -541,6 +603,10 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
             "$secureCustomProperties.SetEquals($expectedSecureCustomProperties)",
             "secureCustomProperties = @($msiContract.SecureCustomProperties)",
             "Malformed or duplicate MSI Property row",
+            "MSI contains a forbidden control Property",
+            "MSI Property table overrides Directory identifier",
+            "MSI payload Directory reuses a predefined path Property",
+            "MSI contains an embedded transform or nested storage",
             "Duplicate MSI LaunchCondition row",
             "$expectedLaunchConditions.Add('NOTWIX_DOWNGRADE_DETECTED')",
             "INSTALLEDORNOTOTHERARCHITECTUREDETECTED",

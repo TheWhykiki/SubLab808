@@ -30,6 +30,27 @@ künftig veröffentlichte Releases und heilt keine bereits vorhandenen veränder
 Releases nachträglich; der Workflow prüft sie deshalb vor Authorization, Stage und
 Finalize jeweils fail-closed über das separate Administration-Read-Token.
 
+Unter **Settings → Environments** muss außerdem vor dem ersten Lauf das
+Environment `physical-daw-release` angelegt werden. Es braucht mindestens einen
+expliziten Benutzer als **Required reviewer** (keine Teams), aktiviertes **Prevent self-review** und
+deaktiviertes **Allow administrators to bypass configured protection rules**.
+Seine Deployment-Branches werden auf **Protected branches only** begrenzt; der
+Default Branch selbst muss geschützt sein.
+Das Environment enthält keine Secrets. Wird es vergessen und von GitHub beim
+ersten Bezug ungeschützt angelegt, bricht der nachgelagerte Validator ab, weil
+er genau eine nichtleere `required_reviewers`-Regel mit
+`prevent_self_review=true`, `deployment_branch_policy.protected_branches=true`
+und `custom_branch_policies=false` verlangt. Der geprüfte Workflow-Run muss
+außerdem auf dem gemeldeten Default Branch liegen. Der Validator liest diesen
+Branch zusätzlich direkt über die GitHub-API und verlangt `protected=true`; die
+Environment-Auswahl **Protected branches only** genügt für sich allein
+ausdrücklich nicht. Candidate-Commit und Workflow-Commit müssen serverseitig
+nachweisbar Vorfahren des beobachteten Branch-Tips sein. Unmittelbar vor der
+Promotion liest der Finalizer Default-Branch, Schutzstatus und beide
+Abstammungsbeziehungen erneut; ein Default-Branch-Wechsel, Force-Push oder
+entfernter Commit lässt den Candidate in Quarantäne. Auch ein fehlender oder
+nicht exakt passender Review-Kommentar verhindert die Promotion.
+
 | Typ | Name | Inhalt |
 | --- | --- | --- |
 | Secret | `WINDOWS_CODE_SIGNING_PFX_BASE64` | Base64-kodierte PFX-Datei mit genau einem privaten Code-Signing-Schlüssel |
@@ -226,6 +247,98 @@ Ein vollständiger Release enthält exakt diese Plattformdateien:
 - `SubLab808-<Version>-macOS-universal.evidence.json`
 - `SubLab808-<Version>-SHA256SUMS.txt`
 
+## Physische Cubase-/Reaper-Freigabe
+
+Es gibt bewusst keinen angeblichen automatischen Cubase- oder Reaper-Test:
+GitHub-hosted Runner enthalten diese DAWs nicht, und das Repository setzt keine
+nicht vorhandene Self-hosted-DAW-Farm voraus. Nach den automatischen Gates wartet
+der Job `physical-daw-acceptance` deshalb ohne belegten Runner im geschützten
+Environment. Die prüfende Person lädt die Dateien aus der im Job verlinkten,
+öffentlichen immutable Prerelease-ID, vergleicht deren SHA-256-Werte mit den
+serverseitigen `digest`-Feldern und führt auf physischer Hardware diese acht
+Abnahmen aus:
+
+- Windows x64 MSI in Cubase und Reaper;
+- Windows ARM64EC MSI in Cubase und Reaper;
+- macOS universal in Cubase und Reaper, jeweils für den PKG-installierten und
+  den aus dem ZIP bereitgestellten VST3-Pfad.
+
+Jede Abnahme umfasst Installation beziehungsweise Kopie, Plug-in-Rescan,
+Instanziierung, Audioverarbeitung, State-Save/-Reload, Downgrade-Ablehnung auf
+Windows und saubere Entfernung.
+Auf Windows bleibt UAC aktiviert; auf macOS bleiben Gatekeeper und die
+gestapelten Notarisierungstickets aktiv. `machine` ist nur ein nicht geheimes
+Inventar-Alias, niemals Seriennummer, Benutzername oder sonstiges Geheimnis.
+
+Erst danach darf ein anderer Required Reviewer den wartenden Environment-Job
+freigeben. Sein Kommentar muss ausschließlich ein JSON-Objekt nach Schema 1
+enthalten; Markdown-Fences oder Begleittext sind nicht zulässig. Die exakten
+Werte für `runId`, `runAttempt`, `releaseId`, `tag`, `commit`,
+`assetManifestSha256` und die vier Digests stehen in der Zusammenfassung von
+`stage-release`. Vor dem Einfügen werden alle Platzhalter ersetzt:
+
+```json
+{
+  "schemaVersion": 1,
+  "repository": "TheWhykiki/SubLab808",
+  "product": "SubLab808",
+  "runId": 123456789,
+  "runAttempt": 1,
+  "releaseId": 987654321,
+  "tag": "v1.4.1",
+  "commit": "0000000000000000000000000000000000000000",
+  "assetManifestSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "artifacts": {
+    "SubLab808-1.4.1-Windows-x64.msi": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "SubLab808-1.4.1-Windows-arm64ec.msi": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "SubLab808-1.4.1-macOS-universal.pkg": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "SubLab808-1.4.1-macOS-universal-VST3.zip": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "checks": [
+    {"platform":"windows-x64-msi","host":"Cubase","hostVersion":"13.0.50","osVersion":"Windows 11 24H2","machine":"qa-win-x64-01","tester":"qa-operator","testedAt":"2026-09-08T12:00:00Z","result":"pass"},
+    {"platform":"windows-x64-msi","host":"Reaper","hostVersion":"7.50","osVersion":"Windows 11 24H2","machine":"qa-win-x64-01","tester":"qa-operator","testedAt":"2026-09-08T12:10:00Z","result":"pass"},
+    {"platform":"windows-arm64ec-msi","host":"Cubase","hostVersion":"13.0.50","osVersion":"Windows 11 24H2 ARM64","machine":"qa-win-arm-01","tester":"qa-operator","testedAt":"2026-09-08T12:20:00Z","result":"pass"},
+    {"platform":"windows-arm64ec-msi","host":"Reaper","hostVersion":"7.50","osVersion":"Windows 11 24H2 ARM64","machine":"qa-win-arm-01","tester":"qa-operator","testedAt":"2026-09-08T12:30:00Z","result":"pass"},
+    {"platform":"macos-universal-pkg","host":"Cubase","hostVersion":"13.0.50","osVersion":"macOS 15.6","machine":"qa-mac-01","tester":"qa-operator","testedAt":"2026-09-08T12:40:00Z","result":"pass"},
+    {"platform":"macos-universal-pkg","host":"Reaper","hostVersion":"7.50","osVersion":"macOS 15.6","machine":"qa-mac-01","tester":"qa-operator","testedAt":"2026-09-08T12:50:00Z","result":"pass"},
+    {"platform":"macos-universal-zip","host":"Cubase","hostVersion":"13.0.50","osVersion":"macOS 15.6","machine":"qa-mac-01","tester":"qa-operator","testedAt":"2026-09-08T13:00:00Z","result":"pass"},
+    {"platform":"macos-universal-zip","host":"Reaper","hostVersion":"7.50","osVersion":"macOS 15.6","machine":"qa-mac-01","tester":"qa-operator","testedAt":"2026-09-08T13:10:00Z","result":"pass"}
+  ]
+}
+```
+
+Nach der Freigabe liest der Job über den dokumentierten REST-Endpunkt
+`GET /repos/{owner}/{repo}/actions/runs/{run_id}/approvals` die Review-Historie.
+Er akzeptiert genau einen Eintrag: `state` muss exakt `approved` sein,
+`environments` muss ausschließlich ID und Name des aktuellen
+`physical-daw-release` enthalten, `user.id` und `user.login` müssen exakt einen
+direkt im Environment konfigurierten Benutzer benennen, dieser darf weder per
+stabiler User-ID noch per Login ursprünglicher Workflow-Aktor oder Re-run-Aktor
+sein und `comment` muss das obige Receipt
+erfüllen. Zusätzliche, abgelehnte, unklare oder zu einem anderen Versuch
+gehörende Review-Einträge sind fail-closed. Zusätzlich werden das Environment
+über `GET /repos/{owner}/{repo}/environments/physical-daw-release`, der Run über
+`GET /repos/{owner}/{repo}/actions/runs/{run_id}`, der aktuelle Default Branch
+über `GET /repos/{owner}/{repo}/branches/{branch}` und der Candidate über seine
+exakte Release-ID erneut gelesen. Nur eine Branch-Antwort mit passendem Namen,
+`protected=true` und gültigem beobachtetem Commit wird in den kanonischen
+Receipt-Umschlag übernommen. Zwei Compare-API-Antworten müssen zusätzlich
+`status=ahead|identical` liefern und Candidate- sowie Workflow-Commit jeweils
+als exakten Merge-Base des beobachteten Tips belegen.
+
+Der Validator verlangt die vollständige Cubase-/Reaper-Matrix mit acht
+`result=pass`, nachvollziehbaren DAW-/OS-Versionen, Maschinen-Alias, Tester und
+UTC-Zeitpunkt nach Veröffentlichung des Candidates. Das Receipt bindet zudem
+Run-ID und -Attempt, Release-ID, Tag-Commit, den kanonischen Digest aller acht
+Asset-Metadaten und die serverseitigen Digests der vier installierbaren
+Artefakte. Der validierte kanonische Receipt-Umschlag wird 90 Tage als
+Actions-Artefakt aufbewahrt; SHA-256 und Base64-Inhalt werden zusätzlich in
+die bei der Promotion gesetzten Release Notes geschrieben. Reviewer-Login und
+stabile GitHub-User-ID sowie Environment-ID bleiben darin dauerhaft gebunden,
+auch wenn das Actions-Artefakt abläuft oder ein Login später umbenannt wird. Das ist eine
+nachvollziehbare, authentifizierte menschliche Attestation, aber kein
+kryptografischer Beweis dafür, dass die DAWs tatsächlich ausgeführt wurden.
+
 Die drei Build-Kandidaten sind Actions-Artefakte mit nur einem Tag
 Aufbewahrung. Die nativen Windows-Hostharnesses bleiben sieben Tage, die beiden
 kleinen Transition-Receipts 30 Tage als Actions-Artefakte erhalten. Receipts
@@ -263,11 +376,13 @@ Latest-Zustand und der autorisierte Historien-Snapshot müssen unverändert sein
 
 Der öffentliche Prerelease ist absichtlich bereits für die unveränderten
 Updater in den nativen x64- und ARM64EC-Gates erreichbar, aber noch nicht
-`latest`. Beide Acceptance-Jobs erhalten weder Code-Signing-/Notary-Secrets noch
+`latest`. Beide automatischen Acceptance-Jobs erhalten weder Code-Signing-/Notary-Secrets noch
 das Administration-Token. Sie erhalten ausschließlich den separaten
 Release-Gate-Private-Key; ohne eine dazu passende kurzlebige Signatur kann kein
-lokaler Prozess einen quarantänisierten Prerelease in den UAC-Pfad treiben. Nur
-wenn beide erfolgreich sind und Release-ID, acht
+lokaler Prozess einen quarantänisierten Prerelease in den UAC-Pfad treiben. Der
+anschließende Environment-Job erhält keine Signing- oder Notary-Secrets. Nur
+wenn beide nativen Gates und das oben beschriebene physische Receipt erfolgreich
+sind und Release-ID, acht
 Asset-Metadaten, Immutability, Origin-Tag, Baseline, gesamte übrige Historie und
 vorheriges Latest nochmals unverändert sind, setzt `finalize-release` dieselbe
 ID auf `prerelease=false` und `make_latest=true`. Titel und Notes werden dabei
@@ -291,11 +406,11 @@ Delete, Demotion oder Neuveröffentlichung.
 
 GitHub-hosted Windows-Runner schalten UAC aus. Der automatische Follow-up-Gate
 durchläuft deshalb den echten `ShellExecuteEx(..., runas)`-/`msiexec`-Pfad,
-beweist aber keinen sichtbaren Consent-Dialog. Vor einer realen Auslieferung
-bleibt je ein physischer x64- und Windows-on-Arm-Test mit aktiviertem UAC Pflicht:
-Consent anzeigen und bestätigen, danach Receipt, N+1-Payload, Hostload,
-Downgrade-Ablehnung und Cleanup erneut prüfen. Diese manuelle Restabnahme darf
-nicht als von GitHub Actions erfüllt dokumentiert werden.
+beweist aber keinen sichtbaren Consent-Dialog und keine DAW-Ausführung. Genau
+deshalb bleiben die physischen x64-, Windows-on-Arm- und macOS-Abnahmen vor der
+Environment-Freigabe Pflicht. GitHub Actions validiert nur Identität, Umfang und
+Bindung der menschlichen Attestation; es behauptet nicht, diese Abnahmen selbst
+ausgeführt zu haben.
 
 ## Windows-Zertifikatswechsel
 

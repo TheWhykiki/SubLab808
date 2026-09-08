@@ -63,10 +63,20 @@ rules. The WiX 6.0.2 Upgrade table must contain exactly the three reviewed rows,
 including NULL `Remove` fields and their exact bounds, languages and attributes.
 Every file must have a safe leaf name and belong to a 64-bit component whose
 Directory ancestry is part of a complete cycle-free graph ending at the one
-product `INSTALLFOLDER`. External cabinets, custom/binary/script
-actions, services, registry writes, path-moving/removal/duplication tables,
-shortcuts, permission tables and forced reboot/rollback-disabling actions are
-rejected.
+product `INSTALLFOLDER` and the compiled 64-bit package must use
+`CommonFiles64Folder` (not WiX's source-only `CommonFiles6432Folder` alias).
+Property rows may not define `TARGETDIR`, `ROOTDRIVE`, or any Directory ID;
+predefined path-valued Installer properties cannot be reused below the product
+directory. External cabinets, custom/binary/script actions, embedded UI/chainer
+code, AppSearch/locator and Control/ControlEvent redirection, service installation
+or configuration, registry writes, the `MoveFile`/removal/duplication tables,
+shortcuts, permission and `MsiPatchCertificate` tables, forced
+reboot/rollback-disabling actions and the
+`DISABLEROLLBACK` property are rejected. `TRANSFORMS*` properties are forbidden
+and `_Storages` must be empty so no embedded transform can alter the verified
+database at install time. The table-dependent `MoveFiles` and
+`MsiConfigureServices` standard actions are not false-positive blacklisted: with
+their data tables rejected they are no-ops.
 
 The verified MSI is administratively extracted through the trusted System32
 `msiexec.exe` into a current-user-only operation Temp directory. Reparse points,

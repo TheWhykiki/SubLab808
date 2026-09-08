@@ -1025,20 +1025,29 @@ function Test-MsiContract {
             Assert-Condition ($tables.Contains($requiredTable)) "MSI table is missing: $requiredTable"
         }
         $forbiddenSideEffectTables = @(
-            'CustomAction', 'Binary', 'ServiceInstall', 'ServiceControl',
+            'CustomAction', 'Binary', 'MsiEmbeddedUI', 'MsiEmbeddedChainer',
+            'AppSearch', 'CompLocator', 'RegLocator', 'IniLocator', 'DrLocator',
+            'Signature', 'Control', 'ControlEvent',
+            'ServiceInstall', 'ServiceControl', 'MsiServiceConfig',
+            'MsiServiceConfigFailureActions',
             'Registry', 'RemoveRegistry', 'SelfReg', 'TypeLib', 'Class', 'ProgId',
             'Extension', 'MIME', 'AppId', 'ODBCDataSource', 'ODBCDriver',
             'ODBCTranslator', 'IniFile', 'RemoveIniFile', 'Environment', 'RemoveFile',
-            'MoveFiles', 'DuplicateFile', 'CreateFolder', 'Shortcut', 'ReserveCost',
+            # MoveFile is the table. MoveFiles is a standard action and is a no-op
+            # without rows here, so it is intentionally not an action blacklist item.
+            'MoveFile', 'DuplicateFile', 'CreateFolder', 'Shortcut', 'ReserveCost',
             'BindImage', 'Font', 'IsolatedComponent', 'MsiAssembly', 'MsiAssemblyName',
             'PublishComponent', 'Complus', 'Verb', 'ODBCAttribute', 'LockPermissions',
             'MsiLockPermissionsEx', 'Permission', 'PermissionEx', 'Patch', 'PatchPackage',
-            'SFPCatalog'
+            'MsiPatchCertificate', 'SFPCatalog'
         )
         foreach ($forbiddenTable in $forbiddenSideEffectTables) {
             Assert-Condition (-not $tables.Contains($forbiddenTable)) `
                 "Forbidden MSI side-effect table is present: $forbiddenTable"
         }
+        $embeddedStorages = @(Get-MsiRows $database 'SELECT `Name` FROM `_Storages`')
+        Assert-Condition ($embeddedStorages.Count -eq 0) `
+            'MSI contains an embedded transform or nested storage.'
 
         $properties = [System.Collections.Generic.Dictionary[string, string]]::new(
             [System.StringComparer]::OrdinalIgnoreCase)
@@ -1047,6 +1056,14 @@ function Test-MsiContract {
                               -not $properties.ContainsKey($row.Fields[0])) `
                 'Malformed or duplicate MSI Property row.'
             $properties.Add($row.Fields[0], $row.Fields[1])
+        }
+        $forbiddenProperties = @(
+            'DISABLEROLLBACK', 'TARGETDIR', 'ROOTDRIVE', 'TRANSFORMS',
+            'TRANSFORMSATSOURCE', 'TRANSFORMSSECURE'
+        )
+        foreach ($forbiddenProperty in $forbiddenProperties) {
+            Assert-Condition (-not $properties.ContainsKey($forbiddenProperty)) `
+                "MSI contains a forbidden control Property: $forbiddenProperty"
         }
         foreach ($requiredProperty in @('ProductName', 'Manufacturer', 'ProductVersion',
                                          'ProductCode', 'UpgradeCode', 'ALLUSERS',
@@ -1096,11 +1113,37 @@ function Test-MsiContract {
                 'Malformed or duplicate MSI Directory row.'
             $directories.Add($row.Fields[0], @($row.Fields[1], $row.Fields[2]))
         }
+        foreach ($identifier in @($directories.Keys)) {
+            Assert-Condition (-not $properties.ContainsKey([string]$identifier)) `
+                "MSI Property table overrides Directory identifier: $identifier"
+        }
         Assert-Condition ($directories.ContainsKey('VST3Folder')) 'MSI VST3Folder is missing.'
         Assert-Condition ($directories.ContainsKey('INSTALLFOLDER')) 'MSI INSTALLFOLDER is missing.'
         $vst3Parent = $directories['VST3Folder'][0]
-        Assert-Condition ($vst3Parent -in @('CommonFiles6432Folder', 'CommonFiles64Folder')) `
+        Assert-Condition ($vst3Parent -ceq 'CommonFiles64Folder') `
             "VST3Folder is not rooted in 64-bit Common Files: $vst3Parent"
+        $predefinedMsiPathProperties = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($pathProperty in @(
+            'OriginalDatabase', 'ParentOriginalDatabase', 'SourceDir', 'TARGETDIR',
+            'ROOTDRIVE', 'CCP_DRIVE', 'PrimaryVolumePath', 'MsiLogFileLocation',
+            'AdminToolsFolder', 'AppDataFolder', 'CommonAppDataFolder',
+            'CommonFilesFolder', 'CommonFiles64Folder', 'CommonFiles6432Folder',
+            'DesktopFolder', 'FavoritesFolder', 'FontsFolder', 'LocalAppDataFolder',
+            'MyPicturesFolder', 'NetHoodFolder', 'PersonalFolder', 'PrintHoodFolder',
+            'ProgramFilesFolder', 'ProgramFiles64Folder', 'ProgramFiles6432Folder',
+            'PerUserProgramFilesFolder', 'ProgramMenuFolder', 'RecentFolder',
+            'SendToFolder', 'StartMenuFolder',
+            'StartupFolder', 'System16Folder', 'SystemFolder', 'System64Folder',
+            'System6432Folder', 'TempFolder', 'TemplateFolder', 'WindowsFolder',
+            'WindowsVolume'
+        )) { [void]$predefinedMsiPathProperties.Add($pathProperty) }
+        foreach ($identifier in @($directories.Keys)) {
+            $expectedSystemAnchor = $identifier -ceq 'TARGETDIR' -or $identifier -ceq $vst3Parent
+            Assert-Condition ($expectedSystemAnchor -or
+                              -not $predefinedMsiPathProperties.Contains([string]$identifier)) `
+                "MSI payload Directory reuses a predefined path Property: $identifier"
+        }
         Assert-Condition ($directories['VST3Folder'][1].Split('|')[-1] -ceq 'VST3') 'MSI VST3 directory mismatch.'
         Assert-Condition ($directories['INSTALLFOLDER'][0] -ceq 'VST3Folder') 'MSI bundle parent mismatch.'
         Assert-Condition ($directories['INSTALLFOLDER'][1].Split('|')[-1] -ceq "$ProductName.vst3") `
@@ -1182,7 +1225,10 @@ function Test-MsiContract {
                           $sequences['RemoveExistingProducts'] -lt $sequences['InstallFiles']) `
             'RemoveExistingProducts is not rollback-safe after InstallInitialize and before InstallFiles.'
 
-        $forbiddenSequenceActions = @('ForceReboot', 'ScheduleReboot', 'DisableRollback')
+        $forbiddenSequenceActions = @(
+            # MsiConfigureServices is harmless after both of its data tables were rejected.
+            'ForceReboot', 'ScheduleReboot', 'DisableRollback'
+        )
         foreach ($sequenceTable in @('InstallExecuteSequence', 'InstallUISequence',
                                       'AdminExecuteSequence', 'AdminUISequence',
                                       'AdvtExecuteSequence')) {
@@ -1191,7 +1237,7 @@ function Test-MsiContract {
             foreach ($row in @(Get-MsiRows $database $query)) {
                 Assert-Condition ($row.Fields.Count -eq 1 -and
                                   $forbiddenSequenceActions -cnotcontains $row.Fields[0]) `
-                    "MSI contains a forbidden reboot/rollback action in ${sequenceTable}: $($row.Fields[0])"
+                    "MSI contains a forbidden side-effect action in ${sequenceTable}: $($row.Fields[0])"
             }
         }
 

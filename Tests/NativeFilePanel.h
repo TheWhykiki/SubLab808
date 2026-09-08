@@ -10,11 +10,13 @@ class NativeFilePanel final
 {
 public:
     using ApplicationStopCallback = bool (*)() noexcept;
+    // Must run before ScopedJuceInitialiser_GUI creates NSApplication.
+    static void installTestApplication();
     static void prepareTestApplication(ApplicationStopCallback);
     [[nodiscard]] static bool applicationIsRunning() noexcept;
-    // Private START/SETTLE events prove that NSApplication is dispatching.
-    // A bounded periodic wake keeps native event acquisition live from SETTLE
-    // through STOP; STOP retires that wake before calling stop:.
+    // Private START/SETTLE/STOP events prove three distinct dispatches through
+    // the real NSApplication event loop. The test application bounds only
+    // otherwise-long default-mode event waits; it never pumps or sends events.
     [[nodiscard]] static bool postApplicationStartEvent() noexcept;
     [[nodiscard]] static bool applicationStartEventWasHandled() noexcept;
     [[nodiscard]] static bool applicationIsReadyForSettleEvent() noexcept;

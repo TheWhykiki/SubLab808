@@ -78,7 +78,16 @@ class WindowsUpdaterContractTests(unittest.TestCase):
             "WinVerifyTrust", "CERT_SHA256_HASH_PROP_ID", "verifyMsiDatabase",
             "isForbiddenMsiSideEffectTable", "hasExactUpgradeContract",
             "hasExactLaunchConditions", "componentDirectoriesAreInsideInstallFolder",
+            '"MsiEmbeddedUI"', '"MsiEmbeddedChainer"',
+            '"AppSearch"', '"RegLocator"', '"Control"', '"ControlEvent"',
+            '"MsiServiceConfig"', '"MsiServiceConfigFailureActions"',
+            '"Permission"', '"PermissionEx"',
             '"ForceReboot"', '"ScheduleReboot"', '"DisableRollback"',
+            '"MoveFile"', '"TRANSFORMS"',
+            '"DISABLEROLLBACK"', '"TARGETDIR"', '"ROOTDRIVE"',
+            "isForbiddenMsiSequenceAction", "isForbiddenMsiProperty",
+            "hasMsiDirectoryPropertyOverride", "isPredefinedMsiPathProperty",
+            "msiDirectoryIdentifiersAreSafe", 'SELECT `Name` FROM `_Storages`',
             "component directory does not descend from INSTALLFOLDER",
             "MSI File row refers to an unknown payload component",
             "MSI Upgrade table is not the exact three-row architecture/downgrade contract",
@@ -91,11 +100,15 @@ class WindowsUpdaterContractTests(unittest.TestCase):
         for token in required:
             self.assertIn(token, implementation)
         policy_test = (TESTS / "PolicyTests.cpp").read_text(encoding="utf-8")
+        self.assertIn('! isForbiddenMsiSequenceAction("MsiConfigureServices")', policy_test)
         for mutation_gate in ("upgrade attribute mutant rejected",
                               "non-NULL WiX Upgrade Remove policy rejected",
                               "component escaping to WindowsFolder rejected",
                               "disconnected directory cycle rejected",
                               "dangling directory parent rejected",
+                              "non-TARGETDIR Directory root rejected",
+                              "case-insensitive MSI Directory Property override rejected",
+                              "engine-defined WindowsFolder child escape rejected",
                               "dangerous MSI side-effect table policy"):
             self.assertIn(mutation_gate, policy_test)
         launch = self.source.index("ShellExecuteExW(&launch)")

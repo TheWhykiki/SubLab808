@@ -1295,6 +1295,11 @@ void checkPresetDialogLifecycles(const juce::File& root)
 }
 int main(int argc, char** argv)
 {
+#if JUCE_MAC
+    // NSApplication is a process singleton. Install the test subclass before
+    // JUCE can instantiate the base class during GUI initialisation.
+    NativeFilePanel::installTestApplication();
+#endif
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     juce::ScopedJuceInitialiser_GUI gui;
     const auto root = juce::File::getSpecialLocation(juce::File::tempDirectory).getNonexistentChildFile("whykiki-preset-tests", "", false);
