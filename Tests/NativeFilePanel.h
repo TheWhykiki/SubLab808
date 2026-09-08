@@ -10,6 +10,9 @@ class NativeFilePanel final
 {
 public:
     static void prepareTestApplication();
+    // NSApplication only observes stop: after dispatching a real NSEvent. The
+    // native suite finishes from a JUCE Timer, so it must enqueue one wake event.
+    [[nodiscard]] static bool postApplicationStopWakeEvent() noexcept;
     // The short-lived synthetic host window must not leave an AppKit display-
     // link animation running after the console test exits.
     static void disableAutomaticHostWindowAnimations(void* nativeView);

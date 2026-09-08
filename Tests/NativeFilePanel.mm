@@ -340,6 +340,31 @@ void NativeFilePanel::prepareTestApplication()
         }
     }
 }
+bool NativeFilePanel::postApplicationStopWakeEvent() noexcept
+{
+    @autoreleasepool
+    {
+        if (![NSThread isMainThread] || NSApp == nil)
+            return false;
+
+        // NSApplication's stop: flag is checked only after an actual NSEvent is
+        // dispatched. A Timer callback alone is not an event-handler boundary,
+        // and JUCE's periodic-event wake is not reliable on headless CI hosts.
+        auto* event = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
+                                         location:NSZeroPoint
+                                    modifierFlags:0
+                                        timestamp:0.0
+                                     windowNumber:0
+                                          context:nil
+                                          subtype:0
+                                            data1:0
+                                            data2:0];
+        if (event == nil)
+            return false;
+        [NSApp postEvent:event atStart:YES];
+        return true;
+    }
+}
 void NativeFilePanel::disableAutomaticHostWindowAnimations(void* nativeView)
 {
     @autoreleasepool

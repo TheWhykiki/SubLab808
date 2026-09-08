@@ -55,6 +55,27 @@ struct NativeChooserCaseState
     std::string nativeClass;
 };
 
+bool nativeApplicationStopWakePosted = false;
+
+void stopNativeChooserApplicationLoop() noexcept
+{
+    std::fputs("NATIVE_APP_LOOP_STOP_BEGIN\n", stderr);
+    auto* messageManager = juce::MessageManager::getInstanceWithoutCreating();
+    if (messageManager == nullptr)
+    {
+        std::fputs("NATIVE_APP_LOOP_STOP_FAILED: message manager missing\n", stderr);
+        std::fflush(stderr);
+        return;
+    }
+    messageManager->stopDispatchLoop();
+    nativeApplicationStopWakePosted = NativeFilePanel::postApplicationStopWakeEvent();
+    std::fputs(nativeApplicationStopWakePosted
+                   ? "NATIVE_APP_LOOP_WAKE_POSTED\n"
+                   : "NATIVE_APP_LOOP_WAKE_FAILED\n",
+               stderr);
+    std::fflush(stderr);
+}
+
 class NativeChooserCoordinator final : private juce::Timer
 {
 public:
@@ -537,7 +558,7 @@ private:
                     cases.size(), cases.size() == 1 ? "" : "s");
         completed = true;
         stopTimer();
-        juce::MessageManager::getInstance()->stopDispatchLoop();
+        stopNativeChooserApplicationLoop();
     }
 
     void fail(const char* message) noexcept
@@ -550,7 +571,7 @@ private:
                 std::fflush(stderr);
                 completed = true;
                 stopTimer();
-                juce::MessageManager::getInstance()->stopDispatchLoop();
+                stopNativeChooserApplicationLoop();
                 return;
             }
             failure = message;
@@ -575,7 +596,7 @@ private:
             std::fflush(stderr);
             completed = true;
             stopTimer();
-            juce::MessageManager::getInstance()->stopDispatchLoop();
+            stopNativeChooserApplicationLoop();
         }
     }
 
@@ -630,7 +651,7 @@ private:
         if (now() < deadline) return;
         completed = true;
         stopTimer();
-        juce::MessageManager::getInstance()->stopDispatchLoop();
+        stopNativeChooserApplicationLoop();
     }
 
     std::vector<NativeChooserCase> cases;
@@ -660,14 +681,20 @@ int runNativeFileChooserLifecycles(const juce::File& root, const juce::String& r
     require(juce::FileChooser::isPlatformDialogAvailable(),
             "native chooser platform implementation is available");
     NativeFilePanel::prepareTestApplication();
+    nativeApplicationStopWakePosted = false;
     nativeFileChooserHarnessEnabled = true;
     NativeChooserCoordinator coordinator(root, requestedCase);
     coordinator.start();
+    std::fputs("NATIVE_APP_LOOP_ENTER\n", stderr);
     juce::MessageManager::getInstance()->runDispatchLoop();
+    std::fputs("NATIVE_APP_LOOP_RETURN\n", stderr);
     nativeFileChooserHarnessEnabled = false;
     require(coordinator.completedNormally(), "native chooser application loop stopped before completion");
+    require(nativeApplicationStopWakePosted,
+            "native chooser application loop stopped without its AppKit wake event");
     if (! coordinator.failureMessage().empty())
         throw std::runtime_error(coordinator.failureMessage());
+    std::fputs("NATIVE_TEST_RETURN\n", stderr);
     return 0;
 }
 #endif

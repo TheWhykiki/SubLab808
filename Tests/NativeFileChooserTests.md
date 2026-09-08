@@ -61,8 +61,10 @@ top-level `MessageManager`/`NSApplication` loop for the complete native suite. A
 timer-driven state machine performs at most one bounded action per callback and
 returns after every asynchronous boundary: activation, menu dismissal, panel
 presentation, owner transition, panel retirement, editor reopen and control probe.
-It never calls `CFRunLoopRunInMode`, manually sends an `NSEvent`, or enters a nested
-JUCE dispatch loop. The harness does not assume that AppKit invokes, discards, or
+It never calls `CFRunLoopRunInMode`, directly invokes `sendEvent:`, or enters a nested
+JUCE dispatch loop. Because `NSApplication.stop` called from a timer is observed only
+after a real event boundary, shutdown posts one neutral application-defined wake event
+at the front of the queue after JUCE requests the stop. The harness does not assume that AppKit invokes, discards, or
 releases a modeless panel completion after a programmatic close. Instead it marks
 the verified JUCE/AppKit owner-retirement boundary atomically and keeps the late-
 entry sentinel active across subsequent editor interaction and chooser sessions.
