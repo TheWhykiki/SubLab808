@@ -34,13 +34,16 @@
 
 // The coordinator runs from JUCE's main-thread run-loop source, which can fire
 // while AppKit is blocked inside nextEventMatchingMask:. postEvent: only queues
-// an event, so queue a marked BARRIER and stop the innermost CFRunLoop
-// activation. The active fetch must return that exact event; only then is
-// SETTLE queued for a later AppKit fetch and dispatch.
+// an event, so an eligible active fetch gets a marked BARRIER before its
+// innermost CFRunLoop activation is stopped. Between fetches, the next eligible
+// outer fetch binds the request and queues BARRIER before retrieval. Only that
+// exact fetch may return BARRIER and queue SETTLE for a later AppKit dispatch.
 static NSUInteger applicationEventFetchDepth = 0;
 static NSUInteger applicationEventFetchReturnRequestedDepth = 0;
 static NSUInteger applicationEventFetchReturnRequestCount = 0;
 static NSUInteger applicationEventFetchReturnCount = 0;
+static NSUInteger applicationEventFetchReturnClaimCount = 0;
+static NSUInteger applicationEventFetchRunLoopStopCount = 0;
 static NSUInteger applicationEventFetchInvocationCount = 0;
 static NSUInteger applicationEventFetchActiveInvocation = 0;
 static NSUInteger applicationEventFetchReturnRequestedInvocation = 0;
@@ -48,6 +51,7 @@ static NSUInteger applicationFetchBarrierEventDequeueInvocation = 0;
 static NSUInteger applicationSettleEventDequeueInvocation = 0;
 static NSUInteger applicationStopEventDequeueInvocation = 0;
 static bool applicationEventFetchReturnRequested = false;
+static bool applicationEventFetchReturnRequestTargetsActiveFetch = false;
 static NSEventMask applicationEventFetchMask = 0;
 static bool applicationEventFetchDequeues = false;
 static bool applicationEventFetchModeSupplied = false;
@@ -75,18 +79,47 @@ static constexpr NSInteger applicationStopEventCode = 4;
 {
     const auto fetchDepth = ++applicationEventFetchDepth;
     const auto fetchInvocation = ++applicationEventFetchInvocationCount;
-    if (fetchDepth == 1)
-    {
-        applicationEventFetchActiveInvocation = fetchInvocation;
-        applicationEventFetchMask = mask;
-        applicationEventFetchDequeues = dequeue == YES;
-        applicationEventFetchModeSupplied = mode != nil;
-        applicationEventFetchContextRecorded = true;
-    }
-
     NSEvent* event = nil;
     @try
     {
+        if (fetchDepth == 1)
+        {
+            applicationEventFetchActiveInvocation = fetchInvocation;
+            applicationEventFetchMask = mask;
+            applicationEventFetchDequeues = dequeue == YES;
+            applicationEventFetchModeSupplied = mode != nil;
+            applicationEventFetchContextRecorded = true;
+        }
+
+        // A shutdown request made between AppKit fetches has no invocation to
+        // bind yet. The first eligible outer fetch claims it and queues BARRIER
+        // before calling super, so only that exact fetch may return the event.
+        if (fetchDepth == 1
+            && applicationEventFetchReturnRequested
+            && applicationEventFetchReturnRequestedDepth == 0
+            && applicationEventFetchReturnRequestedInvocation == 0
+            && dequeue == YES
+            && mode != nil
+            && (mask & NSEventMaskApplicationDefined) != 0)
+        {
+            applicationEventFetchReturnRequestedDepth = fetchDepth;
+            applicationEventFetchReturnRequestedInvocation = fetchInvocation;
+            ++applicationEventFetchReturnClaimCount;
+            std::fprintf(stderr,
+                         "NATIVE_APP_LOOP_FETCH_RETURN_CLAIMED depth=%lu invocation=%lu\n",
+                         static_cast<unsigned long>(fetchDepth),
+                         static_cast<unsigned long>(fetchInvocation));
+            std::fflush(stderr);
+            if (! NativeFilePanel::postBoundApplicationFetchBarrierEvent())
+            {
+                std::fputs("NATIVE_APP_LOOP_FETCH_BARRIER_POST_FAILED\n", stderr);
+                std::fflush(stderr);
+                std::terminate();
+            }
+            std::fputs("NATIVE_APP_LOOP_FETCH_BARRIER_POSTED\n", stderr);
+            std::fflush(stderr);
+        }
+
         event = [super nextEventMatchingMask:mask
                                   untilDate:expiration
                                      inMode:mode
@@ -171,6 +204,9 @@ static constexpr NSInteger applicationStopEventCode = 4;
         if (fetchDepth == 1)
         {
             applicationEventFetchActiveInvocation = 0;
+            applicationEventFetchMask = 0;
+            applicationEventFetchDequeues = false;
+            applicationEventFetchModeSupplied = false;
             applicationEventFetchContextRecorded = false;
         }
     }
@@ -604,6 +640,8 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
         applicationEventFetchReturnRequestedDepth = 0;
         applicationEventFetchReturnRequestCount = 0;
         applicationEventFetchReturnCount = 0;
+        applicationEventFetchReturnClaimCount = 0;
+        applicationEventFetchRunLoopStopCount = 0;
         applicationEventFetchInvocationCount = 0;
         applicationEventFetchActiveInvocation = 0;
         applicationEventFetchReturnRequestedInvocation = 0;
@@ -611,6 +649,7 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
         applicationSettleEventDequeueInvocation = 0;
         applicationStopEventDequeueInvocation = 0;
         applicationEventFetchReturnRequested = false;
+        applicationEventFetchReturnRequestTargetsActiveFetch = false;
         applicationEventFetchMask = 0;
         applicationEventFetchDequeues = false;
         applicationEventFetchModeSupplied = false;
@@ -783,6 +822,15 @@ bool NativeFilePanel::applicationIsReadyForSettleEvent() noexcept
 {
     @autoreleasepool
     {
+        const auto betweenFetches = applicationEventFetchDepth == 0
+            && applicationEventFetchActiveInvocation == 0
+            && ! applicationEventFetchContextRecorded;
+        const auto eligibleActiveFetch = applicationEventFetchDepth == 1
+            && applicationEventFetchActiveInvocation != 0
+            && applicationEventFetchDequeues
+            && applicationEventFetchModeSupplied
+            && (applicationEventFetchMask & NSEventMaskApplicationDefined) != 0
+            && applicationEventFetchContextRecorded;
         return applicationStartEventWasHandled()
             && ! applicationSettleEventPosted
             && applicationSettleEventCount == 0
@@ -792,11 +840,7 @@ bool NativeFilePanel::applicationIsReadyForSettleEvent() noexcept
             && ! applicationStopEventPosted
             && applicationStopEventCount == 0
             && ! applicationEventFetchReturnRequested
-            && applicationEventFetchDepth == 1
-            && applicationEventFetchDequeues
-            && applicationEventFetchModeSupplied
-            && (applicationEventFetchMask & NSEventMaskApplicationDefined) != 0
-            && applicationEventFetchContextRecorded
+            && (betweenFetches || eligibleActiveFetch)
             && isRunnableApplicationEventContext();
     }
 }
@@ -804,6 +848,12 @@ bool NativeFilePanel::postApplicationSettleEvent() noexcept
 {
     @autoreleasepool
     {
+        const auto fetchBoundaryWasProved =
+            applicationEventFetchReturnRequestTargetsActiveFetch
+                ? applicationEventFetchReturnClaimCount == 0
+                    && applicationEventFetchRunLoopStopCount == 1
+                : applicationEventFetchReturnClaimCount == 1
+                    && applicationEventFetchRunLoopStopCount == 0;
         const auto postedFromReadyContext = [NSThread isMainThread]
             && applicationFetchBarrierEventPosted
             && applicationFetchBarrierEventDequeueCount == 1
@@ -817,6 +867,7 @@ bool NativeFilePanel::postApplicationSettleEvent() noexcept
             && applicationEventFetchContextRecorded
             && isRunnableApplicationEventContext();
         if (! postedFromReadyContext
+            || ! fetchBoundaryWasProved
             || applicationEventFetchReturnRequestCount != 1
             || applicationEventFetchReturnCount != 1
             || applicationEventFetchActiveInvocation == 0
@@ -829,6 +880,41 @@ bool NativeFilePanel::postApplicationSettleEvent() noexcept
         return applicationSettleEventPosted;
     }
 }
+bool NativeFilePanel::postBoundApplicationFetchBarrierEvent() noexcept
+{
+    @autoreleasepool
+    {
+        const auto bindingMatchesRequestPath =
+            applicationEventFetchReturnRequestTargetsActiveFetch
+                ? applicationEventFetchReturnClaimCount == 0
+                    && applicationEventFetchRunLoopStopCount == 0
+                : applicationEventFetchReturnClaimCount == 1
+                    && applicationEventFetchRunLoopStopCount == 0;
+        const auto boundEligibleFetch = [NSThread isMainThread]
+            && bindingMatchesRequestPath
+            && applicationEventFetchReturnRequested
+            && applicationEventFetchReturnRequestCount == 1
+            && applicationEventFetchReturnCount == 0
+            && applicationEventFetchReturnRequestedDepth == 1
+            && applicationEventFetchReturnRequestedInvocation != 0
+            && applicationEventFetchDepth == 1
+            && applicationEventFetchActiveInvocation
+                == applicationEventFetchReturnRequestedInvocation
+            && applicationEventFetchDequeues
+            && applicationEventFetchModeSupplied
+            && (applicationEventFetchMask & NSEventMaskApplicationDefined) != 0
+            && applicationEventFetchContextRecorded
+            && ! applicationFetchBarrierEventPosted
+            && applicationFetchBarrierEventCount == 0
+            && applicationFetchBarrierEventDequeueCount == 0
+            && isRunnableApplicationEventContext();
+        if (! boundEligibleFetch)
+            return false;
+        applicationFetchBarrierEventPosted =
+            postApplicationControlEvent(applicationFetchBarrierEventCode);
+        return applicationFetchBarrierEventPosted;
+    }
+}
 bool NativeFilePanel::requestApplicationEventFetchReturn() noexcept
 {
     @autoreleasepool
@@ -838,49 +924,97 @@ bool NativeFilePanel::requestApplicationEventFetchReturn() noexcept
             || applicationEventFetchReturnRequested
             || applicationEventFetchReturnRequestCount != 0
             || applicationEventFetchReturnCount != 0
-            || applicationEventFetchDepth != 1
-            || ! applicationEventFetchContextRecorded
             || ! isRunnableApplicationEventContext())
             return false;
+
+        const auto targetsActiveFetch = applicationEventFetchDepth == 1;
 
         auto* runLoop = CFRunLoopGetCurrent();
         if (runLoop == nullptr || runLoop != CFRunLoopGetMain())
             return false;
-        auto mode = CFRunLoopCopyCurrentMode(runLoop);
-        if (mode == nullptr)
-            return false;
-
-        applicationFetchBarrierEventPosted =
-            postApplicationControlEvent(applicationFetchBarrierEventCode);
-        if (! applicationFetchBarrierEventPosted)
+        CFStringRef mode = nullptr;
+        if (targetsActiveFetch)
         {
-            CFRelease(mode);
+            mode = CFRunLoopCopyCurrentMode(runLoop);
+            if (mode == nullptr)
+                return false;
+        }
+
+        applicationEventFetchReturnRequested = true;
+        applicationEventFetchReturnRequestTargetsActiveFetch = targetsActiveFetch;
+        applicationEventFetchReturnRequestedDepth =
+            targetsActiveFetch ? applicationEventFetchDepth : 0;
+        applicationEventFetchReturnRequestedInvocation =
+            targetsActiveFetch ? applicationEventFetchActiveInvocation : 0;
+        ++applicationEventFetchReturnRequestCount;
+        if (targetsActiveFetch && ! postBoundApplicationFetchBarrierEvent())
+        {
+            applicationEventFetchReturnRequested = false;
+            applicationEventFetchReturnRequestTargetsActiveFetch = false;
+            applicationEventFetchReturnRequestedDepth = 0;
+            applicationEventFetchReturnRequestedInvocation = 0;
+            applicationEventFetchReturnRequestCount = 0;
+            if (mode != nullptr)
+                CFRelease(mode);
             return false;
         }
-        applicationEventFetchReturnRequested = true;
-        applicationEventFetchReturnRequestedDepth = applicationEventFetchDepth;
-        applicationEventFetchReturnRequestedInvocation = applicationEventFetchActiveInvocation;
-        ++applicationEventFetchReturnRequestCount;
-        const auto* modeName = [(NSString*) mode UTF8String];
+        const auto* modeName = mode != nullptr ? [(NSString*) mode UTF8String] : nullptr;
         std::fprintf(stderr,
-                     "NATIVE_APP_LOOP_FETCH_RETURN_REQUESTED depth=%lu invocation=%lu mode=%s mask=0x%llx dequeue=%d\n",
+                     "NATIVE_APP_LOOP_FETCH_RETURN_REQUESTED target=%s depth=%lu invocation=%lu mode=%s mask=0x%llx dequeue=%d\n",
+                     targetsActiveFetch ? "active" : "next-eligible",
                      static_cast<unsigned long>(applicationEventFetchReturnRequestedDepth),
                      static_cast<unsigned long>(applicationEventFetchReturnRequestedInvocation),
-                     modeName != nullptr ? modeName : "<unavailable>",
+                     modeName != nullptr ? modeName : "<between-fetches>",
                      static_cast<unsigned long long>(applicationEventFetchMask),
                      applicationEventFetchDequeues ? 1 : 0);
         std::fflush(stderr);
-        std::fputs("NATIVE_APP_LOOP_FETCH_BARRIER_POSTED\n", stderr);
-        std::fflush(stderr);
-        CFRelease(mode);
-        CFRunLoopStop(runLoop);
+        if (targetsActiveFetch)
+        {
+            std::fputs("NATIVE_APP_LOOP_FETCH_BARRIER_POSTED\n", stderr);
+            std::fflush(stderr);
+        }
+        if (mode != nullptr)
+            CFRelease(mode);
+        if (targetsActiveFetch)
+        {
+            ++applicationEventFetchRunLoopStopCount;
+            CFRunLoopStop(runLoop);
+        }
         return true;
+    }
+}
+void NativeFilePanel::logApplicationSettleReadiness() noexcept
+{
+    @autoreleasepool
+    {
+        std::fprintf(stderr,
+                     "NATIVE_APP_LOOP_SETTLE_READINESS depth=%lu activeInvocation=%lu context=%d mask=0x%llx dequeue=%d mode=%d request=%d targetActive=%d claims=%lu runLoopStops=%lu start=%d running=%d modalWindow=%d\n",
+                     static_cast<unsigned long>(applicationEventFetchDepth),
+                     static_cast<unsigned long>(applicationEventFetchActiveInvocation),
+                     applicationEventFetchContextRecorded ? 1 : 0,
+                     static_cast<unsigned long long>(applicationEventFetchMask),
+                     applicationEventFetchDequeues ? 1 : 0,
+                     applicationEventFetchModeSupplied ? 1 : 0,
+                     applicationEventFetchReturnRequested ? 1 : 0,
+                     applicationEventFetchReturnRequestTargetsActiveFetch ? 1 : 0,
+                     static_cast<unsigned long>(applicationEventFetchReturnClaimCount),
+                     static_cast<unsigned long>(applicationEventFetchRunLoopStopCount),
+                     applicationStartEventWasHandled() ? 1 : 0,
+                     [NSApp isRunning] ? 1 : 0,
+                     [NSApp modalWindow] == nil ? 0 : 1);
+        std::fflush(stderr);
     }
 }
 bool NativeFilePanel::applicationSettleEventWasHandled() noexcept
 {
     @autoreleasepool
     {
+        const auto fetchBoundaryWasProved =
+            applicationEventFetchReturnRequestTargetsActiveFetch
+                ? applicationEventFetchReturnClaimCount == 0
+                    && applicationEventFetchRunLoopStopCount == 1
+                : applicationEventFetchReturnClaimCount == 1
+                    && applicationEventFetchRunLoopStopCount == 0;
         return [NSThread isMainThread] && applicationSettleEventPosted
             && applicationFetchBarrierEventPosted
             && applicationFetchBarrierEventCount == 1
@@ -889,6 +1023,8 @@ bool NativeFilePanel::applicationSettleEventWasHandled() noexcept
             && applicationFetchBarrierEventHandledWithoutModalWindow
             && applicationFetchBarrierEventHandledAfterFetchReturn
             && applicationFetchBarrierEventDequeueCount == 1
+            && applicationFetchBarrierEventDequeueInvocation
+                == applicationEventFetchReturnRequestedInvocation
             && applicationSettleEventCount == 1
             && applicationSettleEventHandledWhileRunning
             && applicationSettleEventPostedFromReadyContext
@@ -900,6 +1036,7 @@ bool NativeFilePanel::applicationSettleEventWasHandled() noexcept
             && applicationEventFetchReturnRequestCount == 1
             && applicationEventFetchReturnCount == 1
             && applicationEventFetchReturnRequestedInvocation != 0
+            && fetchBoundaryWasProved
             && applicationSettleEventDequeueInvocation
                 > applicationEventFetchReturnRequestedInvocation;
     }

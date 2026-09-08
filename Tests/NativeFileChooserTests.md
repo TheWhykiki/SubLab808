@@ -79,14 +79,19 @@ is running without an AppKit modal window. JUCE may deliver those timer messages
 from any common run-loop mode, so posting does not depend on AppKit's transient
 `currentMode`; the marked BARRIER, SETTLE and STOP events themselves must be dequeued
 exactly once through the public AppKit fetch. On that final ready turn the
-coordinator arms an independent GCD watchdog, stops the recurring 10 ms timer, posts one
-private prioritized BARRIER event, and calls public `CFRunLoopStop` once on the current
-main run loop before SETTLE exists. CoreFoundation returns only the innermost active
-run-loop activation. The targeted outermost public AppKit fetch must dequeue and return
-that exact BARRIER once. Only in its return path does the test application post one
-private prioritized SETTLE event. AppKit then dispatches BARRIER before a later public
-fetch can dequeue SETTLE in a non-null supplied mode. Stopping the recurring timer
-prevents further coordinator-timer messages. Invocation IDs prove that separation. The
+coordinator arms an independent GCD watchdog, stops the recurring 10 ms timer, and creates
+one shutdown request before SETTLE exists. If an eligible outer AppKit fetch is active,
+the harness posts one private prioritized BARRIER event and calls public `CFRunLoopStop`
+once on the current main run loop;
+CoreFoundation returns only its innermost active run-loop activation. If the timer fires
+between fetches, the next outer fetch whose supplied mask, mode and dequeue flag can
+retrieve BARRIER claims the pending request and posts BARRIER before entering AppKit. In either path that
+exact public fetch must dequeue and return BARRIER once. Only in its return path does the
+test application post one private prioritized SETTLE event. AppKit then dispatches
+BARRIER before a later public fetch can dequeue SETTLE in a non-null supplied mode.
+Stopping the recurring timer prevents further coordinator-timer messages. Exact request,
+claim and `CFRunLoopStop` counters distinguish the two paths, while invocation IDs prove
+the BARRIER/SETTLE/STOP separation. The
 harness does not change `NSApplication`'s running flag, retrieve an event, or dispatch one
 itself. The local monitor must observe both BARRIER and SETTLE while the application is
 running without a modal window. Only then does the SETTLE handler post prioritized STOP

@@ -700,10 +700,10 @@ private:
         std::fputs("NATIVE_APP_LOOP_STOP_READY_BEGIN\n", stderr);
         std::fflush(stderr);
         // Stable readiness is established on clean main-thread timer turns.
-        // The final turn retires this recurring source, queues a marked
-        // BARRIER, and asks CoreFoundation to return the active AppKit
-        // event-fetch activation. That fetch must return BARRIER; only then
-        // does the test application queue SETTLE for a later fetch.
+        // The final turn retires this recurring source and creates one request.
+        // If an eligible AppKit fetch is active, it receives BARRIER before
+        // CoreFoundation is asked to return it; otherwise the next eligible
+        // fetch claims the request and then queues BARRIER before retrieval.
         startTimer(10);
     }
 
@@ -727,7 +727,11 @@ private:
         if (! NativeFilePanel::applicationIsReadyForSettleEvent())
         {
             fenceTurns = 0;
-            if (now() >= deadline) shutdownTimeout("ready");
+            if (now() >= deadline)
+            {
+                NativeFilePanel::logApplicationSettleReadiness();
+                shutdownTimeout("ready");
+            }
             return;
         }
         if (++fenceTurns < 3) return;
@@ -740,9 +744,9 @@ private:
         }
         std::fputs("NATIVE_APP_LOOP_RETURN_WATCHDOG_ARMED\n", stderr);
         std::fflush(stderr);
-        // stopTimer() is synchronous inside its callback. Queue BARRIER and
-        // request a return from the innermost run-loop activation before
-        // SETTLE exists; the returning fetch will queue SETTLE afterwards.
+        // stopTimer() is synchronous inside its callback. Queue BARRIER before
+        // SETTLE exists. An active eligible fetch is stopped; between fetches,
+        // the next eligible outer fetch binds and returns BARRIER itself.
         stopTimer();
         nativeApplicationSettleDispatchRequested =
             NativeFilePanel::requestApplicationEventFetchReturn();

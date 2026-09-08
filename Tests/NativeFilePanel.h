@@ -15,14 +15,16 @@ public:
     static void prepareTestApplication(ApplicationStopCallback);
     [[nodiscard]] static bool applicationIsRunning() noexcept;
     // Private START/BARRIER/SETTLE/STOP events prove distinct dispatches through
-    // the real NSApplication event loop. BARRIER plus CFRunLoopStop returns the
-    // active fetch; only its return path queues SETTLE for a later fetch. The
-    // test never pumps or sends an event itself.
+    // the real NSApplication event loop. An eligible active fetch is returned
+    // with BARRIER; between fetches, the next eligible fetch claims it. Only
+    // that return path queues SETTLE. The test never pumps or sends an event.
     [[nodiscard]] static bool postApplicationStartEvent() noexcept;
     [[nodiscard]] static bool applicationStartEventWasHandled() noexcept;
     [[nodiscard]] static bool applicationIsReadyForSettleEvent() noexcept;
     [[nodiscard]] static bool postApplicationSettleEvent() noexcept;
+    [[nodiscard]] static bool postBoundApplicationFetchBarrierEvent() noexcept;
     [[nodiscard]] static bool requestApplicationEventFetchReturn() noexcept;
+    static void logApplicationSettleReadiness() noexcept;
     [[nodiscard]] static bool applicationSettleEventWasHandled() noexcept;
     [[nodiscard]] static bool applicationIsReadyForStopEvent() noexcept;
     [[nodiscard]] static bool postApplicationStopEvent() noexcept;
