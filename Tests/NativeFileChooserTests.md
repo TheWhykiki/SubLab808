@@ -8,9 +8,11 @@ with a fake or call an artificial successful import/export callback.
 Each case requires a visible, correctly typed native panel and a live JUCE modal
 before the owner transition. Afterwards the native panel must be hidden, its JUCE
 delegate cleared, removed from `NSApp.windows`, and the JUCE modal destroyed. The
-test-only observer also requires JUCE's real `beginWithCompletionHandler` block to
-enter and return exactly once before the editor is reopened; panel disappearance
-alone is not treated as completed teardown. The next same-process case and wrap-around
+test-only observer also requires AppKit to release JUCE's real
+`beginWithCompletionHandler` block before the editor is reopened. The callback
+must either enter and return exactly once before that release, or remain entirely
+unentered when owner teardown closes the panel; panel disappearance alone is not
+treated as completed teardown. The next same-process case and wrap-around
 sentinel additionally detect leaked session state. Exact processor state, preset selection,
 and every file/directory in the temporary fixture must remain unchanged.
 The reopened editor must accept a real Save As/Cancel interaction and parameter
@@ -34,7 +36,9 @@ acceptance must cover that stronger boundary.
 The bridge observes only the test process's own NSApp windows. It installs a
 test-process-only observer around `NSSavePanel.beginWithCompletionHandler`, calls
 the original implementation and JUCE handler exactly as supplied, and records
-entry and normal return without closing or confirming the panel itself. It stores
+entry, normal return, and final wrapper-block release without closing or confirming
+the panel itself. A callback-local retain keeps the observer valid if the JUCE
+handler synchronously releases AppKit's last block owner. It stores
 the panel's opaque identity and re-resolves it through the live window list on every
 inspection; it deliberately does not retain the panel because JUCE's close-release
 is part of the lifecycle under test. The fixture redirects the panel to an isolated
@@ -48,8 +52,9 @@ timer-driven state machine performs at most one bounded action per callback and
 returns after every asynchronous boundary: activation, menu dismissal, panel
 presentation, owner transition, panel retirement, editor reopen and control probe.
 It never calls `CFRunLoopRunInMode`, manually sends an `NSEvent`, or enters a nested
-JUCE dispatch loop. AppKit therefore retires each modeless panel completion in its
-normal application loop before the next session starts. Before its first order-in, the
+JUCE dispatch loop. AppKit therefore invokes or discards, and then releases, each
+modeless panel completion in its normal application loop before the next session
+starts. Before its first order-in, the
 synthetic `Preset UI Tests` host window also disables AppKit's automatic order
 animation; otherwise that short-lived console-only window can leave a display-link
 worker running after `main()` exits. Native

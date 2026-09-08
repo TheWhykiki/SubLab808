@@ -198,13 +198,36 @@ class WindowsUpdaterContractTests(unittest.TestCase):
         operations_root = self.source.index("const auto root = localOperationsRoot();", normal_start)
         self.assertLess(self_check, operations_root)
 
+    def test_release_gate_is_fresh_one_shot_and_installed_parent_cannot_resume(self):
+        run_start = self.source.index("int runWindowsUpdater()")
+        installed_resume_guard = self.source.index(
+            "The installed release-gate helper cannot resume an existing operation",
+            run_start,
+        )
+        mutex = self.source.index("ProductMutex mutex;", run_start)
+        self.assertLess(installed_resume_guard, mutex)
+        self.assertIn(
+            "Release-gate operations are one-shot and cannot resume persisted progress",
+            self.source,
+        )
+        self.assertIn(
+            "Release-gate operations must start from a fresh one-shot journal",
+            self.source,
+        )
+        self.assertIn(
+            "Persisted verified release-gate journal was replayable as a fresh acceptance",
+            self.source,
+        )
+
     def test_build_contract_validation_is_side_effect_free_and_compile_only_is_closed(self):
         required = [
             "--validate-build-contract", "--challenge", "--response-pipe",
             "--parent-process-id", "--product", "--version", "--manufacturer",
             "--github-owner", "--github-repository", "--architecture",
             "--upgrade-code", "--other-upgrade-code", "--current-signer-sha256",
-            "--next-signer-sha256", r'\"schemaVersion\":2',
+            "--next-signer-sha256", "--release-gate-public-key-xy",
+            "--release-gate-next-public-key-xy", r'\"schemaVersion\":3',
+            r'\"releaseGatePublicKeyXY\"', r'\"releaseGateNextPublicKeyXY\"',
             "buildContractMatches", "WK_WINDOWS_UPDATER_COMPILE_ONLY",
             "whykiki.windows-updater-build-contract", "canonicalBuildContractResponse",
             "GetNamedPipeServerProcessId", "SECURITY_SQOS_PRESENT",
@@ -218,6 +241,20 @@ class WindowsUpdaterContractTests(unittest.TestCase):
         self.assertIn("Build-contract repository mutation was accepted", self.source)
         self.assertIn("Build-contract current-signer mutation was accepted", self.source)
         self.assertIn("Build-contract next-signer mutation was accepted", self.source)
+        self.assertIn(
+            "Build-contract release-gate current-key mutation was accepted", self.source
+        )
+        self.assertIn(
+            "Build-contract release-gate next-key mutation was accepted", self.source
+        )
+        self.assertIn(
+            "Build-contract release-gate keys did not enforce real P-256 curve points",
+            self.source,
+        )
+        self.assertIn(
+            "Build-contract response does not attest the exact release-gate key pair",
+            self.source,
+        )
         self.assertIn("Build-contract challenge validation failed", self.source)
         self.assertIn("Build-contract pipe-name validation failed", self.source)
         dispatch = self.source.index(

@@ -7,12 +7,15 @@ Workflow besitzt ausschließlich `workflow_dispatch`, verlangt
 Tag im Format `vMAJOR.MINOR.PATCH`. Der Tag muss exakt zur CMake-Projektversion
 passen und ein Vorfahr des aktuellen Default-Branch-Standes sein. Der Dispatch
 muss außerdem aus dem Default Branch des kanonischen Repositories
-`TheWhykiki/SubLab808` stammen. Der aktuelle Workflow ist absichtlich nur für
-den ersten signierten Windows-Release freigeschaltet und verlangt zusätzlich
-`confirm_first_windows_release_bootstrap=true`.
+`TheWhykiki/SubLab808` stammen. `scripts/check-windows-release-state.py` löst
+aus der vollständig paginierten öffentlichen Historie entweder den einmaligen
+Windows-Bootstrap oder die exakt neueste stabile Windows-Baseline N auf. Nur im
+Bootstrap-Modus muss zusätzlich
+`confirm_first_windows_release_bootstrap=true` gesetzt sein; ein Follow-up
+verlangt stattdessen den nativen installierten N→N+1-Gate auf x64 und ARM64EC.
 
 Ein Release darf niemals nur Windows enthalten, weil auch der macOS-Updater
-`/releases/latest` auswertet. Der Publish-Job benötigt deshalb sowohl beide
+`/releases/latest` auswertet. Der Stage-Job benötigt deshalb sowohl beide
 Windows-Jobs als auch den signierten und notarisierten macOS-Job und die
 nachgelagerte native Intel-Abnahme genau dieses macOS-Kandidaten.
 
@@ -21,12 +24,22 @@ nachgelagerte native Intel-Abnahme genau dieses macOS-Kandidaten.
 Vor dem ersten echten Lauf müssen im GitHub-Repository diese Werte eingerichtet
 werden:
 
+Zusätzlich muss vor dem Bootstrap unter **Settings → General → Releases**
+**Enable release immutability** aktiviert werden. Diese Einstellung schützt nur
+künftig veröffentlichte Releases und heilt keine bereits vorhandenen veränderlichen
+Releases nachträglich; der Workflow prüft sie deshalb vor Authorization, Stage und
+Finalize jeweils fail-closed über das separate Administration-Read-Token.
+
 | Typ | Name | Inhalt |
 | --- | --- | --- |
 | Secret | `WINDOWS_CODE_SIGNING_PFX_BASE64` | Base64-kodierte PFX-Datei mit genau einem privaten Code-Signing-Schlüssel |
 | Secret | `WINDOWS_CODE_SIGNING_PFX_PASSWORD` | Passwort der PFX-Datei |
+| Secret | `WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64` | Kanonisches Base64 einer separaten ECDSA-P-256-PKCS#8-Private-Key-Datei; signiert ausschließlich kurzlebige N→N+1-Abnahmefreigaben |
+| Secret | `IMMUTABLE_RELEASES_ADMIN_READ_TOKEN` | Eng begrenztes Fine-grained-PAT oder GitHub-App-Token mit ausschließlich Repository-Administration-Lesezugriff zur fail-closed Prüfung von `immutable-releases.enabled=true`; nie an Build- oder Acceptance-Jobs übergeben |
 | Variable | `WINDOWS_CODE_SIGNING_CERT_SHA256` | Öffentlicher, 64-stelliger SHA-256-Fingerprint des aktuellen Windows-Leaf-Zertifikats |
 | Variable | `WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256` | Optionaler, vom aktuellen Pin verschiedener 64-stelliger SHA-256-Fingerprint des nächsten Windows-Leaf-Zertifikats |
+| Variable | `WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY` | Zum Private Key gehöriger P-256-Public-Key als exakt 128 Großhex-Zeichen `X||Y` |
+| Variable | `WINDOWS_RELEASE_GATE_NEXT_PUBLIC_KEY_XY` | Optionaler, verschiedener nächster P-256-Public-Key im selben Format für eine vorbereitete Gate-Key-Rotation |
 | Variable | `WINDOWS_RFC3161_TIMESTAMP_URL` | Absolute HTTPS-URL des RFC-3161-Zeitstempeldienstes |
 | Secret | `MACOS_DEVELOPER_ID_APPLICATION_P12_BASE64` | Base64-kodiertes Developer-ID-Application-Zertifikat samt privatem Schlüssel |
 | Secret | `MACOS_DEVELOPER_ID_APPLICATION_P12_PASSWORD` | Passwort der Application-P12-Datei |
@@ -46,6 +59,15 @@ Nur der Updater erhält zusätzlich den optionalen nächsten Pin als eng begrenz
 Payload-Allowlist für einen Zertifikatswechsel; der Launcher und die
 Selbstprüfung des Updaters akzeptieren weiterhin ausschließlich den aktuellen
 Pin. Beide Pins müssen eindeutig und jeweils exakt 64 Hex-Zeichen lang sein.
+
+Die Release-Gate-Autorisierung verwendet absichtlich ein davon unabhängiges
+ECDSA-P-256-Schlüsselpaar. Der Workflow importiert den privaten PKCS#8-Key nur
+in den eng begrenzten Verifikations- und Acceptance-Schritten, leitet daraus
+den Public Key ab und verlangt bytegenaue Übereinstimmung mit
+`WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY`. Der Private Key wird weder an Build-,
+Packaging-, Stage- noch Finalize-Prozesse vererbt. Der aktuelle und optional
+nächste Public Key werden dagegen in den Updater kompiliert und in der Evidence
+gebunden, damit eine Rotation über genau einen Bridge-Release möglich bleibt.
 
 Die Windows-PFX wird in einen zufälligen laufbezogenen `CurrentUser`-Store
 importiert. Eine restriktive Datei-ACL gibt nur dem Runner-Benutzer Zugriff. Der
@@ -74,19 +96,27 @@ Windows baut und testet in getrennten nativen Jobs:
   `-A ARM64EC`.
 
 CMake erhält bereits vor dem Build exakt
-`SUBLAB808_WINDOWS_UPDATER_SIGNER_SHA256` und optional den davon verschiedenen
-`SUBLAB808_WINDOWS_UPDATER_NEXT_SIGNER_SHA256`. Die Production-VST3 enthält genau
-den Updater unter `Contents\Helpers\SubLab808Updater.exe`. Der MSI-Packager
+`SUBLAB808_WINDOWS_UPDATER_SIGNER_SHA256`, optional den davon verschiedenen
+`SUBLAB808_WINDOWS_UPDATER_NEXT_SIGNER_SHA256`, den exakt 128-stelligen
+`SUBLAB808_WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY` und optional den davon
+verschiedenen `SUBLAB808_WINDOWS_RELEASE_GATE_NEXT_PUBLIC_KEY_XY`. Die
+Production-VST3 enthält genau den Updater unter
+`Contents\Helpers\SubLab808Updater.exe`. Der MSI-Packager
 erhält den exakten Updaterpfad, nativen Hosttest, `SignTool`, Zeitstempel-URL,
 Zertifikats-Store/-Thumbprint, `ExpectedSignerSha256` und optional
 `ExpectedNextSignerSha256`. Die PFX und sämtliche tatsächlich erzeugten
 Signaturen müssen immer dem aktuellen Pin entsprechen; der nächste Pin erteilt
-keine Berechtigung zum Signieren dieses Builds. Der Packager signiert sämtliche
+keine Berechtigung zum Signieren dieses Builds. Entsprechend muss der aktive
+Release-Gate-Private-Key exakt zum aktuellen Gate-Public-Key gehören; der
+nächste Gate-Key darf noch keine Autorisierung ausstellen. Der Packager signiert sämtliche
 PE-Dateien im Payload, prüft die administrativ extrahierte MSI-Nutzlast mit dem
-Hosttest und signiert zuletzt das MSI. Die Windows-Evidence in Schema 3 bindet
+Hosttest und signiert zuletzt das MSI. Die Windows-Evidence in Schema 4 bindet
 aktuellen Pin, optionalen nächsten Pin und die daraus geordnete Payload-Allowlist
-`[current]` beziehungsweise `[current, next]`. Sie enthält zusätzlich den exakten
-40-stelligen Tag-Commit. Der Publish-Job akzeptiert x64 und ARM64EC nur, wenn
+`[current]` beziehungsweise `[current, next]`. Evidence-Schema 4 bindet außerdem
+`releaseGatePublicKeyXY`, den optionalen `releaseGateNextPublicKeyXY` und die
+geordneten `releaseGatePublicKeyAllowlistXY` nach demselben Current/Next-Prinzip.
+Sie enthält zusätzlich den exakten
+40-stelligen Tag-Commit. Der Stage-Job akzeptiert x64 und ARM64EC nur, wenn
 beide Commitwerte mit seinem erneut von `origin` geprüften Tag übereinstimmen.
 
 Bevor ein Windows-Kandidat als Actions-Artefakt hochgeladen wird, führt derselbe
@@ -105,32 +135,64 @@ eine nicht beweisbar vollständige Entfernung blockiert den Upload. Der Gate fü
 keine manuelle rekursive Löschung im systemweiten VST3-Ziel aus, sondern verwendet
 ausschließlich die ProductCode-genaue MSI-Deinstallation.
 
-Der Matrix-Gate deckt den aktuellen Kandidaten auf einem sauberen Runner ab. Da
-vor dem ersten Windows-Release noch keine signierte Vorversion existiert, kann
-dieser Bootstrap keinen echten N→N+1-Lauf des ausgelieferten Updaters beweisen.
-Der Autorisierungsjob liest deshalb die vollständige öffentliche Release-Liste
-fail-closed und erlaubt den Bootstrap nur, wenn noch kein stabiles Windows-MSI
-oder zugehöriges Evidence-Asset existiert. Derselbe Zustand wird vor Erzeugen
-des Drafts und unmittelbar vor dessen Sichtbarkeit erneut geprüft. Eine
-gebundene `--paginate --slurp`-Abfrage erfasst dabei alle REST-Seiten; zu viele,
-unvollständige oder strukturell mehrdeutige Seiten sowie doppelte Release-IDs
-werden abgelehnt.
-Zusätzlich bindet `Installer/Windows/bootstrap-policy.json` diese Ausnahme
-dauerhaft an Produkt und Tag `v1.4.0`; ein späterer Versionstag kann sie auch
-nach dem Löschen alter Release-Assets nicht erneut verwenden. Autorisierung und
-Publish beziehen Checker und Policy aus dem Default-Branch-Commit, aus dem der
-Workflow gestartet wurde, nicht aus frei wählbarem Candidate-Code.
-Dieser historische Bootstrap-Tag darf bei einem späteren Versions-Bump niemals
-mit der CMake-Projektversion weitergeschoben werden.
+Der Autorisierungsjob liest die vollständige öffentliche Release-Liste über
+`gh api --paginate --slurp` mit API-Version `2026-03-10`. Der Resolver akzeptiert
+nur exakte, immutable stabile Releases mit dem vollständigen Set aus acht
+Cross-Platform-Assets oder vollständige immutable Prereleases als dauerhaft
+sichtbare Quarantänen.
+Er bindet Produkt, Candidate-Tag, Baseline-ID/-Tag/-Commit und einen kanonischen
+Digest der gesamten übrigen Historie in eine einzige JSON-Zeile. Der Candidate
+muss strikt neuer als jede stabile oder quarantänisierte Windows-Version sein.
+Dieses JSON und sein SHA-256 werden während Stage und Finalize bytegenau erneut
+verlangt. Beim Ausblenden der eigenen Candidate-ID wird die flache Historie
+wieder exakt in 100er REST-Seiten aufgeteilt; dadurch bleiben auch Historien mit
+mehr als 100 Releases fail-closed prüfbar.
 
-Nach diesem einmaligen Bootstrap blockiert der Workflow absichtlich jeden
-weiteren Release. Vor einer Nachfolgeversion muss der Release-DAG erweitert
-werden: Die exakt installierte signierte Vorversion muss den vollständig
-signierten Kandidaten über ihren normalen GitHub-, Download-, Resume-, UAC- und
-Installationspfad auf x64 und ARM64EC übernehmen, bevor genau dieser Kandidat zu
-`latest` wird. Ein neu kompilierter Test-Helper oder ein anderes Repository ist
-kein Ersatz. Die reale Downgrade-Ablehnung und x64↔ARM64EC-Wechsel bleiben
-ebenfalls separate Abnahmen.
+Ohne Windows-Baseline ist nur der in
+`Installer/Windows/bootstrap-policy.json` dauerhaft gebundene Tag `v1.4.0`
+zulässig. Dieser Bootstrap führt auf beiden Architekturen eine saubere
+Installation, vollständigen Evidence-/Payloadvergleich, nativen Hostload und
+produktcodegenaue Deinstallation aus. Der Policy-Tag darf bei einem späteren
+Versions-Bump nie verschoben werden. Eine bereits vorhandene Quarantäne macht
+die Historie nicht zu einer vertrauenswürdigen Baseline und erlaubt auch keine
+Wiederverwendung ihres Tags.
+
+Für jeden Follow-up-Release wird dagegen genau das MSI der aufgelösten stabilen
+Baseline N aus deren öffentlicher immutable Release-ID geladen, gegen
+serverseitigen Digest, Evidence, Signatur, MSI-Identität und Commit attestiert
+und installiert. Noch vor dem Staging muss die Evidence dieser Baseline den
+aktiven Candidate-Gate-Key in ihrer Current/Next-Allowlist autorisieren. Nur der
+darin ausgelieferte und erneut hash-/signaturgeprüfte
+`Contents\Helpers\SubLab808Updater.exe` darf den öffentlichen Candidate N+1
+abrufen. Der Harness startet ihn mit dem eng gebundenen CLI
+`--release-gate --challenge … --response-pipe … --parent-process-id …
+--release-id … --tag … --source-commit …
+--parent-process-created-at-filetime … --expires-at-unix-seconds …
+--authorization-signature-p1363 …`. Die Signatur ist exakt 64 Byte
+IEEE-P1363-`r||s`, kanonisch als 128 Großhex-Zeichen und mit Low-S normalisiert.
+Sie bindet Domain, Schema, Repository, Produkt, Architektur, installierte
+Version, Release-ID, Tag, Commit, Challenge, Pipe, Parent-PID und dessen
+Erstellungszeit sowie eine höchstens fünf Minuten entfernte Ablaufzeit in eine
+kanonische UTF-8-Nachricht. Der kopierte `--resume`-Child muss
+über eine nur für den aktuellen Benutzer zugängliche Named Pipe genau eine
+kanonische `phase=verified`-Receipt liefern; Client-PID, Parent-Beziehung,
+Pfad, Hash und Signer werden serverseitig geprüft. Challenge, Pipe, PID,
+Erstellungszeit, Ablaufzeit, Signatur und sonstige Autorisierungsdaten dürfen
+nicht im Journal persistieren. Sowohl der installierte Parent als auch der
+kopierte Resume-Child prüfen die Autorisierung vor Mutex-, Datei-, Netzwerk-
+oder UAC-Arbeit erneut. `--resume` ist im Gate-Modus ausschließlich der interne
+Handoff auf den gerade frisch erzeugten `created`-Vorgang: Der installierte
+Helper lehnt eine übergebene Resume-ID ab, und der Child verweigert jeden bereits
+fortgeschrittenen oder `verified` Gate-Vorgang. Ein Gate-Abbruch wird daher nie
+aus persistentem Fortschritt als neue Abnahme fortgesetzt.
+
+Nach der Receipt verlangt der Gate Candidate-ProductState, den vollständigen
+installierten Evidence-Baum, nativen Hostload, Ablehnung des exakten älteren
+N-MSI, unveränderte N+1-Nutzlast, produktcodegenaue Deinstallation und die
+Bereinigung des test-eigenen Updater-Vorgangs. Ein neu gebauter Candidate-Helper
+ist kein Ersatz für den installierten N-Helper. x64↔ARM64EC-Wechsel bleiben
+eine separate physische Abnahme, weil die beiden UpgradeCodes eine parallele
+Installation absichtlich verhindern.
 
 Der macOS-Job führt den bestehenden, fail-closed Packagingpfad
 `scripts/package-release.sh Release <Version>` aus. Er baut eine Universal-VST3
@@ -165,10 +227,14 @@ Ein vollständiger Release enthält exakt diese Plattformdateien:
 - `SubLab808-<Version>-SHA256SUMS.txt`
 
 Die drei Build-Kandidaten sind Actions-Artefakte mit nur einem Tag
-Aufbewahrung. Ihre Container-Namen enthalten Run-ID und Run-Attempt, damit ein
-erneuter Lauf niemals Kandidaten eines früheren Versuchs übernimmt. Im
+Aufbewahrung. Die nativen Windows-Hostharnesses bleiben sieben Tage, die beiden
+kleinen Transition-Receipts 30 Tage als Actions-Artefakte erhalten. Receipts
+können nicht nachträglich an den bereits immutable Candidate angehängt werden
+und sind deshalb bewusst keine Release-Assets. Alle Container-Namen enthalten
+Run-ID und Run-Attempt, damit ein erneuter Lauf niemals Kandidaten eines
+früheren Versuchs übernimmt. Im
 Intel-Gate wird zusätzlich ein deterministischer SHA-256-Wert über alle drei
-macOS-Dateien ausgegeben. Der Publish-Job hängt zwingend von diesem Gate ab,
+macOS-Dateien ausgegeben. Der Stage-Job hängt zwingend von diesem Gate ab,
 berechnet denselben Wert aus seinem erneut heruntergeladenen Kandidaten und
 verweigert bei jeder Abweichung die Veröffentlichung. Außerdem werden dort die Windows-Evidence und sämtliche Hashes
 erneut geprüft. Auf einem macOS-Runner werden zusätzlich die heruntergeladenen
@@ -178,38 +244,58 @@ erneut geprüft.
 
 ## Gestufte Veröffentlichung und Fehlergrenzen
 
-Der Publish-Job besitzt als einziger `contents: write`. Er verweigert vorhandene
-Releases einschließlich Drafts, erstellt einen neuen Draft und merkt sich direkt
-dessen exakte Release-ID. Erst nach Upload aller acht geprüften Dateien müssen
-API-Assetnamen und serverseitige SHA-256-Digests vollständig passen. Unmittelbar
-vor dem Publish werden Origin-Tag und die zu Beginn gemerkte Latest-Release-ID
-erneut verglichen. Eine zwischenzeitliche manuelle oder fremde Veröffentlichung
-blockiert damit den Sichtbarkeitsschritt.
+`authorize_windows_release`, `stage-release` und `finalize-release` prüfen über
+ein separates Administration-Read-Token jeweils fail-closed, dass GitHubs
+Repository-Policy `immutable-releases.enabled=true` meldet. Alle REST-Abfragen,
+die das neue `immutable`-Feld auswerten oder den Resolver speisen, pinnen
+API-Version `2026-03-10`.
 
-Erst danach wird exakt dieser Draft mit einem einzelnen API-Aufruf
-`draft=false`, `prerelease=false` und `make_latest=true` sichtbar. Der Tag muss
-semantisch neuer als das bisherige Latest-Release sein. Anschließend werden die
-eigene ID, Tag, Sichtbarkeit und Latest-Position erneut gelesen. Außerdem muss
-die vollständige öffentliche Historie weiterhin frei von jedem anderen stabilen
-Windows-Release sein; nur die soeben publizierte exakte ID und ihr festgelegter
-Bootstrap-Tag sind bei dieser Nachprüfung erlaubt. Auch die acht Assetnamen und
-ihre serverseitigen SHA-256-Digests müssen weiterhin exakt zu den lokalen,
-bereits geprüften Dateien passen. Die gesamte Nachprüfung wird bei transienten
-API-Fehlern bis zu dreimal wiederholt. Ein produktweiter
-Concurrency-Lock serialisiert diesen Workflow. Manuelle oder andere API-Clients
-kann GitHub damit nicht atomar sperren; die Nachprüfung schließt das relevante
-Fenster um den Publish-Aufruf so weit wie die Release-API erlaubt.
+`stage-release` besitzt `contents: write`, verweigert vorhandene Releases zum
+Candidate-Tag, erstellt einen Draft und merkt sich sofort dessen exakte ID.
+Alle acht Dateien werden über den ID-spezifischen Upload-Endpunkt angehängt.
+Vor Sichtbarkeit müssen der Draft per ID, Tag, explizit beim POST gespeicherten
+40-hex `target_commitish`, Run-Marker, vollständigem Namenssatz, Größen,
+Asset-IDs und serverseitigen SHA-256-Digests übereinstimmen. Der Workflow prüft
+außerdem den gepielten Remote-Tag gegen denselben Commit. Erst dann wird genau
+diese ID mit `draft=false`, `prerelease=true` und `make_latest=false`
+veröffentlicht. GitHub muss danach `immutable=true` zurückgeben; der vorherige
+Latest-Zustand und der autorisierte Historien-Snapshot müssen unverändert sein.
 
-Vor dem Sichtbarkeitsversuch entfernt der Fehler-Trap ausschließlich die in
-diesem Lauf erzeugte ID, und auch nur wenn drei Identitätsprüfungen Tag,
-eindeutige Run-Markierung und `draft=true` bestätigen. Lesen und Löschen werden
-bis zu dreimal versucht; ein Fehler wird im Step Summary als Quarantänefall
-gemeldet. Sobald der Publish-Aufruf versucht wurde, verweigert der Trap bewusst
-eine automatische Löschung: Eine möglicherweise bereits von Updatern gesehene
-öffentliche Version darf nicht still verschwinden. Jede nicht vollständig
-verifizierbare Veröffentlichung schlägt stattdessen fehl und muss vor weiteren
-Release-Aktionen manuell geprüft und gegebenenfalls quarantänisiert werden.
-Fremde oder bereits vorhandene Drafts werden nie gesucht oder entfernt.
+Der öffentliche Prerelease ist absichtlich bereits für die unveränderten
+Updater in den nativen x64- und ARM64EC-Gates erreichbar, aber noch nicht
+`latest`. Beide Acceptance-Jobs erhalten weder Code-Signing-/Notary-Secrets noch
+das Administration-Token. Sie erhalten ausschließlich den separaten
+Release-Gate-Private-Key; ohne eine dazu passende kurzlebige Signatur kann kein
+lokaler Prozess einen quarantänisierten Prerelease in den UAC-Pfad treiben. Nur
+wenn beide erfolgreich sind und Release-ID, acht
+Asset-Metadaten, Immutability, Origin-Tag, Baseline, gesamte übrige Historie und
+vorheriges Latest nochmals unverändert sind, setzt `finalize-release` dieselbe
+ID auf `prerelease=false` und `make_latest=true`. Titel und Notes werden dabei
+von „transition candidate“ auf den stabilen Release-Text umgestellt. Der
+anschließende Resolver-Aufruf erlaubt ausschließlich diese soeben promotete
+ID, schließt sie wieder aus Baseline/History-Digest aus und muss bytegenau das
+initiale JSON liefern.
+
+Der produktweite Concurrency-Lock serialisiert Workflow-Läufe. Manuelle Writer
+kann GitHub nicht atomar sperren; die wiederholten exakten API-Prüfungen
+begrenzen dieses Rennen. Ein Fehler vor jedem Veröffentlichungsversuch darf nur
+den eigenen, weiterhin eindeutig identifizierten Draft löschen. Ab dem ersten
+Publish-Versuch wird nie automatisch gelöscht oder der Tag wiederverwendet.
+Scheitert ein Architecture-Gate, bleibt die geprüfte ID als öffentlicher
+immutable Prerelease quarantänisiert und wird bei späteren Versionsentscheidungen
+mitgezählt. Bei einem fehlgeschlagenen oder zeitlich unklaren Promotion-PATCH
+liest der Finalizer die exakte ID begrenzt erneut: vollständig Stable+Latest
+gilt als Erfolg, unverändert immutable Prerelease als Quarantäne; jeder andere
+Zustand wird ehrlich als `UNKNOWN` gemeldet und verlangt manuelle Prüfung ohne
+Delete, Demotion oder Neuveröffentlichung.
+
+GitHub-hosted Windows-Runner schalten UAC aus. Der automatische Follow-up-Gate
+durchläuft deshalb den echten `ShellExecuteEx(..., runas)`-/`msiexec`-Pfad,
+beweist aber keinen sichtbaren Consent-Dialog. Vor einer realen Auslieferung
+bleibt je ein physischer x64- und Windows-on-Arm-Test mit aktiviertem UAC Pflicht:
+Consent anzeigen und bestätigen, danach Receipt, N+1-Payload, Hostload,
+Downgrade-Ablehnung und Cleanup erneut prüfen. Diese manuelle Restabnahme darf
+nicht als von GitHub Actions erfüllt dokumentiert werden.
 
 ## Windows-Zertifikatswechsel
 
@@ -250,6 +336,29 @@ verwenden. Nach dessen Prüfung müssen MSI und ausnahmslos alle PE-Dateien des
 Payloads denselben tatsächlich ermittelten Leaf-Fingerprint besitzen. Es gibt
 keinen Subject-/Issuer-Fallback und keine gemischten Signer innerhalb eines
 Pakets.
+
+## Windows-Release-Gate-Keywechsel
+
+Der Gate-Key rotiert unabhängig vom Authenticode-Zertifikat und verwendet einen
+eigenen Bridge-Release:
+
+1. Release N enthält `current=K0`, `next=K1` und damit die Evidence-Allowlist
+   `[K0, K1]`. Der aktive Private Key bleibt K0; nur er signiert die
+   kurzlebigen Transition-Autorisierungen für N.
+2. Erst nachdem N stabil veröffentlicht und auf x64 sowie ARM64EC installiert
+   wurde, wechseln Private Key und `WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY`
+   atomar auf K1. Der Pre-Publish-Gate für N+1 beweist vor jeder Sichtbarkeit,
+   dass K1 bereits in der immutable Baseline-Evidence von N autorisiert war.
+3. N+1 enthält `current=K1` und optional `next=K2`. K0 kann erst entfernt
+   werden, wenn keine weitere Abnahme gegen einen K0-only-Updater erforderlich
+   ist. Ein ungeplanter Sprung auf einen nicht in der Baseline-Allowlist
+   enthaltenen Key blockiert vor dem Staging.
+
+Public Keys sind exakt 128 Großhex-Zeichen `X||Y` auf der NIST-P-256-Kurve.
+Private Keys sind kanonisches Base64 einer PKCS#8-Struktur. Signaturen sind
+SHA-256/ECDSA im festen 64-Byte-IEEE-P1363-Format und werden vor Übergabe auf
+Low-S normalisiert. Current und Next müssen verschieden sein; der aktive
+Private Key muss immer exakt Current entsprechen.
 
 ## Normaler CI-Pfad
 

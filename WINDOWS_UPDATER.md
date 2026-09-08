@@ -20,7 +20,10 @@ byte-identical between repositories.
 Only the bounded first page
 `/repos/OWNER/REPOSITORY/releases?per_page=100` is queried. Drafts and
 prereleases are ignored. Every published release tag must be exactly
-`vMAJOR.MINOR.PATCH`; duplicate stable tags are rejected. Versions use Windows
+`vMAJOR.MINOR.PATCH`; duplicate stable tags are rejected. Ein tatsächlich
+neuer stabiler Kandidat wird nur akzeptiert, wenn GitHub `immutable=true` als
+strikten booleschen Wert liefert; ältere mutable Releases ohne Windows-Payload
+blockieren dadurch keinen ersten Windows-Bootstrap. Versions use Windows
 Installer's bounds (major/minor 0–255, patch 0–65535). The updater selects the
 smallest stable version strictly newer than both the invoking build and any
 system VST3 already present, so a certificate-rotation bridge is not skipped in
@@ -81,6 +84,24 @@ still signed by A. Only a later release may switch the helper's current pin and
 package signer to B. Do not delete the bridge release. If it falls outside the
 bounded history or the API page is full, automatic updating fails closed and a
 manually downloaded, independently verified installer is required.
+
+The CI-only `--release-gate` mode that validates an installed N→N+1 transition
+is separately authenticated. Its fixed command line binds a random challenge,
+private response-pipe name, parent PID, parent creation FILETIME, exact release
+ID/tag/source commit, expiry and a 64-byte IEEE-P1363 ECDSA signature. The
+canonical UTF-8 message also binds domain, schema, repository, product,
+architecture and installed version. The expiry must be in the future but no
+more than five minutes away; signatures use SHA-256, exact P-256 `r||s` and
+canonical Low-S. The updater accepts only its compiled current or optional next
+gate public key. It verifies the authorization immediately after its own
+Authenticode identity and again in the copied resume child, before mutex,
+filesystem, network or elevation work. No challenge, pipe, PID, timestamp,
+signature or private-key material is written to the operation journal.
+The `--resume` token in this mode is solely the parent-to-child handoff for the
+fresh operation just created by the installed helper: the installed helper
+rejects any externally supplied resume ID, and the copied child accepts only a
+`created` journal. Downloaded, installed or `verified` release-gate journals are
+never resumable, so persisted state cannot be replayed as a fresh acceptance.
 
 After an explicit reminder to save work and close Cubase, REAPER and all other
 plugin hosts, the updater starts a normal visible `msiexec /i` with UAC. It does
@@ -147,6 +168,8 @@ target_compile_definitions(${PROJECT_NAME}WindowsUpdater PRIVATE
     WK_WINDOWS_UPDATER_OTHER_UPGRADE_CODE="${OTHER_ARCH_UPGRADE_CODE}"
     WK_WINDOWS_UPDATER_SIGNER_SHA256="${DISTRIBUTION_SIGNER_SHA256}"
     WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256="${OPTIONAL_NEXT_DISTRIBUTION_SIGNER_SHA256}"
+    WK_WINDOWS_UPDATER_RELEASE_GATE_PUBLIC_KEY_XY="${RELEASE_GATE_PUBLIC_KEY_XY}"
+    WK_WINDOWS_UPDATER_RELEASE_GATE_NEXT_PUBLIC_KEY_XY="${OPTIONAL_NEXT_RELEASE_GATE_PUBLIC_KEY_XY}"
     _WIN32_WINNT=0x0A00 WINVER=0x0A00)
 target_link_libraries(${PROJECT_NAME}WindowsUpdater PRIVATE juce::juce_core
     bcrypt comctl32 crypt32 msi shell32 winhttp wintrust advapi32 ole32
@@ -168,23 +191,32 @@ The MSI pipeline signs the bridge's embedded PEs and enclosing MSI with the
 current certificate; the next certificate is only an acceptance pin for the
 following rotation step.
 
+Production builds also require exactly 128 uppercase hexadecimal characters in
+`SUBLAB808_WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY` or
+`REVERSELAB_WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY`. This is the P-256 public point
+`X||Y`. The corresponding optional `*_WINDOWS_RELEASE_GATE_NEXT_PUBLIC_KEY_XY`
+must be empty or a distinct valid point. Current and optional next are compiled
+into the helper; only the current key's separate PKCS#8 private key may issue a
+transition authorization.
+
 Before signing or packaging a staged production helper, the MSI packager executes
 its pure build-contract gate. The argument order and spellings are intentionally
 fixed; the packager creates a cryptographically random 32-byte challenge and a
 separate random private named-pipe endpoint for every invocation:
 
 ```text
-ProductUpdater.exe --validate-build-contract --challenge 64-HEX --response-pipe WhykikiAudio.UpdaterBuildContract.32-HEX --parent-process-id DECIMAL-PID --product Product --version 1.2.3 --manufacturer "Whykiki Audio" --github-owner TheWhykiki --github-repository Product --architecture x64 --upgrade-code CURRENT-GUID --other-upgrade-code OTHER-GUID --current-signer-sha256 64-HEX-SHA256 --next-signer-sha256 EMPTY-OR-64-HEX-SHA256
+ProductUpdater.exe --validate-build-contract --challenge 64-HEX --response-pipe WhykikiAudio.UpdaterBuildContract.32-HEX --parent-process-id DECIMAL-PID --product Product --version 1.2.3 --manufacturer "Whykiki Audio" --github-owner TheWhykiki --github-repository Product --architecture x64 --upgrade-code CURRENT-GUID --other-upgrade-code OTHER-GUID --current-signer-sha256 64-HEX-SHA256 --next-signer-sha256 EMPTY-OR-64-HEX-SHA256 --release-gate-public-key-xy 128-UPPER-HEX-X-THEN-Y --release-gate-next-public-key-xy EMPTY-OR-DISTINCT-128-UPPER-HEX
 ```
 
 Use `arm64ec` (lowercase) for Windows on Arm. The WIN32-subsystem helper does not
 depend on a console or stdout. It connects only to the supplied pipe, verifies
 that its server is the named parent process, and writes one canonical ASCII/UTF-8
-JSON record ending in a single LF. Schema version 2 contains
+JSON record ending in a single LF. Schema version 3 contains
 the exact fresh challenge, server PID, `buildMode=production`,
 `compileOnly=false`, and every compiled identity field: product, version,
-manufacturer, GitHub owner/repository, architecture, both UpgradeCodes and the
-exact current and optional-next certificate SHA-256 pins.
+manufacturer, GitHub owner/repository, architecture, both UpgradeCodes, the
+exact current and optional-next certificate SHA-256 pins, and the exact current
+and optional-next Release-Gate-Public-Keys.
 
 The packager owns a one-instance `CurrentUserOnly` byte-mode pipe and uses the OS
 pipe metadata to require that the connected client PID is exactly the updater

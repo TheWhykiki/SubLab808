@@ -18,6 +18,8 @@ param(
     [string[]] $UpdaterPath = @(),
     [string] $ExpectedSignerSha256,
     [string] $ExpectedNextSignerSha256,
+    [string] $ExpectedReleaseGatePublicKeyXY,
+    [string] $ExpectedReleaseGateNextPublicKeyXY,
     [string] $HostTestPath,
     [string] $DumpbinPath,
     [string] $SignToolPath,
@@ -1288,13 +1290,15 @@ function Invoke-UpdaterBuildContract {
         [string] $CurrentUpgradeCode,
         [string] $OtherUpgradeCode,
         [string] $CurrentSignerSha256,
-        [string] $NextSignerSha256
+        [string] $NextSignerSha256,
+        [string] $ReleaseGatePublicKeyXY,
+        [string] $ReleaseGateNextPublicKeyXY
     )
     $challenge = New-CryptographicHex 32
     $pipeName = 'WhykikiAudio.UpdaterBuildContract.' + (New-CryptographicHex 16)
     $parentProcessId = [Convert]::ToString($PID, 10)
     $expectedResponse = '{"schema":"whykiki.windows-updater-build-contract",' +
-        '"schemaVersion":2,"challenge":"' + $challenge + '",' +
+        '"schemaVersion":3,"challenge":"' + $challenge + '",' +
         '"serverProcessId":' + $parentProcessId + ',' +
         '"buildMode":"production","compileOnly":false,' +
         '"product":"' + $Product + '","version":"' + $ProductVersion + '",' +
@@ -1305,7 +1309,9 @@ function Invoke-UpdaterBuildContract {
         '"upgradeCode":"' + $CurrentUpgradeCode + '",' +
         '"otherUpgradeCode":"' + $OtherUpgradeCode + '",' +
         '"currentSignerSha256":"' + $CurrentSignerSha256 + '",' +
-        '"nextSignerSha256":"' + $NextSignerSha256 + '"}' + "`n"
+        '"nextSignerSha256":"' + $NextSignerSha256 + '",' +
+        '"releaseGatePublicKeyXY":"' + $ReleaseGatePublicKeyXY + '",' +
+        '"releaseGateNextPublicKeyXY":"' + $ReleaseGateNextPublicKeyXY + '"}' + "`n"
     [byte[]] $expectedBytes = [System.Text.UTF8Encoding]::new($false).GetBytes($expectedResponse)
     Assert-Condition ($expectedBytes.Length -le 4096) `
         'Expected updater build-contract response exceeds the fixed transport bound.'
@@ -1342,7 +1348,9 @@ function Invoke-UpdaterBuildContract {
             '--upgrade-code', $CurrentUpgradeCode,
             '--other-upgrade-code', $OtherUpgradeCode,
             '--current-signer-sha256', $CurrentSignerSha256,
-            '--next-signer-sha256', $NextSignerSha256
+            '--next-signer-sha256', $NextSignerSha256,
+            '--release-gate-public-key-xy', $ReleaseGatePublicKeyXY,
+            '--release-gate-next-public-key-xy', $ReleaseGateNextPublicKeyXY
         )) {
             $startInfo.ArgumentList.Add($argument)
         }
@@ -1506,7 +1514,9 @@ $updaterRelativePaths = @($updaterRelativePaths.ToArray() | Sort-Object -Unique)
 if ($AllowUnsigned) {
     Assert-Condition (-not $CertificateThumbprint -and -not $CertificateSubject -and -not $TimestampUrl -and
                       -not $SignToolPath -and -not $UseMachineCertificateStore -and
-                      -not $ExpectedSignerSha256 -and -not $ExpectedNextSignerSha256) `
+                      -not $ExpectedSignerSha256 -and -not $ExpectedNextSignerSha256 -and
+                      -not $ExpectedReleaseGatePublicKeyXY -and
+                      -not $ExpectedReleaseGateNextPublicKeyXY) `
         'Do not pass signing options together with -AllowUnsigned.'
 } else {
     Assert-Condition ($SourceCommit -cmatch '^[0-9a-f]{40}$') `
@@ -1529,6 +1539,16 @@ if ($AllowUnsigned) {
     Assert-Condition ([string]::IsNullOrEmpty($ExpectedNextSignerSha256) -or
                       $ExpectedNextSignerSha256 -cne $ExpectedSignerSha256) `
         'ExpectedNextSignerSha256 must differ from the current ExpectedSignerSha256.'
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($ExpectedReleaseGatePublicKeyXY) -and
+                      $ExpectedReleaseGatePublicKeyXY -cmatch '^[0-9A-F]{128}\z') `
+        'Production mode requires -ExpectedReleaseGatePublicKeyXY as exactly 128 uppercase hexadecimal characters.'
+    $ExpectedReleaseGateNextPublicKeyXY = [string]$ExpectedReleaseGateNextPublicKeyXY
+    Assert-Condition ([string]::IsNullOrEmpty($ExpectedReleaseGateNextPublicKeyXY) -or
+                      $ExpectedReleaseGateNextPublicKeyXY -cmatch '^[0-9A-F]{128}\z') `
+        'ExpectedReleaseGateNextPublicKeyXY must be empty or exactly 128 uppercase hexadecimal characters.'
+    Assert-Condition ([string]::IsNullOrEmpty($ExpectedReleaseGateNextPublicKeyXY) -or
+                      $ExpectedReleaseGateNextPublicKeyXY -cne $ExpectedReleaseGatePublicKeyXY) `
+        'ExpectedReleaseGateNextPublicKeyXY must differ from ExpectedReleaseGatePublicKeyXY.'
     Assert-Condition ($UpdaterPath.Count -eq 1 -and $updaterRelativePaths.Count -eq 1 -and
                       $updaterRelativePaths[0] -ceq "Contents\Helpers\$($productName)Updater.exe") `
         'Production packages require exactly the product updater at Contents\Helpers\<Product>Updater.exe.'
@@ -1641,7 +1661,8 @@ try {
     if (-not $AllowUnsigned) {
         Invoke-UpdaterBuildContract (Join-Path $stagedBundle $updaterRelativePaths[0]) `
             $productName $Version $manufacturer $githubOwner $githubRepository $Architecture `
-            $upgradeCode $otherUpgradeCode $ExpectedSignerSha256 $ExpectedNextSignerSha256
+            $upgradeCode $otherUpgradeCode $ExpectedSignerSha256 $ExpectedNextSignerSha256 `
+            $ExpectedReleaseGatePublicKeyXY $ExpectedReleaseGateNextPublicKeyXY
     }
 
     [string[]] $signableRelativePaths = @($payloadContract.PortableExecutablePaths)
@@ -1818,7 +1839,7 @@ try {
             [System.Security.Cryptography.SHA256]::HashData($timestampBytes))
     }
     $evidence = [ordered]@{
-        schemaVersion = 3
+        schemaVersion = 4
         artifactStatus = if ($AllowUnsigned) { 'UNSIGNED-NOT-FOR-DISTRIBUTION' } else { 'SIGNED' }
         product = $productName
         version = $Version
@@ -1847,6 +1868,20 @@ try {
             @($ExpectedSignerSha256)
         } else {
             @($ExpectedSignerSha256, $ExpectedNextSignerSha256)
+        }
+        releaseGatePublicKeyXY = if ($AllowUnsigned) { $null } else { $ExpectedReleaseGatePublicKeyXY }
+        releaseGateNextPublicKeyXY = if ($AllowUnsigned -or
+            [string]::IsNullOrEmpty($ExpectedReleaseGateNextPublicKeyXY)) {
+            $null
+        } else {
+            $ExpectedReleaseGateNextPublicKeyXY
+        }
+        releaseGatePublicKeyAllowlistXY = if ($AllowUnsigned) {
+            @()
+        } elseif ([string]::IsNullOrEmpty($ExpectedReleaseGateNextPublicKeyXY)) {
+            @($ExpectedReleaseGatePublicKeyXY)
+        } else {
+            @($ExpectedReleaseGatePublicKeyXY, $ExpectedReleaseGateNextPublicKeyXY)
         }
         signingDigest = if ($AllowUnsigned) { $null } else { 'SHA256' }
         timestampProtocol = if ($AllowUnsigned) { $null } else { 'RFC3161-SHA256' }

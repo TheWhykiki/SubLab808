@@ -8,11 +8,9 @@ import importlib.util
 import json
 import pathlib
 import re
-import shlex
+import shutil
 import subprocess
-import sys
 import tempfile
-import textwrap
 import unittest
 
 
@@ -21,6 +19,14 @@ PRODUCT = ROOT.name
 CI_WORKFLOW = "build.yml" if PRODUCT == "SubLab808" else "ci.yml"
 SIGNER = "A1" * 32
 NEXT_SIGNER = "D5" * 32
+RELEASE_GATE_PUBLIC_KEY = (
+    "6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C2964"
+    "FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5"
+)
+RELEASE_GATE_NEXT_PUBLIC_KEY = (
+    "7CF27B188D034F7E8A52380304B51AC3C08969E277F21B35A60B48FC476699780"
+    "7775510DB8ED040293D9AC69F7430DBBA7DADE63CE982299E04B79D227873D1"
+)
 APPLICATION_SIGNER = "B2" * 32
 INSTALLER_SIGNER = "C3" * 32
 TAG_COMMIT = "1" * 40
@@ -45,7 +51,10 @@ class WindowsReleaseContractTests(unittest.TestCase):
         )
         cls.ci = (ROOT / ".github" / "workflows" / CI_WORKFLOW).read_text(encoding="utf-8")
         cls.docs = (ROOT / "WINDOWS_RELEASE.md").read_text(encoding="utf-8")
-        cls.bootstrap = (ROOT / "scripts" / "check-windows-release-bootstrap.py").read_text(
+        cls.release_state = (ROOT / "scripts" / "check-windows-release-state.py").read_text(
+            encoding="utf-8"
+        )
+        cls.transition = (ROOT / "scripts" / "test-windows-updater-transition.ps1").read_text(
             encoding="utf-8"
         )
         cls.bootstrap_policy = json.loads(
@@ -85,96 +94,92 @@ class WindowsReleaseContractTests(unittest.TestCase):
         self.assertIn(f"group: {PRODUCT}-windows-release\n", self.release)
         self.assertNotIn("windows-release-${{ inputs.tag }}", self.release)
 
-    def test_first_windows_release_is_an_explicit_fail_closed_bootstrap(self) -> None:
+    def test_release_state_authorization_is_immutable_and_fail_closed(self) -> None:
         for token in (
             "confirm_first_windows_release_bootstrap:",
             "WK_BOOTSTRAP_CONFIRMATION: ${{ inputs.confirm_first_windows_release_bootstrap }}",
-            "test \"$WK_BOOTSTRAP_CONFIRMATION\" = 'true'",
-            "authorize_windows_bootstrap:",
-            "needs: authorize_windows_bootstrap",
-            "needs.authorize_windows_bootstrap.result == 'success'",
-            "Refuse an untested follow-up Windows release",
-            "verify_no_public_windows_release()",
-            "scripts/check-windows-release-bootstrap.py",
+            "authorize_windows_release:",
+            "needs: authorize_windows_release",
+            "needs.authorize_windows_release.result == 'success'",
+            "scripts/check-windows-release-state.py",
             "ref: ${{ github.sha }}",
-            'git show "$GITHUB_SHA:scripts/check-windows-release-bootstrap.py"',
+            'git show "$GITHUB_SHA:scripts/check-windows-release-state.py"',
             'git show "$GITHUB_SHA:Installer/Windows/bootstrap-policy.json"',
             "--policy-json",
             "--paginate --slurp",
-            "--paginated",
+            "--candidate-tag",
+            "--confirmation",
+            "IMMUTABLE_RELEASES_ADMIN_READ_TOKEN",
+            "immutable-releases",
+            "X-GitHub-Api-Version: 2026-03-10",
+            ".enabled == true",
+            "release_state_sha256",
+            "baseline_release_id",
+            "baseline_commit",
         ):
             self.assertIn(token, self.release)
         for token in (
-            "Cannot prove the complete public release history for bootstrap",
-            "A published Windows baseline already exists; exact N-to-N+1 updater acceptance is required",
-            "Paginated release metadata contains duplicate release IDs",
+            "Slurped release metadata contains a short intermediate page",
+            "Release metadata contains duplicate IDs",
+            "Windows release {tag} is not immutable",
+            "Allowed candidate release is not the complete stable Windows candidate",
+            "Candidate tag is not strictly newer than every stable or quarantined",
+            "First Windows release bootstrap requires explicit confirmation",
         ):
-            self.assertIn(token, self.bootstrap)
-        self.assertEqual(self.release.count("needs: authorize_windows_bootstrap"), 2)
-        self.assertGreaterEqual(self.release.count("verify_no_public_windows_release\n"), 2)
-        gate_start = self.release.index("verify_no_public_windows_release()")
-        gate_end = self.release.index("read_latest_state()", gate_start)
-        gate = self.release[gate_start:gate_end]
-        for token in (
-            'test "$#" -le 1 || return 1',
-            "if ! gh api --method GET --paginate --slurp",
-            "if ! python3 -B",
-            'rm -f -- "$metadata" || return 1',
-        ):
-            self.assertIn(token, gate)
+            self.assertIn(token, self.release_state)
+        self.assertGreaterEqual(self.release.count("needs: authorize_windows_release"), 2)
+        self.assertNotIn("check-windows-release-bootstrap.py", self.release)
+        self.assertNotIn("--paginated", self.release)
         self.assertEqual(
             self.bootstrap_policy,
             {"bootstrapTag": BOOTSTRAP_TAG, "product": PRODUCT, "schemaVersion": 1},
         )
-        for token in ("Bootstrap", "N→N+1", "blockiert", "Vorversion"):
+        for token in ("Bootstrap", "N→N+1", "immutable", "Quarantäne"):
             self.assertIn(token, self.docs)
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        "GitHub-hosted Windows resolves bash through optional WSL; POSIX jobs exercise this shell path",
-    )
-    def test_nested_post_publish_baseline_failures_propagate_in_bash(self) -> None:
-        gate_start = self.release.index("          verify_no_public_windows_release()")
-        gate_end = self.release.index("          read_latest_state()", gate_start)
-        gate = textwrap.dedent(self.release[gate_start:gate_end])
-        cases = (
-            ("return 23", "return 0", "failure"),
-            ("printf '[[]]\\n'; return 0", "return 24", "failure"),
-            ("printf '[[]]\\n'; return 0", "return 0", "success"),
+    @unittest.skipIf(shutil.which("jq") is None, "jq is required for workflow pagination")
+    def test_candidate_filter_rechunks_every_pagination_boundary(self) -> None:
+        rechunk_contract = re.compile(
+            r"\[\.\[\]\[\] \| select\(\.id != \$id\)\] as \$history \|\s*"
+            r"\[range\(0; \(\$history \| length\); 100\) as \$offset \|\s*"
+            r"\$history\[\$offset:\(\$offset \+ 100\)\]\] \|\s*"
+            r"if length == 0 then \[\[\]\] else \. end"
         )
-        for gh_body, python_body, expected in cases:
-            with self.subTest(gh=gh_body, python=python_body, expected=expected), tempfile.TemporaryDirectory() as temporary:
-                runner_temp = pathlib.Path(temporary).as_posix()
-                script = f"""
-                    set -euo pipefail
-                    RUNNER_TEMP={shlex.quote(runner_temp)}
-                    GITHUB_REPOSITORY=TheWhykiki/{PRODUCT}
-                    trusted_gate_directory="$RUNNER_TEMP"
-                    PRODUCT={shlex.quote(PRODUCT)}
-                    tag={shlex.quote(BOOTSTRAP_TAG)}
-                    gh() {{ {gh_body}; }}
-                    python3() {{ {python_body}; }}
-                    {gate}
-                    nested() {{ verify_no_public_windows_release 41 || return 1; }}
-                    if nested; then actual=success; else actual=failure; fi
-                    test "$actual" = {shlex.quote(expected)}
-                """
+        self.assertEqual(len(rechunk_contract.findall(self.release)), 2)
+        program = (
+            "[.[][] | select(.id != $id)] as $history | "
+            "[range(0; ($history | length); 100) as $offset | "
+            "$history[$offset:($offset + 100)]] | "
+            "if length == 0 then [[]] else . end"
+        )
+        candidate_id = 9_999_999
+        for history_count in (0, 1, 99, 100, 101, 199, 200, 201):
+            with self.subTest(history_count=history_count):
+                records = [{"id": candidate_id}] + [
+                    {"id": release_id} for release_id in range(1, history_count + 1)
+                ]
+                pages = [records[offset : offset + 100] for offset in range(0, len(records), 100)]
                 completed = subprocess.run(
-                    ["bash", "-c", textwrap.dedent(script)],
+                    ["jq", "--argjson", "id", str(candidate_id), program],
+                    input=json.dumps(pages),
                     check=False,
                     capture_output=True,
                     text=True,
                 )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                filtered = json.loads(completed.stdout)
+                self.assertGreaterEqual(len(filtered), 1)
+                self.assertTrue(all(len(page) == 100 for page in filtered[:-1]))
+                self.assertLessEqual(len(filtered[-1]), 100)
                 self.assertEqual(
-                    completed.returncode,
-                    0,
-                    f"stdout={completed.stdout!r} stderr={completed.stderr!r}",
+                    [entry["id"] for page in filtered for entry in page],
+                    list(range(1, history_count + 1)),
                 )
 
     def test_dispatch_values_are_never_interpolated_into_shell_source(self) -> None:
-        self.assertEqual(self.release.count("WK_INPUT_TAG: ${{ inputs.tag }}"), 5)
+        self.assertGreaterEqual(self.release.count("WK_INPUT_TAG: ${{ inputs.tag }}"), 7)
         self.assertEqual(self.release.count("$tag = $env:WK_INPUT_TAG"), 1)
-        self.assertEqual(self.release.count('tag="$WK_INPUT_TAG"'), 4)
+        self.assertGreaterEqual(self.release.count('tag="$WK_INPUT_TAG"'), 5)
         self.assertEqual(
             self.release.count(
                 "WK_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}"
@@ -251,6 +256,8 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "SourceCommit = $env:WK_TAG_COMMIT",
             "ExpectedSignerSha256 = $env:WK_SIGNER_SHA256",
             "$buildArguments['ExpectedNextSignerSha256'] = $env:WK_NEXT_SIGNER_SHA256",
+            "ExpectedReleaseGatePublicKeyXY = $env:WK_RELEASE_GATE_PUBLIC_KEY_XY",
+            "$buildArguments['ExpectedReleaseGateNextPublicKeyXY'] =",
             "HostTestPath = $hostTest",
             "SignToolPath = $signTool",
             "CertificateThumbprint = $env:WK_CERT_THUMBPRINT",
@@ -259,6 +266,8 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "scripts/validate-windows-release-assets.py",
             "'--source-commit', $env:WK_TAG_COMMIT",
             "@('--expected-next-signer-sha256', $env:WK_NEXT_SIGNER_SHA256)",
+            "'--expected-release-gate-public-key-xy', $env:WK_RELEASE_GATE_PUBLIC_KEY_XY",
+            "'--expected-release-gate-next-public-key-xy'",
         ):
             self.assertIn(token, self.release)
         self.assertNotIn("-AllowUnsigned", self.release)
@@ -266,6 +275,10 @@ class WindowsReleaseContractTests(unittest.TestCase):
     def test_empty_next_pin_is_omitted_from_native_argument_lists(self) -> None:
         guard = "if (-not [string]::IsNullOrEmpty($env:WK_NEXT_SIGNER_SHA256))"
         self.assertEqual(self.release.count(guard), 3)
+        release_gate_guard = (
+            "if (-not [string]::IsNullOrEmpty($env:WK_RELEASE_GATE_NEXT_PUBLIC_KEY_XY))"
+        )
+        self.assertEqual(self.release.count(release_gate_guard), 3)
         for token in (
             "& ./scripts/build-windows-installer.ps1 @buildArguments",
             "& python @validatorArguments",
@@ -274,6 +287,10 @@ class WindowsReleaseContractTests(unittest.TestCase):
             self.assertIn(token, self.release)
         self.assertNotIn("-ExpectedNextSignerSha256 $env:WK_NEXT_SIGNER_SHA256", self.release)
         self.assertNotIn("--expected-next-signer-sha256 $env:WK_NEXT_SIGNER_SHA256", self.release)
+        self.assertNotIn(
+            "-ExpectedReleaseGateNextPublicKeyXY $env:WK_RELEASE_GATE_NEXT_PUBLIC_KEY_XY",
+            self.release,
+        )
 
     def test_signed_msi_is_installed_loaded_and_removed_before_upload(self) -> None:
         for token in (
@@ -291,6 +308,8 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "ExpectedOtherArchitectureUpgradeCode = '${{ matrix.other_architecture_upgrade_code }}'",
             "ExpectedSignerSha256 = $env:WK_SIGNER_SHA256",
             "$acceptanceArguments['ExpectedNextSignerSha256'] = $env:WK_NEXT_SIGNER_SHA256",
+            "ExpectedReleaseGatePublicKeyXY = $env:WK_RELEASE_GATE_PUBLIC_KEY_XY",
+            "$acceptanceArguments['ExpectedReleaseGateNextPublicKeyXY'] =",
         ):
             self.assertIn(token, self.release)
         validator = self.release.index("scripts/validate-windows-release-assets.py")
@@ -309,119 +328,343 @@ class WindowsReleaseContractTests(unittest.TestCase):
                 rf"\s+upgrade_code: {self.package_config['upgradeCodes'][architecture]}\n"
                 rf"\s+other_architecture_upgrade_code: {self.package_config['upgradeCodes'][other]}\n",
             )
-        for limitation in ("N→N+1", "Downgrade", "x64↔ARM64EC", "separate Abnahmen"):
+        for limitation in ("N→N+1", "Downgrade", "x64↔ARM64EC", "separate physische Abnahme"):
             self.assertIn(limitation, self.docs)
 
-    def test_release_is_staged_complete_then_published_once(self) -> None:
-        self.assertEqual(self.release.count("contents: write"), 1)
+    def test_release_is_staged_as_the_exact_immutable_public_prerelease(self) -> None:
+        self.assertEqual(self.release.count("contents: write"), 2)
+        start = self.release.index("  stage-release:")
+        end = self.release.index("\n  accept-windows-upgrade:", start)
+        stage = self.release[start:end]
         for token in (
-            "needs: [build-windows, build-macos, test-macos-intel-candidate]",
+            "needs: [authorize_windows_release, build-windows, build-macos, test-macos-intel-candidate]",
             "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
             "merge-multiple: true",
             "github.run_attempt",
             "--architecture x64 --architecture arm64ec",
             '--source-commit "$tag_commit"',
             "SHA256SUMS.txt",
-            "created_release_id=\"$(gh api --method POST",
-            "-f tag_name=\"$tag\" -f target_commitish=\"$tag_commit\"",
-            "gh release upload",
-            "gh api --method PATCH",
-            "-F draft=false -F prerelease=false -f make_latest=true",
-            "releases/latest",
-            "releases/latest\" --jq '.tag_name'",
-            "verify_origin_tag",
-            "latest_tag=",
-            "baseline_latest_id=",
-            "read_latest_state()",
-            "gh api graphql",
-            "current_latest_state=",
-            "test \"$current_latest_state\" = \"$latest_state\"",
-            "tuple(map(int",
-            ".assets[] | select(.name",
-            ".digest",
-            "cleanup_created_release",
-            "release_marker=",
-            "--allow-release-id",
-            'verify_no_public_windows_release "$created_release_id"',
+            "cleanup_created_draft()",
             "publication_attempted=false",
             "publication_attempted=true",
             "verify_release_assets()",
-            "verify_published_release()",
-            "post_publish_verified=false",
+            "candidate_manifest_sha256()",
+            "resolve_public_history",
+            "read_latest_state()",
+            "verify_origin_tag()",
+            "gh api graphql",
+            "gh api --method POST -H 'X-GitHub-Api-Version: 2026-03-10'",
+            '-f tag_name="$tag" -f target_commitish="$tag_commit"',
+            '-F draft=true -F prerelease=false',
+            'created_release_id="$(jq -r \'.id\' "$create_response")"',
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$created_release_id/assets?name=$name",
+            "--data-binary \"@$asset\"",
+            "-F draft=false -F prerelease=true -f make_latest=false",
+            "verify_candidate_identity \"$candidate_metadata\" false true true",
+            ".immutable == true",
+            "staged_verified=true",
+            "Latest is unchanged",
         ):
-            self.assertIn(token, self.release)
-        cleanup_start = self.release.index("cleanup_created_release()")
-        cleanup_end = self.release.index("trap cleanup_created_release EXIT", cleanup_start)
-        cleanup = self.release[cleanup_start:cleanup_end]
-        for token in (
-            "releases/$created_release_id",
-            "release_state=",
-            "identity_valid=false",
-            "for attempt in 1 2 3",
-            'value.get("draft") is True',
-            'value.get("tag_name") == sys.argv[2]',
-            'sys.argv[3] in (value.get("body") or "")',
-            "gh api --method DELETE",
-            "cleanup_failed=true",
-            "GITHUB_STEP_SUMMARY",
-        ):
-            self.assertIn(token, cleanup)
-        self.assertNotIn("releases?per_page", cleanup)
-        self.assertGreaterEqual(self.release.count("verify_origin_tag\n"), 2)
-        self.assertNotIn('releases/latest" --jq \'.id\' 2>/dev/null || true', self.release)
-        self.assertGreaterEqual(self.release.count("${{ github.run_attempt }}"), 4)
-        post_publish = self.release.index("published=true")
-        for postcondition in (
-            'releases/$created_release_id" --jq \'.draft\'',
-            'releases/$created_release_id" --jq \'.prerelease\'',
-            'releases/$created_release_id" --jq \'.tag_name\'',
-            'releases/latest" --jq \'.id\'',
-            'releases/latest" --jq \'.tag_name\'',
-            'verify_no_public_windows_release "$created_release_id"',
-        ):
-            self.assertLess(self.release.rindex(postcondition), post_publish)
-        publication_attempted = self.release.rindex("publication_attempted=true")
-        publish_patch = self.release.rindex('gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$created_release_id"')
-        post_publish_audit = self.release.rindex("if verify_published_release; then")
-        self.assertLess(publication_attempted, publish_patch)
-        self.assertLess(publish_patch, post_publish_audit)
-        self.assertLess(post_publish_audit, post_publish)
-        verifier_start = self.release.index("verify_published_release()")
-        verifier_end = self.release.index("release_body=", verifier_start)
-        verifier = self.release[verifier_start:verifier_end]
-        self.assertIn("verify_release_assets || return 1", verifier)
-        self.assertIn(
-            'verify_no_public_windows_release "$created_release_id" || return 1', verifier
-        )
-        self.assertIn("post_publish_verified=false", self.release[publish_patch:post_publish])
-        self.assertIn("for attempt in 1 2 3", self.release[publish_patch:post_publish])
-        self.assertIn('published_body=', verifier)
-        self.assertIn('[[ "$published_body" == *"$release_marker"* ]]', verifier)
-        for variable in (
-            "release_draft",
-            "release_prerelease",
-            "release_tag",
-            "published_body",
-            "latest_id",
-            "latest_tag",
-        ):
-            self.assertRegex(verifier, rf'{variable}="\$\(gh api .*?\)" \|\| return 1')
+            self.assertIn(token, stage)
         for architecture in ("x64", "arm64ec"):
             self.assertIn(
-                f'release-assets/windows/{PRODUCT}-$version-Windows-{architecture}.msi',
-                self.release,
+                f'release-assets/windows/{PRODUCT}-$version-Windows-{architecture}.msi', stage
             )
             self.assertIn(
                 f'release-assets/windows/{PRODUCT}-$version-Windows-{architecture}.evidence.json',
-                self.release,
+                stage,
             )
+        steps_start = stage.index("\n    steps:")
+        self.assertNotIn("GH_TOKEN", stage[:steps_start])
+        revalidate_start = stage.index(
+            "- name: Revalidate source, evidence, signatures, notarization and all hashes"
+        )
+        policy_start = stage.index(
+            "- name: Require immutable GitHub Releases policy immediately before staging"
+        )
+        self.assertNotIn("GH_TOKEN", stage[revalidate_start:policy_start])
+        publish_start = stage.index(
+            "- name: Create a complete draft and expose that exact ID as an immutable prerelease"
+        )
+        publish_run = stage.index("        run: |", publish_start)
+        self.assertIn(
+            "env:\n          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}",
+            stage[publish_start:publish_run],
+        )
+        self.assertNotIn("gh release upload", stage)
+        cleanup_start = stage.index("cleanup_created_draft()")
+        cleanup_end = stage.index("trap cleanup_created_draft EXIT", cleanup_start)
+        cleanup = stage[cleanup_start:cleanup_end]
+        self.assertIn('if [[ "$publication_attempted" == true ]]', cleanup)
+        self.assertIn("It is never deleted automatically", cleanup)
+        self.assertIn("gh api --method DELETE", cleanup)
+        self.assertLess(
+            cleanup.index('if [[ "$publication_attempted" == true ]]'),
+            cleanup.index("gh api --method DELETE"),
+        )
+
+    def test_release_gate_key_is_preflighted_and_revalidated_before_staging(self) -> None:
+        build_start = self.release.index("  build-windows:")
+        build_end = self.release.index("\n  build-macos:", build_start)
+        build = self.release[build_start:build_end]
+
+        key_preflight_start = build.index(
+            "- name: Verify active release-gate authorization key pair"
+        )
+        key_preflight_end = build.index(
+            "- name: Prove the installed baseline authorizes the active release-gate key",
+            key_preflight_start,
+        )
+        key_preflight = build[key_preflight_start:key_preflight_end]
+        for token in (
+            "${{ secrets.WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64 }}",
+            "$privateText.Length -gt 8192",
+            "[Convert]::FromBase64String($privateText)",
+            "[Convert]::ToBase64String($privateBytes) -cne $privateText",
+            "$key.ImportPkcs8PrivateKey($privateBytes, [ref]$bytesRead)",
+            "$bytesRead -ne $privateBytes.Length",
+            "$key.ExportParameters($false)",
+            "$parameters.Q.X.Length -ne 32",
+            "$actualPublicKey -cne $env:WK_RELEASE_GATE_PUBLIC_KEY_XY",
+            "DSASignatureFormat]::IeeeP1363FixedFieldConcatenation",
+            "$key.VerifyData(",
+            "[Array]::Clear($privateBytes, 0, $privateBytes.Length)",
+            "$key.Dispose()",
+            "Remove-Item Env:WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64",
+        ):
+            self.assertIn(token, key_preflight)
+        self.assertLess(
+            key_preflight_start,
+            build.index("- name: Configure production updater pin"),
+        )
+
+        baseline_start = key_preflight_end
+        baseline_end = build.index("- name: Configure production updater pin", baseline_start)
+        baseline = build[baseline_start:baseline_end]
+        for token in (
+            "if: needs.authorize_windows_release.outputs.mode == 'upgrade'",
+            '"repos/$env:GITHUB_REPOSITORY/releases/$env:WK_BASELINE_RELEASE_ID"',
+            "$release.immutable -isnot [bool] -or -not $release.immutable",
+            "@($release.assets).Count -ne 8",
+            'Windows-${{ matrix.artifact_arch }}.evidence.json',
+            "$evidenceAssets.Count -ne 1",
+            "$asset.digest -cnotmatch '^sha256:[0-9a-f]{64}$'",
+            "$item.Length -ne [long]$asset.size",
+            '"sha256:$actualDigest" -cne [string]$asset.digest',
+            "$evidence.schemaVersion -ne 4",
+            "$evidence.releaseGatePublicKeyXY",
+            "$evidence.releaseGateNextPublicKeyXY",
+            "$evidence.releaseGatePublicKeyAllowlistXY",
+            "$allowlist[$index] -cne $expectedAllowlist[$index]",
+            "$allowlist -cnotcontains $env:WK_RELEASE_GATE_PUBLIC_KEY_XY",
+        ):
+            self.assertIn(token, baseline)
+
+        stage_start = self.release.index("  stage-release:")
+        stage_end = self.release.index("\n  accept-windows-upgrade:", stage_start)
+        stage = self.release[stage_start:stage_end]
+        self.assertIn(
+            "needs: [authorize_windows_release, build-windows, build-macos, test-macos-intel-candidate]",
+            stage,
+        )
+        for token in (
+            'release_gate_key="$RELEASE_GATE_PUBLIC_KEY_XY"',
+            'next_release_gate_key="$RELEASE_GATE_NEXT_PUBLIC_KEY_XY"',
+            '[[ "$release_gate_key" =~ ^[0-9A-F]{128}$ ]]',
+            "python3 scripts/validate-windows-release-assets.py",
+            '--expected-release-gate-public-key-xy "$release_gate_key"',
+            '--expected-release-gate-next-public-key-xy "$next_release_gate_key"',
+            "--architecture x64 --architecture arm64ec",
+        ):
+            self.assertIn(token, stage)
+        self.assertNotIn("WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64", stage)
+
+    def test_native_transition_gate_binds_public_n_to_exact_candidate(self) -> None:
+        start = self.release.index("  accept-windows-upgrade:")
+        end = self.release.index("\n  finalize-release:", start)
+        acceptance = self.release[start:end]
+        for token in (
+            "runner: windows-2022",
+            "runner: windows-11-vs2026-arm",
+            "needs: [authorize_windows_release, stage-release]",
+            "needs.stage-release.outputs.staged_verified == 'true'",
+            'git show "${env:GITHUB_SHA}:scripts/test-windows-updater-transition.ps1"',
+            'git show "${env:GITHUB_SHA}:scripts/test-windows-installer.ps1"',
+            "Mode = $env:WK_TRANSITION_MODE",
+            "BaselineReleaseId = $baselineReleaseId",
+            "CandidateReleaseId = [long]$env:WK_CANDIDATE_RELEASE_ID",
+            "CandidateSourceCommit = $env:WK_CANDIDATE_COMMIT",
+            "HostTestPath =",
+            "Upload transition acceptance receipt",
+            "retention-days: 30",
+        ):
+            self.assertIn(token, acceptance)
+        self.assertIn("permissions:\n      contents: read", acceptance)
+        self.assertEqual(
+            acceptance.count(
+                "${{ secrets.WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64 }}"
+            ),
+            1,
+        )
+        self.assertNotIn("secrets.GITHUB_TOKEN", acceptance)
+
+        for token in (
+            "$script:Owner = 'TheWhykiki'",
+            "X-GitHub-Api-Version' = '2026-03-10'",
+            "$Release.immutable",
+            "Release does not contain exactly eight cross-platform assets.",
+            "256MB",
+            "8MB",
+            "-TimeoutSec 600",
+            "ExpectedPrerelease",
+            "'bootstrap'",
+            "'upgrade'",
+            "Installed baseline updater",
+            "ExpectedExecutableSha256",
+            "GetNamedPipeClientProcessId",
+            "ParentProcessId",
+            "PipeOptions]::CurrentUserOnly",
+            "[byte[]]::new($expectedBytes.Length + 1)",
+            "operationMode",
+            "releaseId",
+            "releaseTag",
+            "sourceCommit",
+            "phase -ceq 'verified'",
+            "Older baseline MSI was not rejected as a downgrade.",
+            "Updater-installed candidate host load",
+            "Test-owned updater operation cleanup failed.",
+            "productCleanup = $true",
+            "[int] $UpdaterTimeoutSeconds = 3600",
+            "function Import-ReleaseGateSigningKey",
+            "ImportPkcs8PrivateKey",
+            "ExportParameters($false)",
+            "$parameters.Q.X.Length -eq 32",
+            "$actualPublicKeyXY -ceq $ExpectedPublicKeyXY",
+            "function New-LowSReleaseGateSignature",
+            "DSASignatureFormat]::IeeeP1363FixedFieldConcatenation",
+            "FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551",
+            "7FFFFFFF800000007FFFFFFFFFFFFFFFDE737D56D38BCF4279DCE5617E3192A8",
+            "if ($s -gt $halfOrder)",
+            "$order - $s",
+            "$ExpiresAtUnixSeconds -le $nowUnixSeconds + 300",
+            "$AuthorizationSignatureP1363 -cmatch '^[0-9A-F]{128}$'",
+        ):
+            self.assertIn(token, self.transition)
+        cli = """'--release-gate',
+            '--challenge', $Challenge,
+            '--response-pipe', $PipeName,
+            '--parent-process-id', ([string]$PID),
+            '--release-id', ([string]$CandidateReleaseId),
+            '--tag', $CandidateTag,
+            '--source-commit', $CandidateSourceCommit,
+            '--parent-process-created-at-filetime', ([string]$ParentProcessCreatedAtFiletime),
+            '--expires-at-unix-seconds', ([string]$ExpiresAtUnixSeconds),
+            '--authorization-signature-p1363', $AuthorizationSignatureP1363"""
+        self.assertIn(cli, self.transition)
+
+        authorization_start = self.transition.index("function New-ReleaseGateAuthorization")
+        authorization_end = self.transition.index(
+            "function Assert-NamedPipeReleaseGateClient", authorization_start
+        )
+        authorization = self.transition[authorization_start:authorization_end]
+        canonical_fields = (
+            "domain=whykiki.windows-updater-release-gate-authorization",
+            "schemaVersion=1",
+            "repository=",
+            "product=",
+            "architecture=",
+            "installedVersion=",
+            "releaseId=",
+            "tag=",
+            "sourceCommit=",
+            "challenge=",
+            "responsePipe=",
+            "parentProcessId=",
+            "parentProcessCreatedAtFiletime=",
+            "expiresAtUnixSeconds=",
+        )
+        positions = [authorization.index(field) for field in canonical_fields]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn(
+            "[DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 240", authorization
+        )
+        self.assertIn("New-LowSReleaseGateSignature $SigningKey $messageBytes", authorization)
+
+        invoke_start = self.transition.index("function Invoke-ReleaseGateUpdater")
+        invoke_end = self.transition.index(
+            "function Remove-VerifiedOperationDirectories", invoke_start
+        )
+        invoke = self.transition[invoke_start:invoke_end]
+        self.assertIn(
+            "$startInfo.Environment.Remove('WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64')",
+            invoke,
+        )
+        self.assertNotIn("ReleaseGatePrivateKeyPkcs8Base64", invoke)
+        clear_environment = self.transition.index(
+            "Remove-Item Env:WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64"
+        )
+        gate_call = self.transition.rindex("$gateReceipt = Invoke-ReleaseGateUpdater")
+        clear_local = self.transition.rindex("$releaseGatePrivateKeyText = ''", 0, gate_call)
+        self.assertLess(clear_environment, gate_call)
+        self.assertLess(clear_local, gate_call)
+
+        journal_start = self.transition.index("function Remove-VerifiedOperationDirectories")
+        journal_end = self.transition.index("if (-not $IsWindows)", journal_start)
+        journal = self.transition[journal_start:journal_end]
+        for forbidden_ephemeral_value in (
+            "$Challenge",
+            "$PipeName",
+            "$AuthorizationSignatureP1363",
+            "authorizationSignature|expiresAtUnixSeconds|parentProcessCreatedAtFiletime",
+            "private.?key|pkcs8|WINDOWS_RELEASE_GATE_PRIVATE_KEY",
+        ):
+            self.assertIn(forbidden_ephemeral_value, journal)
+        self.assertNotIn("ReadToEndAsync", self.transition)
+        self.assertNotIn("GH_TOKEN", self.transition)
+
+    def test_finalizer_reconciles_uncertain_promotion_and_never_rewrites_assets(self) -> None:
+        start = self.release.index("  finalize-release:")
+        finalizer = self.release[start:]
+        for token in (
+            "always()",
+            "needs: [authorize_windows_release, stage-release, accept-windows-upgrade]",
+            "WK_ACCEPTANCE_RESULT: ${{ needs.accept-windows-upgrade.result }}",
+            "WK_ASSET_MANIFEST_SHA256",
+            "fail_unknown()",
+            "quarantine()",
+            "fail_after_promotion()",
+            "promotion_request_succeeded=false",
+            "if gh api --method PATCH -H 'X-GitHub-Api-Version: 2026-03-10'",
+            '-F draft=false -F prerelease=false -f make_latest=true',
+            "for attempt in 1 2 3 4 5",
+            ".prerelease == false and .immutable == true",
+            ".prerelease == true and .immutable == true",
+            "promotion outcome is UNKNOWN",
+            "--allow-candidate-release-id \"$release_id\"",
+            '[[ "$final_state" == "$WK_INITIAL_RELEASE_STATE" ]]',
+            "post-promotion history attestation failed",
+            f'-f name="{PRODUCT} ${{tag#v}}" -f body="$stable_body"',
+        ):
+            self.assertIn(token, finalizer)
+        patch = finalizer.index("if gh api --method PATCH")
+        reconcile = finalizer.index("for attempt in 1 2 3 4 5", patch)
+        stable = finalizer.index(".prerelease == false and .immutable == true", reconcile)
+        quarantine = finalizer.index(".prerelease == true and .immutable == true", stable)
+        unknown = finalizer.index("promotion outcome is UNKNOWN", quarantine)
+        post_state = finalizer.index("--allow-candidate-release-id", unknown)
+        self.assertLess(patch, reconcile)
+        self.assertLess(reconcile, stable)
+        self.assertLess(stable, quarantine)
+        self.assertLess(quarantine, unknown)
+        self.assertLess(unknown, post_state)
+        self.assertNotIn("--method DELETE", finalizer)
 
     def test_macos_candidate_is_signed_notarized_and_required_for_publish(self) -> None:
         product_prefix = PRODUCT.upper()
         for token in (
             "build-macos:",
             "runs-on: macos-15",
-            "needs: [build-windows, build-macos, test-macos-intel-candidate]",
+            "needs: [authorize_windows_release, build-windows, build-macos, test-macos-intel-candidate]",
             "secrets.MACOS_DEVELOPER_ID_APPLICATION_P12_BASE64",
             "secrets.MACOS_DEVELOPER_ID_APPLICATION_P12_PASSWORD",
             "secrets.MACOS_DEVELOPER_ID_INSTALLER_P12_BASE64",
@@ -461,20 +704,20 @@ class WindowsReleaseContractTests(unittest.TestCase):
         self.assertEqual(self.release.count("retention-days: 1"), 2)
         self.assertEqual(self.release.count("APPLICATION_SIGNER_SHA256:"), 3)
         self.assertEqual(self.release.count("INSTALLER_SIGNER_SHA256:"), 3)
-        self.assertEqual(self.release.count("\n      NEXT_SIGNER_SHA256:"), 2)
+        self.assertEqual(self.release.count("\n      NEXT_SIGNER_SHA256:"), 3)
         self.assertGreaterEqual(self.release.count("timeout-minutes: 120"), 2)
         self.assertNotIn(f"{PRODUCT}-$version-Windows-SHA256SUMS.txt", self.release)
         self.assertLess(
             self.release.index("unset APPLICATION_P12_BASE64"),
             self.release.index('./scripts/package-release.sh Release "$WK_RELEASE_VERSION"'),
         )
-        publish = self.release[self.release.index("publish-release:") :]
-        self.assertIn("macOS-universal", publish)
-        self.assertIn("Windows-arm64ec", publish)
+        stage = self.release[self.release.index("stage-release:") :]
+        self.assertIn("macOS-universal", stage)
+        self.assertIn("Windows-arm64ec", stage)
 
     def test_exact_macos_candidate_is_host_loaded_on_native_intel_before_publish(self) -> None:
         start = self.release.index("  test-macos-intel-candidate:")
-        end = self.release.index("\n  publish-release:", start)
+        end = self.release.index("\n  stage-release:", start)
         intel_gate = self.release[start:end]
         for token in (
             "needs: build-macos",
@@ -507,16 +750,41 @@ class WindowsReleaseContractTests(unittest.TestCase):
         self.assertNotIn("${{ secrets.", intel_gate)
         self.assertNotIn("WK_RUNNER_ARCH: ${{ runner.arch }}", intel_gate)
 
-        publish = self.release[end:]
+        stage = self.release[end:]
         for token in (
-            "needs: [build-windows, build-macos, test-macos-intel-candidate]",
+            "needs: [authorize_windows_release, build-windows, build-macos, test-macos-intel-candidate]",
             "needs.test-macos-intel-candidate.result == 'success'",
             "WK_INTEL_TESTED_MACOS_CANDIDATE_SHA256: ${{ needs.test-macos-intel-candidate.outputs.candidate_sha256 }}",
             'tested_candidate_digest="$WK_INTEL_TESTED_MACOS_CANDIDATE_SHA256"',
             'test "$actual_candidate_digest" = "$tested_candidate_digest"',
         ):
-            self.assertIn(token, publish)
-        self.assertIn("runs-on: macos-15\n    timeout-minutes: 30", publish)
+            self.assertIn(token, stage)
+        self.assertIn("runs-on: macos-15\n    timeout-minutes: 30", stage)
+
+    @unittest.skipIf(importlib.util.find_spec("yaml") is None, "PyYAML is unavailable")
+    def test_release_workflow_is_valid_yaml(self) -> None:
+        import yaml
+
+        parsed = yaml.safe_load(self.release)
+        self.assertIsInstance(parsed, dict)
+        self.assertIn("jobs", parsed)
+
+    @unittest.skipIf(shutil.which("pwsh") is None, "PowerShell is unavailable")
+    def test_transition_gate_has_no_powershell_parser_errors(self) -> None:
+        script = ROOT / "scripts" / "test-windows-updater-transition.ps1"
+        command = (
+            "$tokens=$null;$errors=$null;"
+            "[System.Management.Automation.Language.Parser]::ParseFile("
+            "$args[0],[ref]$tokens,[ref]$errors)>$null;"
+            "if($errors.Count){$errors|ForEach-Object{[Console]::Error.WriteLine($_)};exit 1}"
+        )
+        completed = subprocess.run(
+            ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command, str(script)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_all_external_actions_are_full_commit_pinned(self) -> None:
         references = re.findall(r"(?m)^\s*-?\s*uses:\s*[^@\s]+@([^\s#]+)", self.release)
@@ -529,7 +797,11 @@ class WindowsReleaseContractTests(unittest.TestCase):
         self.assertNotIn(f"{PRODUCT}-VST3-Windows-", self.ci)
 
     def _write_candidate(
-        self, directory: pathlib.Path, architecture: str, next_signer: str = NEXT_SIGNER
+        self,
+        directory: pathlib.Path,
+        architecture: str,
+        next_signer: str = NEXT_SIGNER,
+        next_release_gate_public_key: str = RELEASE_GATE_NEXT_PUBLIC_KEY,
     ) -> pathlib.Path:
         version = "1.2.3"
         base = f"{PRODUCT}-{version}-Windows-{architecture}"
@@ -540,7 +812,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
         )
         other_architecture = "arm64ec" if architecture == "x64" else "x64"
         evidence = {
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "artifactStatus": "SIGNED",
             "product": PRODUCT,
             "version": version,
@@ -560,6 +832,10 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "updaterCurrentSignerSha256": SIGNER,
             "updaterNextSignerSha256": next_signer or None,
             "payloadSignerAllowlistSha256": [SIGNER] + ([next_signer] if next_signer else []),
+            "releaseGatePublicKeyXY": RELEASE_GATE_PUBLIC_KEY,
+            "releaseGateNextPublicKeyXY": next_release_gate_public_key or None,
+            "releaseGatePublicKeyAllowlistXY": [RELEASE_GATE_PUBLIC_KEY]
+            + ([next_release_gate_public_key] if next_release_gate_public_key else []),
             "signingDigest": "SHA256",
             "timestampProtocol": "RFC3161-SHA256",
             "timestampUrlSha256": "A7" * 32,
@@ -669,14 +945,16 @@ class WindowsReleaseContractTests(unittest.TestCase):
             directory = pathlib.Path(temporary)
             evidence_path = self._write_candidate(directory, "x64")
             self.validator.validate_assets(
-                directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, NEXT_SIGNER, ("x64",)
+                directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, NEXT_SIGNER,
+                RELEASE_GATE_PUBLIC_KEY, RELEASE_GATE_NEXT_PUBLIC_KEY, ("x64",)
             )
             evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
             evidence["msiSha256"] = "00" * 32
             evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
             with self.assertRaises(self.validator.ContractError):
                 self.validator.validate_assets(
-                    directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, NEXT_SIGNER, ("x64",)
+                    directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, NEXT_SIGNER,
+                    RELEASE_GATE_PUBLIC_KEY, RELEASE_GATE_NEXT_PUBLIC_KEY, ("x64",)
                 )
 
     def test_asset_validator_rejects_missing_other_architecture(self) -> None:
@@ -686,6 +964,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
             with self.assertRaises(self.validator.ContractError):
                 self.validator.validate_assets(
                     directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, NEXT_SIGNER,
+                    RELEASE_GATE_PUBLIC_KEY, RELEASE_GATE_NEXT_PUBLIC_KEY,
                     ("x64", "arm64ec")
                 )
 
@@ -695,7 +974,8 @@ class WindowsReleaseContractTests(unittest.TestCase):
             self._write_candidate(directory, "x64")
             with self.assertRaises(self.validator.ContractError):
                 self.validator.validate_assets(
-                    directory, PRODUCT, "1.2.3", "0" * 40, SIGNER, NEXT_SIGNER, ("x64",)
+                    directory, PRODUCT, "1.2.3", "0" * 40, SIGNER, NEXT_SIGNER,
+                    RELEASE_GATE_PUBLIC_KEY, RELEASE_GATE_NEXT_PUBLIC_KEY, ("x64",)
                 )
 
     def test_asset_validator_rejects_out_of_range_msi_version(self) -> None:
@@ -703,7 +983,8 @@ class WindowsReleaseContractTests(unittest.TestCase):
             with self.assertRaises(self.validator.ContractError):
                 self.validator.validate_assets(
                     pathlib.Path(temporary), PRODUCT, "256.0.0", TAG_COMMIT, SIGNER,
-                    NEXT_SIGNER, ("x64",)
+                    NEXT_SIGNER, RELEASE_GATE_PUBLIC_KEY, RELEASE_GATE_NEXT_PUBLIC_KEY,
+                    ("x64",)
                 )
 
     def test_asset_validator_rejects_incomplete_updater_and_msi_policy_evidence(self) -> None:
@@ -731,7 +1012,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
                 with self.assertRaises(self.validator.ContractError):
                     self.validator.validate_assets(
                         directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, NEXT_SIGNER,
-                        ("x64",)
+                        RELEASE_GATE_PUBLIC_KEY, RELEASE_GATE_NEXT_PUBLIC_KEY, ("x64",)
                     )
 
     def test_asset_validator_binds_one_or_two_unique_ordered_signer_pins(self) -> None:
@@ -739,7 +1020,8 @@ class WindowsReleaseContractTests(unittest.TestCase):
             directory = pathlib.Path(temporary)
             self._write_candidate(directory, "x64", "")
             self.validator.validate_assets(
-                directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, "", ("x64",)
+                directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, "",
+                RELEASE_GATE_PUBLIC_KEY, RELEASE_GATE_NEXT_PUBLIC_KEY, ("x64",)
             )
         with tempfile.TemporaryDirectory() as temporary:
             directory = pathlib.Path(temporary)
@@ -749,14 +1031,78 @@ class WindowsReleaseContractTests(unittest.TestCase):
             evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
             with self.assertRaises(self.validator.ContractError):
                 self.validator.validate_assets(
-                    directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, NEXT_SIGNER, ("x64",)
+                    directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, NEXT_SIGNER,
+                    RELEASE_GATE_PUBLIC_KEY, RELEASE_GATE_NEXT_PUBLIC_KEY, ("x64",)
                 )
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaises(self.validator.ContractError):
                 self.validator.validate_assets(
                     pathlib.Path(temporary), PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, SIGNER,
-                    ("x64",)
+                    RELEASE_GATE_PUBLIC_KEY, RELEASE_GATE_NEXT_PUBLIC_KEY, ("x64",)
                 )
+
+    def test_asset_validator_binds_exact_ordered_release_gate_keys_for_both_architectures(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            self._write_candidate(directory, "x64")
+            self._write_candidate(directory, "arm64ec")
+            self.validator.validate_assets(
+                directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, NEXT_SIGNER,
+                RELEASE_GATE_PUBLIC_KEY, RELEASE_GATE_NEXT_PUBLIC_KEY,
+                ("x64", "arm64ec"),
+            )
+
+        mutations = (
+            ("releaseGatePublicKeyXY", RELEASE_GATE_NEXT_PUBLIC_KEY),
+            ("releaseGateNextPublicKeyXY", None),
+            (
+                "releaseGatePublicKeyAllowlistXY",
+                [RELEASE_GATE_NEXT_PUBLIC_KEY, RELEASE_GATE_PUBLIC_KEY],
+            ),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                directory = pathlib.Path(temporary)
+                evidence_path = self._write_candidate(directory, "x64")
+                evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+                evidence[field] = value
+                evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+                with self.assertRaises(self.validator.ContractError):
+                    self.validator.validate_assets(
+                        directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, NEXT_SIGNER,
+                        RELEASE_GATE_PUBLIC_KEY, RELEASE_GATE_NEXT_PUBLIC_KEY, ("x64",),
+                    )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            evidence_path = self._write_candidate(
+                directory, "x64", next_release_gate_public_key=""
+            )
+            self.validator.validate_assets(
+                directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, NEXT_SIGNER,
+                RELEASE_GATE_PUBLIC_KEY, "", ("x64",),
+            )
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            del evidence["releaseGateNextPublicKeyXY"]
+            evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+            with self.assertRaises(self.validator.ContractError):
+                self.validator.validate_assets(
+                    directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, NEXT_SIGNER,
+                    RELEASE_GATE_PUBLIC_KEY, "", ("x64",),
+                )
+
+        for current, next_key in (
+            (RELEASE_GATE_PUBLIC_KEY.lower(), RELEASE_GATE_NEXT_PUBLIC_KEY),
+            (RELEASE_GATE_PUBLIC_KEY, RELEASE_GATE_PUBLIC_KEY),
+        ):
+            with self.subTest(current=current, next_key=next_key), tempfile.TemporaryDirectory() as temporary:
+                with self.assertRaises(self.validator.ContractError):
+                    self.validator.validate_assets(
+                        pathlib.Path(temporary), PRODUCT, "1.2.3", TAG_COMMIT,
+                        SIGNER, NEXT_SIGNER, current, next_key, ("x64",),
+                    )
 
     def _write_macos_pipeline_candidate(self, candidate: pathlib.Path) -> None:
         version = "1.2.3"

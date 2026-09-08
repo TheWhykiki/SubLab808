@@ -344,7 +344,7 @@ private:
                 "native file panel completion-session counts became invalid");
         const bool retired = ! current->panel->isVisible() && ! current->panel->hasDelegate()
                           && ! current->panel->isAlive()
-                          && current->panel->completionReturnedExactlyOnce()
+                          && current->panel->completionResolvedExactlyOnce()
                           && ! NativeFilePanel::hasActiveCompletionSession();
         if (! waitUntil(retired,
                         "NATIVE_PANEL_TEARDOWN_TIMEOUT: panel/delegate/window or AppKit completion remains active")) return;
@@ -353,12 +353,13 @@ private:
 
     void retirementFence()
     {
-        // The observer above proves that JUCE's real AppKit completion returned;
-        // these turns give any unrelated application-loop cleanup a grace fence.
+        // The observer proves that JUCE's real AppKit completion either returned
+        // or its never-entered block was released. In both cases no stale
+        // callback can fire; these turns provide an additional loop grace fence.
         if (++fenceTurns < 3) return;
         auto& state = *current;
         require(state.nativeModal == nullptr && ! state.panel->isAlive()
-                    && state.panel->completionReturnedExactlyOnce()
+                    && state.panel->completionResolvedExactlyOnce()
                     && NativeFilePanel::visibleCount() == 0
                     && ! NativeFilePanel::hasActiveCompletionSession()
                     && juce::Component::getNumCurrentlyModalComponents() == 0,
@@ -543,7 +544,7 @@ private:
         const bool panelClean = failurePanel == nullptr
                              || (! failurePanel->isVisible() && ! failurePanel->hasDelegate()
                                  && ! failurePanel->isAlive()
-                                 && failurePanel->completionReturnedExactlyOnce());
+                                 && failurePanel->completionResolvedExactlyOnce());
         const bool globallyClean = juce::Component::getNumCurrentlyModalComponents() == 0
                                 && NativeFilePanel::visibleCount() == 0
                                 && ! NativeFilePanel::hasActiveCompletionSession();
@@ -556,10 +557,10 @@ private:
         if (now() < deadline) return;
 
         std::fprintf(stderr,
-                     "FAILURE_CLEANUP_TIMEOUT: modal=%d visiblePanels=%d activeCompletion=%d completionReturned=%d\n",
+                     "FAILURE_CLEANUP_TIMEOUT: modal=%d visiblePanels=%d activeCompletion=%d completionResolved=%d\n",
                      juce::Component::getNumCurrentlyModalComponents(), NativeFilePanel::visibleCount(),
                      NativeFilePanel::hasActiveCompletionSession(),
-                     failurePanel == nullptr || failurePanel->completionReturnedExactlyOnce());
+                     failurePanel == nullptr || failurePanel->completionResolvedExactlyOnce());
         std::fflush(stderr);
         failurePanel.reset();
         enter(Phase::failureDrain, 100.0);

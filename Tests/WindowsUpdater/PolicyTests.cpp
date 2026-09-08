@@ -1,6 +1,7 @@
 #include "UpdaterPolicy.h"
 
 #include <cstdlib>
+#include <array>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -52,6 +53,150 @@ int main()
     require(releasesApiUrl("TheWhykiki", "SubLab808")
                 == "https://api.github.com/repos/TheWhykiki/SubLab808/releases?per_page=100",
             "exact bounded releases API URL");
+    require(releaseByIdApiUrl("TheWhykiki", "SubLab808", 123456789)
+                == "https://api.github.com/repos/TheWhykiki/SubLab808/releases/123456789",
+            "exact release-by-ID API URL");
+    require(isGitCommitHex("0123456789abcdef0123456789abcdef01234567")
+                && ! isGitCommitHex("0123456789abcdef0123456789abcdef0123456g"),
+            "exact 40-hex source commit");
+    require(parseCanonicalPositiveUint64("1") == std::uint64_t { 1 }
+                && parseCanonicalPositiveUint64("18446744073709551615")
+                    == std::numeric_limits<std::uint64_t>::max()
+                && ! parseCanonicalPositiveUint64("0")
+                && ! parseCanonicalPositiveUint64("01")
+                && ! parseCanonicalPositiveUint64("18446744073709551616"),
+            "canonical positive release ID");
+
+    const std::string testPublicKey =
+        "6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296"
+        "4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5";
+    require(isP256PublicKeyXYHex(testPublicKey)
+                && ! isP256PublicKeyXYHex(testPublicKey.substr(2))
+                && ! isP256PublicKeyXYHex(std::string(128, 'a')),
+            "P-256 public key is canonical uppercase X||Y hex");
+    std::array<std::uint8_t, 64> signatureBytes{};
+    for (std::size_t index{}; index < signatureBytes.size(); ++index)
+        signatureBytes[index] = static_cast<std::uint8_t>(index);
+    const auto signatureHex = encodeP256P1363SignatureHex(signatureBytes);
+    const std::string derSignatureHex =
+        "30440220"
+        "0000000000000000000000000000000000000000000000000000000000000001"
+        "0220"
+        "0000000000000000000000000000000000000000000000000000000000000001";
+    require(signatureHex.size() == 128
+                && decodeP256P1363SignatureHex(signatureHex) == signatureBytes
+                && ! decodeP256P1363SignatureHex(signatureHex.substr(2))
+                && ! decodeP256P1363SignatureHex(derSignatureHex)
+                && ! decodeP256P1363SignatureHex(std::string(128, 'a'))
+                && ! decodeP256P1363SignatureHex(
+                    std::string(64, '0') + signatureHex.substr(64))
+                && ! decodeP256P1363SignatureHex(
+                    signatureHex.substr(0, 64) + std::string(64, '0'))
+                && ! decodeP256P1363SignatureHex(
+                    signatureHex.substr(0, 64)
+                    + "7FFFFFFF800000007FFFFFFFFFFFFFFFDE737D56D38BCF4279DCE5617E3192A9"),
+            "P-256 P1363 signatures use exactly 64 uppercase-hex bytes and canonical low-S");
+
+    ReleaseGateAuthorizationFields authorization {
+        "TheWhykiki", "SubLab808", "SubLab808", Architecture::x64,
+        *installed, 123456789, "v1.4.1",
+        "0123456789abcdef0123456789abcdef01234567",
+        std::string(64, 'A'),
+        "WhykikiAudio.UpdaterReleaseGate.0123456789ABCDEF0123456789ABCDEF",
+        42, 133444736000000000, 1700000300
+    };
+    const auto canonicalAuthorization = canonicalReleaseGateAuthorization(authorization);
+    const std::string expectedAuthorization =
+        "domain=whykiki.windows-updater-release-gate-authorization\n"
+        "schemaVersion=1\n"
+        "repository=TheWhykiki/SubLab808\n"
+        "product=SubLab808\n"
+        "architecture=x64\n"
+        "installedVersion=1.4.0\n"
+        "releaseId=123456789\n"
+        "tag=v1.4.1\n"
+        "sourceCommit=0123456789abcdef0123456789abcdef01234567\n"
+        "challenge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"
+        "responsePipe=WhykikiAudio.UpdaterReleaseGate.0123456789ABCDEF0123456789ABCDEF\n"
+        "parentProcessId=42\n"
+        "parentProcessCreatedAtFiletime=133444736000000000\n"
+        "expiresAtUnixSeconds=1700000300\n";
+    require(canonicalAuthorization && *canonicalAuthorization == expectedAuthorization,
+            "release-gate authorization has one fixed versioned LF encoding");
+    require(isCanonicalReleaseGatePipeName(authorization.responsePipe)
+                && ! isCanonicalReleaseGatePipeName(
+                    "WhykikiAudio.UpdaterReleaseGate.0123456789abcdef0123456789abcdef")
+                && ! isCanonicalReleaseGatePipeName("\\\\.\\pipe\\attacker"),
+            "release-gate pipe name is a canonical bare current-user token");
+    require(isReleaseGateExpiryValid(1300, 1000)
+                && ! isReleaseGateExpiryValid(1000, 1000)
+                && ! isReleaseGateExpiryValid(1301, 1000)
+                && ! isReleaseGateExpiryValid(1, 0),
+            "release-gate expiry is future-only and bounded to five minutes");
+
+    const auto originalCanonical = *canonicalAuthorization;
+    const auto requireMutationChangesAuthorization = [&] (const ReleaseGateAuthorizationFields& mutation)
+    {
+        const auto changed = canonicalReleaseGateAuthorization(mutation);
+        require(changed && *changed != originalCanonical,
+                "every accepted authorization-field mutation changes signed bytes");
+    };
+    auto mutation = authorization;
+    mutation.owner = "OtherOwner";
+    requireMutationChangesAuthorization(mutation);
+    mutation = authorization;
+    mutation.repository = "OtherRepository";
+    requireMutationChangesAuthorization(mutation);
+    mutation = authorization;
+    mutation.product = "OtherProduct";
+    requireMutationChangesAuthorization(mutation);
+    mutation = authorization;
+    mutation.architecture = Architecture::arm64ec;
+    requireMutationChangesAuthorization(mutation);
+    mutation = authorization;
+    mutation.installedVersion = *parseVersion("1.3.9");
+    requireMutationChangesAuthorization(mutation);
+    mutation = authorization;
+    ++mutation.releaseId;
+    requireMutationChangesAuthorization(mutation);
+    mutation = authorization;
+    mutation.tag = "v1.4.2";
+    requireMutationChangesAuthorization(mutation);
+    mutation = authorization;
+    mutation.sourceCommit = std::string(40, 'f');
+    requireMutationChangesAuthorization(mutation);
+    mutation = authorization;
+    mutation.challenge = std::string(64, 'B');
+    requireMutationChangesAuthorization(mutation);
+    mutation = authorization;
+    mutation.responsePipe =
+        "WhykikiAudio.UpdaterReleaseGate.FEDCBA9876543210FEDCBA9876543210";
+    requireMutationChangesAuthorization(mutation);
+    mutation = authorization;
+    ++mutation.parentProcessId;
+    requireMutationChangesAuthorization(mutation);
+    mutation = authorization;
+    ++mutation.parentProcessCreatedAtFiletime;
+    requireMutationChangesAuthorization(mutation);
+    mutation = authorization;
+    ++mutation.expiresAtUnixSeconds;
+    requireMutationChangesAuthorization(mutation);
+
+    const std::array<void (*) (ReleaseGateAuthorizationFields&), 6> invalidMutations {
+        [] (ReleaseGateAuthorizationFields& value) { value.sourceCommit[0] = 'A'; },
+        [] (ReleaseGateAuthorizationFields& value) { value.challenge[0] = 'a'; },
+        [] (ReleaseGateAuthorizationFields& value) { value.responsePipe.back() = 'a'; },
+        [] (ReleaseGateAuthorizationFields& value) { value.parentProcessId = 0; },
+        [] (ReleaseGateAuthorizationFields& value) { value.parentProcessCreatedAtFiletime = 0; },
+        [] (ReleaseGateAuthorizationFields& value) { value.expiresAtUnixSeconds = 0; }
+    };
+    for (const auto invalid : invalidMutations)
+    {
+        mutation = authorization;
+        invalid(mutation);
+        require(! canonicalReleaseGateAuthorization(mutation),
+                "non-canonical release-gate authorization field rejected");
+    }
 
     const std::string digest(64, 'a');
     const auto normalized = digestHex("sha256:" + digest);

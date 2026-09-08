@@ -72,6 +72,8 @@ $updater = (Resolve-Path "$bundle\Contents\Helpers\<Product>Updater.exe").Path
     -UpdaterPath $updater `
     -ExpectedSignerSha256 '<64-hex-certificate-sha256-from-cmake>' `
     -ExpectedNextSignerSha256 '<optional-distinct-64-hex-next-certificate-sha256>' `
+    -ExpectedReleaseGatePublicKeyXY '<128-uppercase-hex-p256-x-then-y-from-cmake>' `
+    -ExpectedReleaseGateNextPublicKeyXY '<optional-distinct-128-uppercase-hex-next-p256-key>' `
     -CertificateThumbprint '<40-hex-certificate-thumbprint>' `
     -TimestampUrl 'https://<your-rfc3161-provider>' `
     -HostTestPath $hostTest
@@ -88,7 +90,11 @@ unverändert als `-ExpectedSignerSha256` übergeben werden. Der optionale, davon
 verschiedene nächste Updater-Pin wird mit `-ExpectedNextSignerSha256` gebunden.
 Er erweitert ausschließlich die vom Updater akzeptierte Download-Payload und
 darf nicht das Zertifikat der PFX oder einer in diesem Lauf erzeugten Signatur
-sein. Das Skript bricht ab, wenn der tatsächliche Fingerprint des ausgewählten
+sein. Entsprechend binden `-ExpectedReleaseGatePublicKeyXY` und optional
+`-ExpectedReleaseGateNextPublicKeyXY` den aktuellen und vorbereiteten nächsten
+P-256-Public-Key bytegenau an CMake, Helper und Evidence. Beide Werte sind
+128 Großhex-Zeichen `X||Y`; Current ist zwingend und Next muss leer oder
+verschieden sein. Das Skript bricht ab, wenn der tatsächliche Fingerprint des ausgewählten
 Zertifikats vom aktuellen Pin abweicht. Der Updater muss dieselbe x64-
 beziehungsweise ARM64EC-PE-Architektur wie das Plug-in besitzen. Vor jeder
 Signatur führt das Skript den gestagten Helper
@@ -105,8 +111,9 @@ Der Datensatz enthält Schema und Schemaversion, Challenge, Server-PID,
 Produktions-/Compile-only-Modus sowie die vollständige kompilierte Identität:
 Produkt, Version, Hersteller, GitHub-Owner und -Repository, Architektur, beide
 UpgradeCodes, aktuellen Signer-Pin und optionalen nächsten Signer-Pin. Der
-kanonische Build-Vertrag verwendet Schema 2 mit `currentSignerSha256` und
-`nextSignerSha256`. Verbindung, begrenztes Lesen und Prozessende teilen sich ein
+kanonische Build-Vertrag verwendet Schema 3 mit `currentSignerSha256`,
+`nextSignerSha256`, `releaseGatePublicKeyXY` und
+`releaseGateNextPublicKeyXY`. Verbindung, begrenztes Lesen und Prozessende teilen sich ein
 30-Sekunden-Limit; das Skript liest höchstens die erwartete Länge plus ein Byte.
 Nur bytegenaue Übereinstimmung ohne BOM, Zusatz-Whitespace oder Folgedaten
 **und** Exitcode 0 besteht. Ein bloßer Exitcode 0, Console-Ausgabe, ein
@@ -217,10 +224,13 @@ Das Resultat ist ein neues, atomar veröffentlichtes Kandidatenverzeichnis unter
 `dist\windows` (oder `-OutputDirectory`). Es enthält genau das MSI und eine
 `*.evidence.json` mit MSI-Hash, vollständiger Payload-Hashliste, Produkt- und
 UpgradeCodes sowie expliziten Ergebnissen für Graph-, Referenz-, Side-Effect-,
-Sequenz- und Extraktionslayout-Prüfung. Evidence-Schema 3 protokolliert zusätzlich
+Sequenz- und Extraktionslayout-Prüfung. Evidence-Schema 4 protokolliert zusätzlich
 `updaterCurrentSignerSha256`, den optionalen `updaterNextSignerSha256` und die
 exakt geordnete `payloadSignerAllowlistSha256` als `[current]` oder
-`[current, next]`. Außerdem enthält es den `moduleinfo.json`-Hash und seine
+`[current, next]`. Zusätzlich bindet es `releaseGatePublicKeyXY`, den optionalen
+`releaseGateNextPublicKeyXY` und die exakt geordnete
+`releaseGatePublicKeyAllowlistXY` nach demselben Current/Next-Prinzip. Außerdem
+enthält es den `moduleinfo.json`-Hash und seine
 gebundene Identität, die fünf geprüften Felder der
 Plugin- und Updater-PE-Versionresources samt Mutationstestzahlen, sämtliche erkannten PE-Pfade,
 Updater-/Helper-Klassifikation, tatsächlich signierte PE-Pfade, den exakten

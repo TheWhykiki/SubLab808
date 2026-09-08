@@ -17,6 +17,7 @@ ARCHITECTURES = {
     "arm64ec": "arm64",
 }
 SHA256_RE = re.compile(r"^[0-9A-F]{64}$")
+PUBLIC_KEY_XY_RE = re.compile(r"^[0-9A-F]{128}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 GUID_RE = re.compile(r"^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$")
 VERSION_RE = re.compile(r"^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,4})$")
@@ -189,6 +190,8 @@ def validate_assets(
     source_commit: str,
     expected_signer_sha256: str,
     expected_next_signer_sha256: str,
+    expected_release_gate_public_key_xy: str,
+    expected_release_gate_next_public_key_xy: str,
     architectures: tuple[str, ...],
 ) -> None:
     _require(directory.is_dir() and not directory.is_symlink(), f"Asset directory is invalid: {directory}")
@@ -205,6 +208,25 @@ def validate_assets(
     )
     _require(not next_signer or next_signer != signer, "Expected current and next signers must be distinct")
     signer_allowlist = [signer] + ([next_signer] if next_signer else [])
+    release_gate_public_key = expected_release_gate_public_key_xy
+    _require(
+        PUBLIC_KEY_XY_RE.fullmatch(release_gate_public_key) is not None,
+        "Expected release-gate public key must be exactly 128 uppercase hexadecimal characters",
+    )
+    release_gate_next_public_key = expected_release_gate_next_public_key_xy
+    _require(
+        not release_gate_next_public_key
+        or PUBLIC_KEY_XY_RE.fullmatch(release_gate_next_public_key) is not None,
+        "Expected next release-gate public key must be empty or exactly 128 uppercase hexadecimal characters",
+    )
+    _require(
+        not release_gate_next_public_key
+        or release_gate_next_public_key != release_gate_public_key,
+        "Expected current and next release-gate public keys must be distinct",
+    )
+    release_gate_public_key_allowlist = [release_gate_public_key] + (
+        [release_gate_next_public_key] if release_gate_next_public_key else []
+    )
     _require(architectures and len(set(architectures)) == len(architectures), "Architectures must be unique")
 
     expected_names: set[str] = set()
@@ -227,7 +249,7 @@ def validate_assets(
         _require(msi.stat().st_size <= 256 * 1024 * 1024, f"MSI exceeds updater size policy: {msi.name}")
         evidence = _load_evidence(evidence_path)
         expected_values = {
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "artifactStatus": "SIGNED",
             "product": product,
             "version": version,
@@ -240,9 +262,15 @@ def validate_assets(
             "updaterCurrentSignerSha256": signer,
             "updaterNextSignerSha256": next_signer or None,
             "payloadSignerAllowlistSha256": signer_allowlist,
+            "releaseGatePublicKeyXY": release_gate_public_key,
+            "releaseGateNextPublicKeyXY": release_gate_next_public_key or None,
+            "releaseGatePublicKeyAllowlistXY": release_gate_public_key_allowlist,
         }
         for key, expected in expected_values.items():
-            _require(evidence.get(key) == expected, f"Evidence field {key!r} is invalid for {architecture}")
+            _require(
+                key in evidence and evidence[key] == expected,
+                f"Evidence field {key!r} is invalid for {architecture}",
+            )
         config = json.loads(
             (pathlib.Path(__file__).resolve().parents[1] / "Installer/Windows/package-config.json").read_text(
                 encoding="utf-8"
@@ -321,6 +349,8 @@ def main() -> int:
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--expected-signer-sha256", required=True)
     parser.add_argument("--expected-next-signer-sha256", default="")
+    parser.add_argument("--expected-release-gate-public-key-xy", required=True)
+    parser.add_argument("--expected-release-gate-next-public-key-xy", default="")
     parser.add_argument("--architecture", choices=tuple(ARCHITECTURES), action="append")
     args = parser.parse_args()
     architectures = tuple(args.architecture or ARCHITECTURES)
@@ -332,6 +362,8 @@ def main() -> int:
             args.source_commit,
             args.expected_signer_sha256,
             args.expected_next_signer_sha256,
+            args.expected_release_gate_public_key_xy,
+            args.expected_release_gate_next_public_key_xy,
             architectures,
         )
     except (ContractError, OSError) as error:

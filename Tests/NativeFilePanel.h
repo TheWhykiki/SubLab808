@@ -23,7 +23,9 @@ public:
     bool beganExactlyOnce() const;
     bool completionHasNotStarted() const;
     bool completionProgressIsValid() const;
-    bool completionReturnedExactlyOnce() const;
+    // A native completion is terminal only after AppKit released its block:
+    // either the callback returned once, or the block was never entered.
+    bool completionResolvedExactlyOnce() const;
     static bool hasActiveCompletionSession();
     std::string className() const;
     void useFixtureLocation(const std::string& directory, const std::string& filename);

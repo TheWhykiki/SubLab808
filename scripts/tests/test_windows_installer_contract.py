@@ -447,7 +447,7 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
             "moduleInfoIdentityValidated = $true",
             "classIdentities = @($moduleInfoContract.ClassIdentities)",
             "sha256 = $moduleInfoContract.Sha256",
-            "schemaVersion = 3",
+            "schemaVersion = 4",
         ):
             self.assertIn(token, self.script)
 
@@ -592,6 +592,9 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
             "Production mode requires the exact 64-hex -ExpectedSignerSha256 compiled into the updater",
             "ExpectedNextSignerSha256 must be empty or exactly 64 hexadecimal characters",
             "ExpectedNextSignerSha256 must differ from the current ExpectedSignerSha256",
+            "Production mode requires -ExpectedReleaseGatePublicKeyXY as exactly 128 uppercase hexadecimal characters",
+            "ExpectedReleaseGateNextPublicKeyXY must be empty or exactly 128 uppercase hexadecimal characters",
+            "ExpectedReleaseGateNextPublicKeyXY must differ from ExpectedReleaseGatePublicKeyXY",
             "Selected signing certificate does not match the SHA-256 fingerprint compiled into the updater",
             "Production packages require exactly the product updater",
             "Invoke-UpdaterBuildContract",
@@ -604,7 +607,9 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
             "--github-repository",
             "--current-signer-sha256",
             "--next-signer-sha256",
-            '"schemaVersion":2',
+            "--release-gate-public-key-xy",
+            "--release-gate-next-public-key-xy",
+            '"schemaVersion":3',
             "RandomNumberGenerator]::Fill",
             "PipeOptions]::CurrentUserOnly",
             "NamedPipeServerStream]::new",
@@ -636,6 +641,9 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
             "updaterCurrentSignerSha256",
             "updaterNextSignerSha256",
             "payloadSignerAllowlistSha256",
+            "releaseGatePublicKeyXY",
+            "releaseGateNextPublicKeyXY",
+            "releaseGatePublicKeyAllowlistXY",
         ):
             self.assertIn(token, self.script)
         self.assertNotIn("@('/n',", self.script)
@@ -676,6 +684,41 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
         self.assertIn("CurrentUserOnly", contract)
         self.assertIn("RandomNumberGenerator]::Fill", self.script)
         self.assertGreater(peer_check, self.script.index("GetNamedPipeClientProcessId"))
+
+    def test_release_gate_build_identity_and_evidence_are_schema_bound(self) -> None:
+        contract_start = self.script.index("function Invoke-UpdaterBuildContract")
+        contract_end = self.script.index(
+            "function Invoke-AdministrativeExtraction", contract_start
+        )
+        contract = self.script[contract_start:contract_end]
+        next_signer = contract.index('"nextSignerSha256"')
+        current_gate_key = contract.index('"releaseGatePublicKeyXY"')
+        next_gate_key = contract.index('"releaseGateNextPublicKeyXY"')
+        self.assertLess(next_signer, current_gate_key)
+        self.assertLess(current_gate_key, next_gate_key)
+        self.assertIn(
+            "$ExpectedReleaseGatePublicKeyXY $ExpectedReleaseGateNextPublicKeyXY",
+            self.script,
+        )
+        self.assertRegex(
+            self.script,
+            r"releaseGatePublicKeyXY = if \(\$AllowUnsigned\) \{ \$null \} else "
+            r"\{ \$ExpectedReleaseGatePublicKeyXY \}",
+        )
+        self.assertRegex(
+            self.script,
+            r"releaseGateNextPublicKeyXY = if \(\$AllowUnsigned -or\s+"
+            r"\[string\]::IsNullOrEmpty\(\$ExpectedReleaseGateNextPublicKeyXY\)\) "
+            r"\{\s+\$null",
+        )
+        self.assertRegex(
+            self.script,
+            r"releaseGatePublicKeyAllowlistXY = if \(\$AllowUnsigned\) \{\s+@\(\)",
+        )
+        self.assertIn(
+            "($evidence.schemaVersion -eq 4)",
+            self.acceptance,
+        )
 
     def test_msi_validation_and_host_hook_are_mandatory_contracts(self) -> None:
         for token in (
@@ -726,6 +769,13 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
             "ExpectedMsiArchitecture",
             "ExpectedNextSignerSha256",
             "payloadSignerAllowlistSha256",
+            "ExpectedReleaseGatePublicKeyXY",
+            "ExpectedReleaseGateNextPublicKeyXY",
+            "releaseGatePublicKeyXY",
+            "releaseGateNextPublicKeyXY",
+            "releaseGatePublicKeyAllowlistXY",
+            "$releaseGateAllowlistValue -is [System.Array]",
+            "$releaseGateAllowlistValue[$index] -cne $expectedReleaseGateAllowlist[$index]",
             "$evidenceAllowlist.Count -eq $expectedAllowlist.Count",
             "$evidenceAllowlist[$index] -cne $expectedAllowlist[$index]",
             "Signed MSI ProductCode does not match the release evidence",

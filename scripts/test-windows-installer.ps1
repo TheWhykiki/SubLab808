@@ -39,6 +39,11 @@ param(
 
     [string] $ExpectedNextSignerSha256,
 
+    [Parameter(Mandatory = $true)]
+    [string] $ExpectedReleaseGatePublicKeyXY,
+
+    [string] $ExpectedReleaseGateNextPublicKeyXY,
+
     [ValidateRange(1, 3600)]
     [int] $InstallerTimeoutSeconds = 300,
 
@@ -494,6 +499,16 @@ Assert-Condition ([string]::IsNullOrEmpty($expectedNextPin) -or
     'ExpectedNextSignerSha256 must be empty or exactly 64 hexadecimal characters.'
 Assert-Condition ([string]::IsNullOrEmpty($expectedNextPin) -or $expectedNextPin -cne $expectedPin) `
     'ExpectedNextSignerSha256 must differ from ExpectedSignerSha256.'
+$expectedReleaseGatePublicKey = [string]$ExpectedReleaseGatePublicKeyXY
+Assert-Condition ($expectedReleaseGatePublicKey -cmatch '^[0-9A-F]{128}\z') `
+    'ExpectedReleaseGatePublicKeyXY must be exactly 128 uppercase hexadecimal characters.'
+$expectedReleaseGateNextPublicKey = [string]$ExpectedReleaseGateNextPublicKeyXY
+Assert-Condition ([string]::IsNullOrEmpty($expectedReleaseGateNextPublicKey) -or
+                  $expectedReleaseGateNextPublicKey -cmatch '^[0-9A-F]{128}\z') `
+    'ExpectedReleaseGateNextPublicKeyXY must be empty or exactly 128 uppercase hexadecimal characters.'
+Assert-Condition ([string]::IsNullOrEmpty($expectedReleaseGateNextPublicKey) -or
+                  $expectedReleaseGateNextPublicKey -cne $expectedReleaseGatePublicKey) `
+    'ExpectedReleaseGateNextPublicKeyXY must differ from ExpectedReleaseGatePublicKeyXY.'
 
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
@@ -538,7 +553,7 @@ try {
         [System.IO.FileAccess]::Read,
         [System.IO.FileShare]::Read)
     $evidence = Get-Content -LiteralPath $resolvedEvidence -Raw -Encoding utf8 | ConvertFrom-Json
-    Assert-Condition ($evidence.schemaVersion -eq 3) 'Unsupported Windows installer evidence schema.'
+    Assert-Condition ($evidence.schemaVersion -eq 4) 'Unsupported Windows installer evidence schema.'
     Assert-Condition ([string]$evidence.artifactStatus -ceq 'SIGNED' -and
                       $evidence.signed -is [bool] -and $evidence.signed) `
         'Installed-MSI acceptance requires a signed production candidate.'
@@ -587,6 +602,47 @@ try {
         'Evidence signer identities do not match the configured release pin.'
     Assert-Condition ($updaterNextPin -ceq $expectedNextPin -and $allowlistMatches) `
         'Evidence payload signer allowlist does not match the configured current/next pins.'
+    $evidencePropertyNames = @($evidence.PSObject.Properties.Name)
+    foreach ($releaseGateEvidenceField in @(
+        'releaseGatePublicKeyXY',
+        'releaseGateNextPublicKeyXY',
+        'releaseGatePublicKeyAllowlistXY'
+    )) {
+        Assert-Condition ($evidencePropertyNames -ccontains $releaseGateEvidenceField) `
+            "Evidence is missing required release-gate field '$releaseGateEvidenceField'."
+    }
+    Assert-Condition ($evidence.releaseGatePublicKeyXY -is [string] -and
+                      [string]$evidence.releaseGatePublicKeyXY -ceq
+                          $expectedReleaseGatePublicKey) `
+        'Evidence release-gate public key does not match the configured current key.'
+    if ([string]::IsNullOrEmpty($expectedReleaseGateNextPublicKey)) {
+        Assert-Condition ($null -eq $evidence.releaseGateNextPublicKeyXY) `
+            'Evidence next release-gate public key must be null when no next key is configured.'
+        [string[]]$expectedReleaseGateAllowlist = @($expectedReleaseGatePublicKey)
+    } else {
+        Assert-Condition ($evidence.releaseGateNextPublicKeyXY -is [string] -and
+                          [string]$evidence.releaseGateNextPublicKeyXY -ceq
+                              $expectedReleaseGateNextPublicKey) `
+            'Evidence next release-gate public key does not match the configured next key.'
+        [string[]]$expectedReleaseGateAllowlist = @(
+            $expectedReleaseGatePublicKey,
+            $expectedReleaseGateNextPublicKey
+        )
+    }
+    $releaseGateAllowlistValue = $evidence.releaseGatePublicKeyAllowlistXY
+    $releaseGateAllowlistMatches = $releaseGateAllowlistValue -is [System.Array] -and
+        $releaseGateAllowlistValue.Count -eq $expectedReleaseGateAllowlist.Count
+    if ($releaseGateAllowlistMatches) {
+        for ($index = 0; $index -lt $expectedReleaseGateAllowlist.Count; ++$index) {
+            if (-not ($releaseGateAllowlistValue[$index] -is [string]) -or
+                $releaseGateAllowlistValue[$index] -cne $expectedReleaseGateAllowlist[$index]) {
+                $releaseGateAllowlistMatches = $false
+                break
+            }
+        }
+    }
+    Assert-Condition $releaseGateAllowlistMatches `
+        'Evidence release-gate public-key allowlist does not exactly match the configured current/next keys.'
     $actualMsiHash = (Get-FileHash -LiteralPath $resolvedMsi -Algorithm SHA256).Hash.ToUpperInvariant()
     Assert-Condition ([string]$evidence.msiSha256 -ceq $actualMsiHash) `
         'MSI bytes do not match the signed evidence.'

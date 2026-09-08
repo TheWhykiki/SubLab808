@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <map>
@@ -32,8 +33,39 @@ std::string toString(const SemVersion& version);
 bool isSafeRepositoryComponent(std::string_view value);
 bool isCanonicalGuid(std::string_view value);
 bool isSha256Hex(std::string_view value);
+bool isGitCommitHex(std::string_view value);
+bool isP256PublicKeyXYHex(std::string_view value);
+std::optional<std::array<std::uint8_t, 64>> decodeP256P1363SignatureHex(
+    std::string_view value);
+std::string encodeP256P1363SignatureHex(const std::array<std::uint8_t, 64>& value);
+std::optional<std::uint64_t> parseCanonicalPositiveUint64(std::string_view value);
 std::optional<std::string> digestHex(std::string_view githubDigest);
 bool isAllowedHttpsHost(std::string_view lowerCaseHost);
+
+inline constexpr std::uint64_t releaseGateMaximumTtlSeconds = 5u * 60u;
+
+struct ReleaseGateAuthorizationFields
+{
+    std::string owner;
+    std::string repository;
+    std::string product;
+    Architecture architecture{};
+    SemVersion installedVersion;
+    std::uint64_t releaseId{};
+    std::string tag;
+    std::string sourceCommit;
+    std::string challenge;
+    std::string responsePipe;
+    std::uint32_t parentProcessId{};
+    std::uint64_t parentProcessCreatedAtFiletime{};
+    std::uint64_t expiresAtUnixSeconds{};
+};
+
+bool isCanonicalReleaseGatePipeName(std::string_view value);
+bool isReleaseGateExpiryValid(std::uint64_t expiresAtUnixSeconds,
+                              std::uint64_t nowUnixSeconds);
+std::optional<std::string> canonicalReleaseGateAuthorization(
+    const ReleaseGateAuthorizationFields& fields);
 
 std::string architectureAssetSuffix(Architecture architecture);
 std::string architectureBundleDirectory(Architecture architecture);
@@ -46,6 +78,9 @@ std::string expectedAssetUrl(std::string_view owner,
                              const SemVersion& version,
                              Architecture architecture);
 std::string releasesApiUrl(std::string_view owner, std::string_view repository);
+std::string releaseByIdApiUrl(std::string_view owner,
+                              std::string_view repository,
+                              std::uint64_t releaseId);
 
 struct MsiUpgradeRow
 {

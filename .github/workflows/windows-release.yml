@@ -27,8 +27,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  authorize_windows_bootstrap:
-    name: Authorize first signed Windows release bootstrap
+  authorize_windows_release:
+    name: Resolve and authorize Windows release transition
     if: >-
       inputs.confirm_release == true &&
       github.repository == 'TheWhykiki/SubLab808' &&
@@ -37,6 +37,14 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+    outputs:
+      release_state: ${{ steps.release_state.outputs.release_state }}
+      release_state_sha256: ${{ steps.release_state.outputs.release_state_sha256 }}
+      mode: ${{ steps.release_state.outputs.mode }}
+      baseline_release_id: ${{ steps.release_state.outputs.baseline_release_id }}
+      baseline_tag: ${{ steps.release_state.outputs.baseline_tag }}
+      baseline_version: ${{ steps.release_state.outputs.baseline_version }}
+      baseline_commit: ${{ steps.release_state.outputs.baseline_commit }}
     env:
       PRODUCT: SubLab808
       WK_INPUT_TAG: ${{ inputs.tag }}
@@ -48,24 +56,51 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Refuse an untested follow-up Windows release
+      - name: Require immutable GitHub Releases policy
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_ADMIN_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          policy="$(gh api --method GET -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/immutable-releases")"
+          test "$(jq -r 'if type == "object" and .enabled == true then "true" else "false" end' <<< "$policy")" = true
+
+      - name: Resolve immutable bootstrap or exact previous Windows release
+        id: release_state
         shell: bash
         run: |
           set -euo pipefail
-          test "$WK_BOOTSTRAP_CONFIRMATION" = 'true'
           metadata="$RUNNER_TEMP/public-releases.json"
-          gh api --method GET --paginate --slurp \
+          gh api --method GET -H 'X-GitHub-Api-Version: 2026-03-10' --paginate --slurp \
             "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$metadata"
-          python3 -B scripts/check-windows-release-bootstrap.py \
+          release_state="$(python3 -B scripts/check-windows-release-state.py \
             --releases-json "$metadata" \
             --policy-json Installer/Windows/bootstrap-policy.json \
-            --product "$PRODUCT" --tag "$WK_INPUT_TAG" --paginated
+            --product "$PRODUCT" --candidate-tag "$WK_INPUT_TAG" \
+            --confirmation "$WK_BOOTSTRAP_CONFIRMATION")"
+          python3 -c 'import json,sys; value=json.loads(sys.argv[1]); assert value["schemaVersion"] == 1 and value["product"] == sys.argv[2]' \
+            "$release_state" "$PRODUCT"
+          release_state_sha256="$(printf '%s' "$release_state" | sha256sum | awk '{print $1}')"
+          mode="$(jq -r '.mode' <<< "$release_state")"
+          baseline_release_id="$(jq -r '.baseline.releaseId // ""' <<< "$release_state")"
+          baseline_tag="$(jq -r '.baseline.tag // ""' <<< "$release_state")"
+          baseline_version="$(jq -r '.baseline.version // ""' <<< "$release_state")"
+          baseline_commit="$(jq -r '.baseline.commit // ""' <<< "$release_state")"
+          printf 'release_state=%s\n' "$release_state" >> "$GITHUB_OUTPUT"
+          printf 'release_state_sha256=%s\n' "$release_state_sha256" >> "$GITHUB_OUTPUT"
+          printf 'mode=%s\n' "$mode" >> "$GITHUB_OUTPUT"
+          printf 'baseline_release_id=%s\n' "$baseline_release_id" >> "$GITHUB_OUTPUT"
+          printf 'baseline_tag=%s\n' "$baseline_tag" >> "$GITHUB_OUTPUT"
+          printf 'baseline_version=%s\n' "$baseline_version" >> "$GITHUB_OUTPUT"
+          printf 'baseline_commit=%s\n' "$baseline_commit" >> "$GITHUB_OUTPUT"
 
   build-windows:
     name: Build and sign Windows ${{ matrix.artifact_arch }}
-    needs: authorize_windows_bootstrap
+    needs: authorize_windows_release
     if: >-
-      needs.authorize_windows_bootstrap.result == 'success' &&
+      needs.authorize_windows_release.result == 'success' &&
       inputs.confirm_release == true &&
       github.repository == 'TheWhykiki/SubLab808' &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
@@ -107,6 +142,8 @@ jobs:
       WK_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       SIGNER_SHA256: ${{ vars.WINDOWS_CODE_SIGNING_CERT_SHA256 }}
       NEXT_SIGNER_SHA256: ${{ vars.WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256 }}
+      RELEASE_GATE_PUBLIC_KEY_XY: ${{ vars.WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY }}
+      RELEASE_GATE_NEXT_PUBLIC_KEY_XY: ${{ vars.WINDOWS_RELEASE_GATE_NEXT_PUBLIC_KEY_XY }}
       TIMESTAMP_URL: ${{ vars.WINDOWS_RFC3161_TIMESTAMP_URL }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -170,6 +207,16 @@ jobs:
           if ($nextPin -and $nextPin -ceq $pin) {
             throw 'WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256 must differ from the current certificate pin.'
           }
+          $releaseGateKey = [string]$env:RELEASE_GATE_PUBLIC_KEY_XY
+          $nextReleaseGateKey = [string]$env:RELEASE_GATE_NEXT_PUBLIC_KEY_XY
+          if ($releaseGateKey -cnotmatch '^[0-9A-F]{128}$') {
+            throw 'WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY must be exactly 128 uppercase hexadecimal characters.'
+          }
+          if ($nextReleaseGateKey -and
+              ($nextReleaseGateKey -cnotmatch '^[0-9A-F]{128}$' -or
+               $nextReleaseGateKey -ceq $releaseGateKey)) {
+            throw 'WINDOWS_RELEASE_GATE_NEXT_PUBLIC_KEY_XY must be empty or a distinct canonical P-256 point.'
+          }
           $timestamp = $null
           if (-not [uri]::TryCreate($env:TIMESTAMP_URL, [System.UriKind]::Absolute, [ref]$timestamp) -or
               $timestamp.Scheme -cne 'https') {
@@ -180,6 +227,143 @@ jobs:
           "WK_TAG_COMMIT=$tagCommit" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "WK_SIGNER_SHA256=$pin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "WK_NEXT_SIGNER_SHA256=$nextPin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WK_RELEASE_GATE_PUBLIC_KEY_XY=$releaseGateKey" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WK_RELEASE_GATE_NEXT_PUBLIC_KEY_XY=$nextReleaseGateKey" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify active release-gate authorization key pair
+        shell: pwsh
+        env:
+          WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64: ${{ secrets.WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64 }}
+        run: |
+          $privateText = [string]$env:WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64
+          if ([string]::IsNullOrWhiteSpace($privateText) -or $privateText.Length -gt 8192) {
+            throw 'WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64 is missing or exceeds its fixed bound.'
+          }
+          [byte[]]$privateBytes = $null
+          [byte[]]$probe = $null
+          [byte[]]$signature = $null
+          $key = $null
+          try {
+            $privateBytes = [Convert]::FromBase64String($privateText)
+            if ($privateBytes.Length -eq 0 -or $privateBytes.Length -gt 4096 -or
+                [Convert]::ToBase64String($privateBytes) -cne $privateText) {
+              throw 'Release-gate PKCS#8 secret is not canonical bounded base64.'
+            }
+            $key = [System.Security.Cryptography.ECDsa]::Create()
+            [int]$bytesRead = 0
+            $key.ImportPkcs8PrivateKey($privateBytes, [ref]$bytesRead)
+            if ($bytesRead -ne $privateBytes.Length) {
+              throw 'Release-gate PKCS#8 secret contains trailing data.'
+            }
+            $parameters = $key.ExportParameters($false)
+            if ($parameters.Q.X.Length -ne 32 -or $parameters.Q.Y.Length -ne 32) {
+              throw 'Release-gate private key is not ECDSA P-256.'
+            }
+            $actualPublicKey = [Convert]::ToHexString($parameters.Q.X) +
+              [Convert]::ToHexString($parameters.Q.Y)
+            if ($actualPublicKey -cne $env:WK_RELEASE_GATE_PUBLIC_KEY_XY) {
+              throw 'Release-gate private key does not match the active public-key variable.'
+            }
+            $probe = [byte[]]::new(32)
+            [System.Security.Cryptography.RandomNumberGenerator]::Fill($probe)
+            $signature = $key.SignData(
+              $probe,
+              [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+              [System.Security.Cryptography.DSASignatureFormat]::IeeeP1363FixedFieldConcatenation)
+            if ($signature.Length -ne 64 -or -not $key.VerifyData(
+                $probe, $signature,
+                [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+                [System.Security.Cryptography.DSASignatureFormat]::IeeeP1363FixedFieldConcatenation)) {
+              throw 'Release-gate P-256 key pair failed its signing self-test.'
+            }
+          } finally {
+            if ($null -ne $signature) { [Array]::Clear($signature, 0, $signature.Length) }
+            if ($null -ne $probe) { [Array]::Clear($probe, 0, $probe.Length) }
+            if ($null -ne $privateBytes) { [Array]::Clear($privateBytes, 0, $privateBytes.Length) }
+            if ($null -ne $key) { $key.Dispose() }
+            Remove-Item Env:WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64 -ErrorAction SilentlyContinue
+            $privateText = ''
+          }
+
+      - name: Prove the installed baseline authorizes the active release-gate key
+        if: needs.authorize_windows_release.outputs.mode == 'upgrade'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WK_BASELINE_RELEASE_ID: ${{ needs.authorize_windows_release.outputs.baseline_release_id }}
+          WK_BASELINE_TAG: ${{ needs.authorize_windows_release.outputs.baseline_tag }}
+          WK_BASELINE_VERSION: ${{ needs.authorize_windows_release.outputs.baseline_version }}
+          WK_BASELINE_COMMIT: ${{ needs.authorize_windows_release.outputs.baseline_commit }}
+        run: |
+          if ($env:WK_BASELINE_RELEASE_ID -cnotmatch '^[1-9][0-9]*$' -or
+              $env:WK_BASELINE_TAG -cne "v$env:WK_BASELINE_VERSION" -or
+              $env:WK_BASELINE_COMMIT -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'Authorized baseline identity is malformed.'
+          }
+          $releaseText = (& gh api --method GET -H 'X-GitHub-Api-Version: 2026-03-10' `
+            "repos/$env:GITHUB_REPOSITORY/releases/$env:WK_BASELINE_RELEASE_ID") -join "`n"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read the exact authorized baseline release.' }
+          $release = $releaseText | ConvertFrom-Json
+          if ([string]$release.id -cne $env:WK_BASELINE_RELEASE_ID -or
+              [string]$release.tag_name -cne $env:WK_BASELINE_TAG -or
+              [string]$release.target_commitish -cne $env:WK_BASELINE_COMMIT -or
+              $release.draft -isnot [bool] -or $release.draft -or
+              $release.prerelease -isnot [bool] -or $release.prerelease -or
+              $release.immutable -isnot [bool] -or -not $release.immutable -or
+              @($release.assets).Count -ne 8) {
+            throw 'Authorized baseline is no longer the exact immutable stable release.'
+          }
+          $evidenceName = "SubLab808-$env:WK_BASELINE_VERSION-Windows-${{ matrix.artifact_arch }}.evidence.json"
+          $evidenceAssets = @($release.assets | Where-Object { [string]$_.name -ceq $evidenceName })
+          if ($evidenceAssets.Count -ne 1) { throw 'Authorized baseline evidence asset is ambiguous.' }
+          $asset = $evidenceAssets[0]
+          $expectedUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:WK_BASELINE_TAG/$evidenceName"
+          if ([string]$asset.state -cne 'uploaded' -or
+              [string]$asset.digest -cnotmatch '^sha256:[0-9a-f]{64}$' -or
+              [long]$asset.size -le 0 -or [long]$asset.size -gt 8MB -or
+              [string]$asset.browser_download_url -cne $expectedUrl) {
+            throw 'Authorized baseline evidence asset metadata is invalid.'
+          }
+          $evidencePath = Join-Path $env:RUNNER_TEMP $evidenceName
+          Invoke-WebRequest -Uri $expectedUrl -OutFile $evidencePath -MaximumRedirection 5
+          $item = Get-Item -LiteralPath $evidencePath -Force
+          if ($item.Length -ne [long]$asset.size -or $item.Length -gt 8MB -or
+              ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Downloaded baseline evidence size or file type differs from release metadata.'
+          }
+          $actualDigest = (Get-FileHash -LiteralPath $evidencePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ("sha256:$actualDigest" -cne [string]$asset.digest) {
+            throw 'Downloaded baseline evidence differs from its immutable GitHub digest.'
+          }
+          $evidence = Get-Content -LiteralPath $evidencePath -Raw -Encoding utf8 | ConvertFrom-Json
+          if ($evidence.schemaVersion -ne 4 -or
+              [string]$evidence.artifactStatus -cne 'SIGNED' -or
+              $evidence.signed -isnot [bool] -or -not $evidence.signed -or
+              [string]$evidence.product -cne 'SubLab808' -or
+              [string]$evidence.version -cne $env:WK_BASELINE_VERSION -or
+              [string]$evidence.sourceCommit -cne $env:WK_BASELINE_COMMIT -or
+              [string]$evidence.payloadArchitecture -cne '${{ matrix.artifact_arch }}') {
+            throw 'Downloaded baseline evidence identity is invalid.'
+          }
+          $current = [string]$evidence.releaseGatePublicKeyXY
+          $next = [string]$evidence.releaseGateNextPublicKeyXY
+          [string[]]$allowlist = @($evidence.releaseGatePublicKeyAllowlistXY)
+          $expectedAllowlist = if ([string]::IsNullOrEmpty($next)) { @($current) } else { @($current, $next) }
+          if ($current -cnotmatch '^[0-9A-F]{128}$' -or
+              ($next -and ($next -cnotmatch '^[0-9A-F]{128}$' -or $next -ceq $current)) -or
+              $allowlist.Count -ne $expectedAllowlist.Count) {
+            throw 'Baseline release-gate public-key allowlist is malformed.'
+          }
+          for ($index = 0; $index -lt $expectedAllowlist.Count; ++$index) {
+            if ($allowlist[$index] -cne $expectedAllowlist[$index]) {
+              throw 'Baseline release-gate public-key allowlist is not canonical.'
+            }
+          }
+          if ($allowlist -cnotcontains $env:WK_RELEASE_GATE_PUBLIC_KEY_XY) {
+            throw 'Baseline N does not authorize the active key for the N-to-N+1 release gate.'
+          }
 
       - name: Configure production updater pin
         shell: pwsh
@@ -187,7 +371,9 @@ jobs:
           cmake -S . -B '${{ matrix.build_dir }}' `
             -G '${{ matrix.generator }}' -A '${{ matrix.platform }}' `
             "-DSUBLAB808_WINDOWS_UPDATER_SIGNER_SHA256:STRING=$env:WK_SIGNER_SHA256" `
-            "-DSUBLAB808_WINDOWS_UPDATER_NEXT_SIGNER_SHA256:STRING=$env:WK_NEXT_SIGNER_SHA256"
+            "-DSUBLAB808_WINDOWS_UPDATER_NEXT_SIGNER_SHA256:STRING=$env:WK_NEXT_SIGNER_SHA256" `
+            "-DSUBLAB808_WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY:STRING=$env:WK_RELEASE_GATE_PUBLIC_KEY_XY" `
+            "-DSUBLAB808_WINDOWS_RELEASE_GATE_NEXT_PUBLIC_KEY_XY:STRING=$env:WK_RELEASE_GATE_NEXT_PUBLIC_KEY_XY"
           if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed.' }
           $versionRows = @(Get-Content -LiteralPath '${{ matrix.build_dir }}/CMakeCache.txt' |
             Where-Object { $_ -like 'CMAKE_PROJECT_VERSION:STATIC=*' })
@@ -311,6 +497,7 @@ jobs:
             OutputDirectory = $output
             UpdaterPath = $updater
             ExpectedSignerSha256 = $env:WK_SIGNER_SHA256
+            ExpectedReleaseGatePublicKeyXY = $env:WK_RELEASE_GATE_PUBLIC_KEY_XY
             HostTestPath = $hostTest
             SignToolPath = $signTool
             CertificateThumbprint = $env:WK_CERT_THUMBPRINT
@@ -319,6 +506,10 @@ jobs:
           }
           if (-not [string]::IsNullOrEmpty($env:WK_NEXT_SIGNER_SHA256)) {
             $buildArguments['ExpectedNextSignerSha256'] = $env:WK_NEXT_SIGNER_SHA256
+          }
+          if (-not [string]::IsNullOrEmpty($env:WK_RELEASE_GATE_NEXT_PUBLIC_KEY_XY)) {
+            $buildArguments['ExpectedReleaseGateNextPublicKeyXY'] =
+              $env:WK_RELEASE_GATE_NEXT_PUBLIC_KEY_XY
           }
           & ./scripts/build-windows-installer.ps1 @buildArguments
           $base = "SubLab808-$env:WK_RELEASE_VERSION-Windows-${{ matrix.artifact_arch }}"
@@ -333,10 +524,16 @@ jobs:
             '--product', 'SubLab808',
             '--version', $env:WK_RELEASE_VERSION,
             '--source-commit', $env:WK_TAG_COMMIT,
-            '--expected-signer-sha256', $env:WK_SIGNER_SHA256
+            '--expected-signer-sha256', $env:WK_SIGNER_SHA256,
+            '--expected-release-gate-public-key-xy', $env:WK_RELEASE_GATE_PUBLIC_KEY_XY
           )
           if (-not [string]::IsNullOrEmpty($env:WK_NEXT_SIGNER_SHA256)) {
             $validatorArguments += @('--expected-next-signer-sha256', $env:WK_NEXT_SIGNER_SHA256)
+          }
+          if (-not [string]::IsNullOrEmpty($env:WK_RELEASE_GATE_NEXT_PUBLIC_KEY_XY)) {
+            $validatorArguments += @(
+              '--expected-release-gate-next-public-key-xy',
+              $env:WK_RELEASE_GATE_NEXT_PUBLIC_KEY_XY)
           }
           $validatorArguments += @('--architecture', '${{ matrix.artifact_arch }}')
           & python @validatorArguments
@@ -362,9 +559,14 @@ jobs:
             ExpectedUpgradeCode = '${{ matrix.upgrade_code }}'
             ExpectedOtherArchitectureUpgradeCode = '${{ matrix.other_architecture_upgrade_code }}'
             ExpectedSignerSha256 = $env:WK_SIGNER_SHA256
+            ExpectedReleaseGatePublicKeyXY = $env:WK_RELEASE_GATE_PUBLIC_KEY_XY
           }
           if (-not [string]::IsNullOrEmpty($env:WK_NEXT_SIGNER_SHA256)) {
             $acceptanceArguments['ExpectedNextSignerSha256'] = $env:WK_NEXT_SIGNER_SHA256
+          }
+          if (-not [string]::IsNullOrEmpty($env:WK_RELEASE_GATE_NEXT_PUBLIC_KEY_XY)) {
+            $acceptanceArguments['ExpectedReleaseGateNextPublicKeyXY'] =
+              $env:WK_RELEASE_GATE_NEXT_PUBLIC_KEY_XY
           }
           & ./scripts/test-windows-installer.ps1 @acceptanceArguments
 
@@ -375,6 +577,14 @@ jobs:
           path: release-assets-${{ matrix.artifact_arch }}
           if-no-files-found: error
           retention-days: 1
+
+      - name: Upload native transition host harness
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: SubLab808-Windows-${{ matrix.artifact_arch }}-TRANSITION-HARNESS-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ matrix.build_dir }}/SubLab808HostTests_artefacts/Release/SubLab808HostTests.exe
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Remove PFX and ephemeral certificate store
         if: always()
@@ -405,9 +615,9 @@ jobs:
 
   build-macos:
     name: Build, sign and notarize macOS universal
-    needs: authorize_windows_bootstrap
+    needs: authorize_windows_release
     if: >-
-      needs.authorize_windows_bootstrap.result == 'success' &&
+      needs.authorize_windows_release.result == 'success' &&
       inputs.confirm_release == true &&
       github.repository == 'TheWhykiki/SubLab808' &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
@@ -765,11 +975,12 @@ jobs:
           [[ "$candidate_digest" =~ ^[0-9a-f]{64}$ ]]
           printf 'candidate_sha256=%s\n' "$candidate_digest" >> "$GITHUB_OUTPUT"
 
-  publish-release:
-    name: Publish complete cross-platform release
-    needs: [build-windows, build-macos, test-macos-intel-candidate]
+  stage-release:
+    name: Stage complete immutable public prerelease
+    needs: [authorize_windows_release, build-windows, build-macos, test-macos-intel-candidate]
     if: >-
       needs.build-windows.result == 'success' &&
+      needs.authorize_windows_release.result == 'success' &&
       needs.build-macos.result == 'success' &&
       needs.test-macos-intel-candidate.result == 'success' &&
       inputs.confirm_release == true &&
@@ -779,18 +990,30 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write
+    outputs:
+      release_id: ${{ steps.stage_release.outputs.release_id }}
+      candidate_commit: ${{ steps.stage_release.outputs.candidate_commit }}
+      asset_manifest_sha256: ${{ steps.stage_release.outputs.asset_manifest_sha256 }}
+      prior_latest_id: ${{ steps.stage_release.outputs.prior_latest_id }}
+      prior_latest_tag: ${{ steps.stage_release.outputs.prior_latest_tag }}
+      publication_attempted: ${{ steps.stage_release.outputs.publication_attempted }}
+      staged_verified: ${{ steps.stage_release.outputs.staged_verified }}
     env:
       PRODUCT: SubLab808
       WK_INPUT_TAG: ${{ inputs.tag }}
       WK_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       SIGNER_SHA256: ${{ vars.WINDOWS_CODE_SIGNING_CERT_SHA256 }}
       NEXT_SIGNER_SHA256: ${{ vars.WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256 }}
+      RELEASE_GATE_PUBLIC_KEY_XY: ${{ vars.WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY }}
+      RELEASE_GATE_NEXT_PUBLIC_KEY_XY: ${{ vars.WINDOWS_RELEASE_GATE_NEXT_PUBLIC_KEY_XY }}
       APPLICATION_IDENTITY: ${{ vars.MACOS_DEVELOPER_ID_APPLICATION_IDENTITY }}
       INSTALLER_IDENTITY: ${{ vars.MACOS_DEVELOPER_ID_INSTALLER_IDENTITY }}
       APPLICATION_SIGNER_SHA256: ${{ vars.MACOS_DEVELOPER_ID_APPLICATION_CERT_SHA256 }}
       INSTALLER_SIGNER_SHA256: ${{ vars.MACOS_DEVELOPER_ID_INSTALLER_CERT_SHA256 }}
       WK_INTEL_TESTED_MACOS_CANDIDATE_SHA256: ${{ needs.test-macos-intel-candidate.outputs.candidate_sha256 }}
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      WK_INITIAL_RELEASE_STATE: ${{ needs.authorize_windows_release.outputs.release_state }}
+      WK_INITIAL_RELEASE_STATE_SHA256: ${{ needs.authorize_windows_release.outputs.release_state_sha256 }}
+      WK_BOOTSTRAP_CONFIRMATION: ${{ inputs.confirm_first_windows_release_bootstrap }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -831,11 +1054,16 @@ jobs:
           test "$remote_commit" = "$tag_commit"
           pin="$(printf '%s' "$SIGNER_SHA256" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
           next_pin="$(printf '%s' "$NEXT_SIGNER_SHA256" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+          release_gate_key="$RELEASE_GATE_PUBLIC_KEY_XY"
+          next_release_gate_key="$RELEASE_GATE_NEXT_PUBLIC_KEY_XY"
           app_pin="$(printf '%s' "$APPLICATION_SIGNER_SHA256" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
           installer_pin="$(printf '%s' "$INSTALLER_SIGNER_SHA256" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
           [[ "$pin" =~ ^[0-9A-F]{64}$ ]]
           [[ -z "$next_pin" || "$next_pin" =~ ^[0-9A-F]{64}$ ]]
           [[ -z "$next_pin" || "$next_pin" != "$pin" ]]
+          [[ "$release_gate_key" =~ ^[0-9A-F]{128}$ ]]
+          [[ -z "$next_release_gate_key" || "$next_release_gate_key" =~ ^[0-9A-F]{128}$ ]]
+          [[ -z "$next_release_gate_key" || "$next_release_gate_key" != "$release_gate_key" ]]
           [[ "$app_pin" =~ ^[0-9A-F]{64}$ ]]
           [[ "$installer_pin" =~ ^[0-9A-F]{64}$ ]]
           python3 scripts/validate-windows-release-assets.py \
@@ -843,6 +1071,8 @@ jobs:
             --source-commit "$tag_commit" \
             --expected-signer-sha256 "$pin" \
             --expected-next-signer-sha256 "$next_pin" \
+            --expected-release-gate-public-key-xy "$release_gate_key" \
+            --expected-release-gate-next-public-key-xy "$next_release_gate_key" \
             --architecture x64 --architecture arm64ec
           python3 -B scripts/macos-release-assets.py validate \
             --directory release-assets/macos --product SubLab808 --version "$version" \
@@ -918,59 +1148,53 @@ jobs:
               >> "release-assets/$checksum"
           done
 
-      - name: Atomically publish every platform from a verified draft
+      - name: Require immutable GitHub Releases policy immediately before staging
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_ADMIN_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          policy="$(gh api --method GET -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/immutable-releases")"
+          test "$(jq -r 'if type == "object" and .enabled == true then "true" else "false" end' <<< "$policy")" = true
+
+      - name: Create a complete draft and expose that exact ID as an immutable prerelease
+        id: stage_release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           tag="$WK_INPUT_TAG"
           version="${tag#v}"
           tag_commit="$(git rev-parse "refs/tags/$tag^{commit}")"
-          published=false
-          publication_attempted=false
           created_release_id=''
+          publication_attempted=false
+          staged_verified=false
           release_marker="whykiki-release-run:$GITHUB_REPOSITORY:$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT:$tag_commit"
-          trusted_gate_directory="$(mktemp -d "$RUNNER_TEMP/whykiki-bootstrap-policy.XXXXXX")"
+          trusted_gate_directory="$(mktemp -d "$RUNNER_TEMP/whykiki-release-state.XXXXXX")"
+          printf 'publication_attempted=false\nstaged_verified=false\n' >> "$GITHUB_OUTPUT"
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
-          git show "$GITHUB_SHA:scripts/check-windows-release-bootstrap.py" \
-            > "$trusted_gate_directory/check-windows-release-bootstrap.py"
+          [[ "$tag_commit" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$WK_INITIAL_RELEASE_STATE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          git show "$GITHUB_SHA:scripts/check-windows-release-state.py" \
+            > "$trusted_gate_directory/check-windows-release-state.py"
           git show "$GITHUB_SHA:Installer/Windows/bootstrap-policy.json" \
             > "$trusted_gate_directory/bootstrap-policy.json"
+
           verify_origin_tag() {
-            remote_lines="$(git ls-remote --exit-code origin "refs/tags/$tag" "refs/tags/$tag^{}")"
-            remote_commit="$(printf '%s\n' "$remote_lines" | awk -v peeled="refs/tags/$tag^{}" '$2 == peeled { print $1 }')"
+            local remote_lines remote_commit
+            remote_lines="$(git ls-remote --exit-code origin "refs/tags/$tag" "refs/tags/$tag^{}")" || return 1
+            remote_commit="$(printf '%s\n' "$remote_lines" | awk -v peeled="refs/tags/$tag^{}" '$2 == peeled { print $1 }')" || return 1
             if [[ -z "$remote_commit" ]]; then
-              remote_commit="$(printf '%s\n' "$remote_lines" | awk -v direct="refs/tags/$tag" '$2 == direct { print $1 }')"
+              remote_commit="$(printf '%s\n' "$remote_lines" | awk -v direct="refs/tags/$tag" '$2 == direct { print $1 }')" || return 1
             fi
-            test "$remote_commit" = "$tag_commit"
+            [[ "$remote_commit" == "$tag_commit" ]]
           }
-          verify_no_public_windows_release() {
-            local metadata
-            local checker_arguments
-            test "$#" -le 1 || return 1
-            metadata="$(mktemp "$RUNNER_TEMP/whykiki-bootstrap-releases.XXXXXX")" || return 1
-            if ! gh api --method GET --paginate --slurp \
-              "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$metadata"; then
-              rm -f -- "$metadata"
-              return 1
-            fi
-            checker_arguments=(
-              --releases-json "$metadata"
-              --policy-json "$trusted_gate_directory/bootstrap-policy.json"
-              --product "$PRODUCT"
-              --tag "$tag"
-              --paginated
-            )
-            if [[ "$#" -eq 1 ]]; then
-              checker_arguments+=(--allow-release-id "$1")
-            fi
-            if ! python3 -B "$trusted_gate_directory/check-windows-release-bootstrap.py" \
-              "${checker_arguments[@]}"; then
-              rm -f -- "$metadata"
-              return 1
-            fi
-            rm -f -- "$metadata" || return 1
-          }
+
           read_latest_state() {
+            local owner repository
             owner="${GITHUB_REPOSITORY%%/*}"
             repository="${GITHUB_REPOSITORY#*/}"
             gh api graphql -F owner="$owner" -F repository="$repository" \
@@ -985,70 +1209,58 @@ jobs:
                 else [.latestRelease.databaseId, .latestRelease.tagName] | @tsv
                 end'
           }
-          cleanup_created_release() {
-            status=$?
-            trap - EXIT
-            set +e
-            cleanup_failed=false
-            if [[ "$published" != true && -n "$created_release_id" ]]; then
-              if [[ "$publication_attempted" == true ]]; then
-                printf 'Publication was attempted but its final state was not verified for release ID %s. Automatic deletion is intentionally refused; inspect and quarantine this release immediately.\n' \
-                  "$created_release_id" | tee -a "$GITHUB_STEP_SUMMARY" >&2
-                cleanup_failed=true
-              else
-                release_state="$(mktemp "$RUNNER_TEMP/whykiki-release-cleanup.XXXXXX")"
-                identity_valid=false
-                for attempt in 1 2 3; do
-                  if gh api "repos/$GITHUB_REPOSITORY/releases/$created_release_id" \
-                       > "$release_state" 2>/dev/null && \
-                     python3 -c 'import json, pathlib, sys; value=json.loads(pathlib.Path(sys.argv[1]).read_text()); assert value.get("draft") is True and value.get("tag_name") == sys.argv[2] and sys.argv[3] in (value.get("body") or "")' \
-                       "$release_state" "$tag" "$release_marker"; then
-                    identity_valid=true
-                    break
-                  fi
-                  sleep "$attempt"
-                done
-                if [[ "$identity_valid" == true ]]; then
-                  deleted=false
-                  for attempt in 1 2 3; do
-                    if gh api --method DELETE \
-                         "repos/$GITHUB_REPOSITORY/releases/$created_release_id" >/dev/null 2>&1; then
-                      deleted=true
-                      break
-                    fi
-                    sleep "$attempt"
-                  done
-                  [[ "$deleted" == true ]] || cleanup_failed=true
-                else
-                  cleanup_failed=true
-                fi
-              fi
+
+          resolve_public_history() {
+            local excluded_id="${1:-}" metadata filtered matches state state_digest
+            metadata="$(mktemp "$RUNNER_TEMP/whykiki-release-pages.XXXXXX")" || return 1
+            filtered="$(mktemp "$RUNNER_TEMP/whykiki-release-filtered.XXXXXX")" || {
+              rm -f -- "$metadata"
+              return 1
+            }
+            if ! gh api --method GET -H 'X-GitHub-Api-Version: 2026-03-10' --paginate --slurp \
+                 "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$metadata"; then
+              rm -f -- "$metadata" "$filtered"
+              return 1
             fi
-            if [[ "$cleanup_failed" == true ]]; then
-              printf 'Release cleanup or publication verification failed for exact release ID %s; block further release operations until it is quarantined.\n' \
-                "$created_release_id" | tee -a "$GITHUB_STEP_SUMMARY" >&2
-              status=1
+            if [[ -n "$excluded_id" ]]; then
+              matches="$(jq --argjson id "$excluded_id" '[.[][] | select(.id == $id)] | length' "$metadata")" || {
+                rm -f -- "$metadata" "$filtered"
+                return 1
+              }
+              [[ "$matches" == 1 ]] || {
+                rm -f -- "$metadata" "$filtered"
+                return 1
+              }
+              jq --argjson id "$excluded_id" '
+                [.[][] | select(.id != $id)] as $history |
+                [range(0; ($history | length); 100) as $offset |
+                  $history[$offset:($offset + 100)]] |
+                if length == 0 then [[]] else . end
+              ' \
+                "$metadata" > "$filtered" || {
+                  rm -f -- "$metadata" "$filtered"
+                  return 1
+                }
+            else
+              cp "$metadata" "$filtered" || {
+                rm -f -- "$metadata" "$filtered"
+                return 1
+              }
             fi
-            exit "$status"
+            state="$(python3 -B "$trusted_gate_directory/check-windows-release-state.py" \
+              --releases-json "$filtered" \
+              --policy-json "$trusted_gate_directory/bootstrap-policy.json" \
+              --product "$PRODUCT" --candidate-tag "$tag" \
+              --confirmation "$WK_BOOTSTRAP_CONFIRMATION")" || {
+                rm -f -- "$metadata" "$filtered"
+                return 1
+              }
+            rm -f -- "$metadata" "$filtered" || return 1
+            [[ "$state" == "$WK_INITIAL_RELEASE_STATE" ]] || return 1
+            state_digest="$(printf '%s' "$state" | shasum -a 256 | awk '{print $1}')" || return 1
+            [[ "$state_digest" == "$WK_INITIAL_RELEASE_STATE_SHA256" ]]
           }
-          trap cleanup_created_release EXIT
-          verify_origin_tag
-          verify_no_public_windows_release
-          existing="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            --jq ".[] | select(.tag_name == \"$tag\") | .id")"
-          test -z "$existing"
-          latest_state="$(read_latest_state)"
-          baseline_latest_id=''
-          latest_tag=''
-          if [[ -n "$latest_state" ]]; then
-            IFS=$'\t' read -r baseline_latest_id latest_tag <<< "$latest_state"
-            [[ "$baseline_latest_id" =~ ^[0-9]+$ ]]
-          fi
-          if [[ -n "$latest_tag" ]]; then
-            [[ "$latest_tag" =~ ^v(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,4})$ ]]
-            python3 -c 'import sys; assert tuple(map(int, sys.argv[2].split("."))) > tuple(map(int, sys.argv[1].split(".")))' \
-              "${latest_tag#v}" "$version"
-          fi
+
           assets=(
             "release-assets/windows/SubLab808-$version-Windows-x64.msi"
             "release-assets/windows/SubLab808-$version-Windows-x64.evidence.json"
@@ -1059,75 +1271,553 @@ jobs:
             "release-assets/macos/SubLab808-$version-macOS-universal.evidence.json"
             "release-assets/SubLab808-$version-SHA256SUMS.txt"
           )
+
+          fetch_candidate_release() {
+            local destination="$1"
+            gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/releases/$created_release_id" > "$destination"
+          }
+
+          verify_candidate_identity() {
+            local metadata="$1" expected_draft="$2" expected_prerelease="$3" expected_immutable="$4"
+            jq -e --argjson id "$created_release_id" --arg tag "$tag" \
+              --arg commit "$tag_commit" --arg marker "$release_marker" \
+              --argjson draft "$expected_draft" --argjson prerelease "$expected_prerelease" \
+              --argjson immutable "$expected_immutable" '
+                type == "object" and .id == $id and .tag_name == $tag and
+                .target_commitish == $commit and (.body // "" | contains($marker)) and
+                .draft == $draft and .prerelease == $prerelease and
+                (if $immutable then .immutable == true else true end)
+              ' "$metadata" >/dev/null
+          }
+
           verify_release_assets() {
-            local actual_names
-            local expected_names
-            local asset
-            local name
-            local file_digest
-            local remote_digest
+            local metadata="$1" expected_names actual_names asset name row file_size file_digest
             expected_names="$(printf '%s\n' "${assets[@]##*/}" | LC_ALL=C sort)" || return 1
-            actual_names="$(gh api "repos/$GITHUB_REPOSITORY/releases/$created_release_id" \
-              --jq '.assets[].name' | LC_ALL=C sort)" || return 1
+            actual_names="$(jq -r '.assets[]?.name' "$metadata" | LC_ALL=C sort)" || return 1
             [[ "$actual_names" == "$expected_names" ]] || return 1
             for asset in "${assets[@]}"; do
+              [[ -f "$asset" && ! -L "$asset" ]] || return 1
               name="${asset##*/}"
+              row="$(jq -c --arg name "$name" \
+                '[.assets[] | select(.name == $name)] | if length == 1 then .[0] else error("asset identity") end' \
+                "$metadata")" || return 1
+              file_size="$(stat -f '%z' "$asset")" || return 1
               file_digest="$(shasum -a 256 "$asset" | awk '{print $1}')" || return 1
-              remote_digest="$(gh api "repos/$GITHUB_REPOSITORY/releases/$created_release_id" \
-                --jq ".assets[] | select(.name == \"$name\") | .digest")" || return 1
-              [[ "$remote_digest" == "sha256:$file_digest" ]] || return 1
+              jq -e --arg name "$name" --arg digest "sha256:$file_digest" \
+                --argjson size "$file_size" '
+                  .name == $name and .state == "uploaded" and .digest == $digest and
+                  .size == $size and (.id | type == "number" and . > 0)
+                ' <<< "$row" >/dev/null || return 1
             done
           }
-          verify_published_release() {
-            local release_draft
-            local release_prerelease
-            local release_tag
-            local published_body
-            local latest_id
-            local latest_tag
-            release_draft="$(gh api "repos/$GITHUB_REPOSITORY/releases/$created_release_id" --jq '.draft')" || return 1
-            release_prerelease="$(gh api "repos/$GITHUB_REPOSITORY/releases/$created_release_id" --jq '.prerelease')" || return 1
-            release_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/$created_release_id" --jq '.tag_name')" || return 1
-            published_body="$(gh api "repos/$GITHUB_REPOSITORY/releases/$created_release_id" --jq '.body // ""')" || return 1
-            latest_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.id')" || return 1
-            latest_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')" || return 1
-            [[ "$release_draft" == false ]] || return 1
-            [[ "$release_prerelease" == false ]] || return 1
-            [[ "$release_tag" == "$tag" ]] || return 1
-            [[ "$published_body" == *"$release_marker"* ]] || return 1
-            [[ "$latest_id" == "$created_release_id" ]] || return 1
-            [[ "$latest_tag" == "$tag" ]] || return 1
-            verify_release_assets || return 1
-            verify_no_public_windows_release "$created_release_id" || return 1
+
+          candidate_manifest_sha256() {
+            local metadata="$1" manifest
+            manifest="$(jq -c '[.assets[] | {digest,id,name,size,state}] | sort_by(.name,.id)' "$metadata")" || return 1
+            printf '%s' "$manifest" | shasum -a 256 | awk '{print $1}'
           }
-          release_body="$(printf '%s\n\n<!-- %s -->' \
-            'Signed Windows x64 and native ARM64EC installers plus the signed, notarized universal macOS VST3 package and archive. See the attached evidence and SHA-256 manifest.' \
-            "$release_marker")"
-          created_release_id="$(gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
-            -f tag_name="$tag" -f target_commitish="$tag_commit" \
-            -f name="SubLab808 $version" \
-            -f body="$release_body" \
-            -F draft=true -F prerelease=false --jq '.id')"
-          [[ "$created_release_id" =~ ^[0-9]+$ ]]
-          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/$created_release_id" --jq '.draft')" = true
-          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/$created_release_id" --jq '.prerelease')" = false
-          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/$created_release_id" --jq '.tag_name')" = "$tag"
-          gh release upload "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY"
-          verify_release_assets
+
+          cleanup_created_draft() {
+            local status=$? cleanup_failed=false metadata
+            trap - EXIT
+            set +e
+            rm -rf -- "$trusted_gate_directory"
+            if [[ "$status" -ne 0 && -n "$created_release_id" ]]; then
+              if [[ "$publication_attempted" == true ]]; then
+                printf 'Publication was attempted for release ID %s. It is never deleted automatically; the finalize job will audit and quarantine it.\n' \
+                  "$created_release_id" | tee -a "$GITHUB_STEP_SUMMARY" >&2
+                cleanup_failed=true
+              else
+                metadata="$(mktemp "$RUNNER_TEMP/whykiki-draft-cleanup.XXXXXX")"
+                identity_valid=false
+                for attempt in 1 2 3; do
+                  if fetch_candidate_release "$metadata" 2>/dev/null && \
+                     verify_candidate_identity "$metadata" true false false; then
+                    identity_valid=true
+                    break
+                  fi
+                  sleep "$attempt"
+                done
+                if [[ "$identity_valid" == true ]]; then
+                  gh api --method DELETE -H 'X-GitHub-Api-Version: 2026-03-10' \
+                    "repos/$GITHUB_REPOSITORY/releases/$created_release_id" >/dev/null 2>&1 || cleanup_failed=true
+                else
+                  cleanup_failed=true
+                fi
+                rm -f -- "$metadata"
+              fi
+            fi
+            if [[ "$cleanup_failed" == true ]]; then status=1; fi
+            exit "$status"
+          }
+          trap cleanup_created_draft EXIT
+
           verify_origin_tag
-          current_latest_state="$(read_latest_state)"
-          test "$current_latest_state" = "$latest_state"
-          verify_no_public_windows_release
-          publication_attempted=true
-          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$created_release_id" \
-            -F draft=false -F prerelease=false -f make_latest=true >/dev/null
-          post_publish_verified=false
-          for attempt in 1 2 3; do
-            if verify_published_release; then
-              post_publish_verified=true
+          resolve_public_history
+          existing_metadata="$(mktemp "$RUNNER_TEMP/whykiki-existing-releases.XXXXXX")"
+          gh api --method GET -H 'X-GitHub-Api-Version: 2026-03-10' --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$existing_metadata"
+          test "$(jq --arg tag "$tag" '[.[][] | select(.tag_name == $tag)] | length' "$existing_metadata")" = 0
+          rm -f -- "$existing_metadata"
+          latest_state="$(read_latest_state)"
+          prior_latest_id=''
+          prior_latest_tag=''
+          if [[ -n "$latest_state" ]]; then
+            IFS=$'\t' read -r prior_latest_id prior_latest_tag <<< "$latest_state"
+            [[ "$prior_latest_id" =~ ^[0-9]+$ ]]
+            [[ "$prior_latest_tag" =~ ^v(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,4})$ ]]
+          fi
+          printf 'prior_latest_id=%s\nprior_latest_tag=%s\ncandidate_commit=%s\n' \
+            "$prior_latest_id" "$prior_latest_tag" "$tag_commit" >> "$GITHUB_OUTPUT"
+
+          release_body="$(printf '%s\n\n%s\n\n<!-- %s -->' \
+            'Signed Windows x64 and native ARM64EC installers plus the signed, notarized universal macOS VST3 package and archive.' \
+            'This release is an immutable public prerelease while native N-to-N+1 transition gates run. Do not delete or reuse its tag.' \
+            "$release_marker")"
+          create_response="$(mktemp "$RUNNER_TEMP/whykiki-created-release.XXXXXX")"
+          gh api --method POST -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases" \
+            -f tag_name="$tag" -f target_commitish="$tag_commit" \
+            -f name="SubLab808 $version (transition candidate)" \
+            -f body="$release_body" -F draft=true -F prerelease=false \
+            > "$create_response"
+          created_release_id="$(jq -r '.id' "$create_response")"
+          upload_url="$(jq -r '.upload_url' "$create_response")"
+          [[ "$created_release_id" =~ ^[1-9][0-9]*$ ]]
+          [[ "$upload_url" == "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$created_release_id/assets{?name,label}" ]]
+          printf 'release_id=%s\n' "$created_release_id" >> "$GITHUB_OUTPUT"
+          verify_candidate_identity "$create_response" true false false
+          rm -f -- "$create_response"
+
+          for asset in "${assets[@]}"; do
+            name="${asset##*/}"
+            [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$ ]]
+            upload_response="$(mktemp "$RUNNER_TEMP/whykiki-upload-response.XXXXXX")"
+            curl --fail-with-body --silent --show-error \
+              --request POST \
+              --header 'Accept: application/vnd.github+json' \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'X-GitHub-Api-Version: 2026-03-10' \
+              --header 'Content-Type: application/octet-stream' \
+              --data-binary "@$asset" \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$created_release_id/assets?name=$name" \
+              > "$upload_response"
+            jq -e --arg name "$name" '.name == $name and .state == "uploaded" and (.id | type == "number" and . > 0)' \
+              "$upload_response" >/dev/null
+            rm -f -- "$upload_response"
+          done
+
+          candidate_metadata="$(mktemp "$RUNNER_TEMP/whykiki-staged-release.XXXXXX")"
+          draft_verified=false
+          for attempt in 1 2 3 4 5; do
+            if fetch_candidate_release "$candidate_metadata" && \
+               verify_candidate_identity "$candidate_metadata" true false false && \
+               verify_release_assets "$candidate_metadata"; then
+              draft_verified=true
               break
             fi
             sleep "$attempt"
           done
-          test "$post_publish_verified" = true
-          published=true
+          test "$draft_verified" = true
+          asset_manifest_sha256="$(candidate_manifest_sha256 "$candidate_metadata")"
+          [[ "$asset_manifest_sha256" =~ ^[0-9a-f]{64}$ ]]
+          printf 'asset_manifest_sha256=%s\n' "$asset_manifest_sha256" >> "$GITHUB_OUTPUT"
+          verify_origin_tag
+          test "$(read_latest_state)" = "$latest_state"
+          resolve_public_history "$created_release_id"
+
+          publication_attempted=true
+          printf 'publication_attempted=true\n' >> "$GITHUB_OUTPUT"
+          gh api --method PATCH -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/$created_release_id" \
+            -F draft=false -F prerelease=true -f make_latest=false >/dev/null
+
+          public_verified=false
+          for attempt in 1 2 3 4 5; do
+            if fetch_candidate_release "$candidate_metadata" && \
+               verify_candidate_identity "$candidate_metadata" false true true && \
+               verify_release_assets "$candidate_metadata" && \
+               [[ "$(candidate_manifest_sha256 "$candidate_metadata")" == "$asset_manifest_sha256" ]] && \
+               [[ "$(read_latest_state)" == "$latest_state" ]] && \
+               verify_origin_tag && resolve_public_history "$created_release_id"; then
+              public_verified=true
+              break
+            fi
+            sleep "$attempt"
+          done
+          test "$public_verified" = true
+          staged_verified=true
+          printf 'staged_verified=true\n' >> "$GITHUB_OUTPUT"
+          printf 'Immutable prerelease ID %s is public with eight verified assets; Latest is unchanged.\n' \
+            "$created_release_id" >> "$GITHUB_STEP_SUMMARY"
+          rm -f -- "$candidate_metadata"
+
+  accept-windows-upgrade:
+    name: Accept ${{ needs.authorize_windows_release.outputs.mode }} on Windows ${{ matrix.artifact_arch }}
+    needs: [authorize_windows_release, stage-release]
+    if: >-
+      needs.authorize_windows_release.result == 'success' &&
+      needs.stage-release.result == 'success' &&
+      needs.stage-release.outputs.staged_verified == 'true' &&
+      inputs.confirm_release == true &&
+      github.repository == 'TheWhykiki/SubLab808' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact_arch: x64
+            msi_architecture: x64
+            upgrade_code: DB0CABBA-9411-5738-8A43-98D900748C58
+            other_architecture_upgrade_code: 8494E96B-8735-5AB6-8E20-D1BF667DADD9
+            runner: windows-2022
+            runner_arch: X64
+            processor_arch: AMD64
+          - artifact_arch: arm64ec
+            msi_architecture: arm64
+            upgrade_code: 8494E96B-8735-5AB6-8E20-D1BF667DADD9
+            other_architecture_upgrade_code: DB0CABBA-9411-5738-8A43-98D900748C58
+            runner: windows-11-vs2026-arm
+            runner_arch: ARM64
+            processor_arch: ARM64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      PRODUCT: SubLab808
+      WK_INPUT_TAG: ${{ inputs.tag }}
+      WK_TRANSITION_MODE: ${{ needs.authorize_windows_release.outputs.mode }}
+      WK_BASELINE_RELEASE_ID: ${{ needs.authorize_windows_release.outputs.baseline_release_id }}
+      WK_BASELINE_TAG: ${{ needs.authorize_windows_release.outputs.baseline_tag }}
+      WK_BASELINE_VERSION: ${{ needs.authorize_windows_release.outputs.baseline_version }}
+      WK_BASELINE_COMMIT: ${{ needs.authorize_windows_release.outputs.baseline_commit }}
+      WK_CANDIDATE_RELEASE_ID: ${{ needs.stage-release.outputs.release_id }}
+      WK_CANDIDATE_COMMIT: ${{ needs.stage-release.outputs.candidate_commit }}
+      SIGNER_SHA256: ${{ vars.WINDOWS_CODE_SIGNING_CERT_SHA256 }}
+      NEXT_SIGNER_SHA256: ${{ vars.WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256 }}
+      RELEASE_GATE_PUBLIC_KEY_XY: ${{ vars.WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY }}
+      RELEASE_GATE_NEXT_PUBLIC_KEY_XY: ${{ vars.WINDOWS_RELEASE_GATE_NEXT_PUBLIC_KEY_XY }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Materialize trusted transition gates from the dispatch commit
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'Dispatch commit is not canonical.' }
+          $trusted = Join-Path $env:RUNNER_TEMP "whykiki-transition-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          New-Item -ItemType Directory -Path $trusted -ErrorAction Stop | Out-Null
+          & git show "${env:GITHUB_SHA}:scripts/test-windows-updater-transition.ps1" |
+            Set-Content -LiteralPath (Join-Path $trusted 'test-windows-updater-transition.ps1') -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot materialize the trusted transition gate.' }
+          & git show "${env:GITHUB_SHA}:scripts/test-windows-installer.ps1" |
+            Set-Content -LiteralPath (Join-Path $trusted 'test-windows-installer.ps1') -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot materialize the trusted clean-install gate.' }
+          "WK_TRUSTED_TRANSITION_GATE=$(Join-Path $trusted 'test-windows-updater-transition.ps1')" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WK_TRUSTED_CLEAN_INSTALL_GATE=$(Join-Path $trusted 'test-windows-installer.ps1')" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Download exact native host harness
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: SubLab808-Windows-${{ matrix.artifact_arch }}-TRANSITION-HARNESS-${{ github.run_id }}-${{ github.run_attempt }}
+          path: transition-harness
+
+      - name: Exercise public immutable release through the installed updater
+        shell: pwsh
+        env:
+          WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64: ${{ secrets.WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64 }}
+        run: |
+          if ('${{ runner.arch }}' -cne '${{ matrix.runner_arch }}' -or
+              $env:PROCESSOR_ARCHITECTURE -cne '${{ matrix.processor_arch }}') {
+            throw 'Transition acceptance is not running on the required native architecture.'
+          }
+          $pin = ([string]$env:SIGNER_SHA256).Replace(' ', '').ToUpperInvariant()
+          $nextPin = ([string]$env:NEXT_SIGNER_SHA256).Replace(' ', '').ToUpperInvariant()
+          if ($pin -cnotmatch '^[0-9A-F]{64}$' -or
+              ($nextPin -and $nextPin -cnotmatch '^[0-9A-F]{64}$')) {
+            throw 'Windows signer pins are malformed.'
+          }
+          $releaseGateKey = [string]$env:RELEASE_GATE_PUBLIC_KEY_XY
+          $nextReleaseGateKey = [string]$env:RELEASE_GATE_NEXT_PUBLIC_KEY_XY
+          if ($releaseGateKey -cnotmatch '^[0-9A-F]{128}$' -or
+              ($nextReleaseGateKey -and
+               ($nextReleaseGateKey -cnotmatch '^[0-9A-F]{128}$' -or
+                $nextReleaseGateKey -ceq $releaseGateKey))) {
+            throw 'Windows release-gate public-key variables are malformed.'
+          }
+          $releaseGatePrivateKey = [string]$env:WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64
+          if ([string]::IsNullOrWhiteSpace($releaseGatePrivateKey)) {
+            throw 'Windows release-gate private-key secret is missing.'
+          }
+          [long]$baselineReleaseId = 0
+          if (-not [string]::IsNullOrWhiteSpace($env:WK_BASELINE_RELEASE_ID)) {
+            $baselineReleaseId = [long]$env:WK_BASELINE_RELEASE_ID
+          }
+          $arguments = @{
+            Mode = $env:WK_TRANSITION_MODE
+            Product = 'SubLab808'
+            Architecture = '${{ matrix.artifact_arch }}'
+            ExpectedMsiArchitecture = '${{ matrix.msi_architecture }}'
+            ExpectedManufacturer = 'Whykiki Audio'
+            ExpectedUpgradeCode = '${{ matrix.upgrade_code }}'
+            ExpectedOtherArchitectureUpgradeCode = '${{ matrix.other_architecture_upgrade_code }}'
+            CandidateReleaseId = [long]$env:WK_CANDIDATE_RELEASE_ID
+            CandidateTag = $env:WK_INPUT_TAG
+            CandidateSourceCommit = $env:WK_CANDIDATE_COMMIT
+            BaselineReleaseId = $baselineReleaseId
+            BaselineTag = $env:WK_BASELINE_TAG
+            BaselineVersion = $env:WK_BASELINE_VERSION
+            BaselineSourceCommit = $env:WK_BASELINE_COMMIT
+            ExpectedSignerSha256 = $pin
+            ExpectedNextSignerSha256 = $nextPin
+            ExpectedReleaseGatePublicKeyXY = $releaseGateKey
+            ExpectedReleaseGateNextPublicKeyXY = $nextReleaseGateKey
+            ReleaseGatePrivateKeyPkcs8Base64 = $releaseGatePrivateKey
+            HostTestPath = (Resolve-Path -LiteralPath 'transition-harness/SubLab808HostTests.exe').Path
+            CleanInstallGatePath = $env:WK_TRUSTED_CLEAN_INSTALL_GATE
+            ReceiptPath = (Join-Path $env:RUNNER_TEMP 'windows-transition-receipt.json')
+          }
+          & $env:WK_TRUSTED_TRANSITION_GATE @arguments
+
+      - name: Upload transition acceptance receipt
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: SubLab808-Windows-${{ matrix.artifact_arch }}-TRANSITION-ACCEPTED-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-transition-receipt.json
+          if-no-files-found: error
+          retention-days: 30
+
+  finalize-release:
+    name: Promote accepted immutable prerelease or leave it quarantined
+    needs: [authorize_windows_release, stage-release, accept-windows-upgrade]
+    if: >-
+      always() &&
+      needs.authorize_windows_release.result == 'success' &&
+      inputs.confirm_release == true &&
+      github.repository == 'TheWhykiki/SubLab808' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      PRODUCT: SubLab808
+      WK_INPUT_TAG: ${{ inputs.tag }}
+      WK_BOOTSTRAP_CONFIRMATION: ${{ inputs.confirm_first_windows_release_bootstrap }}
+      WK_INITIAL_RELEASE_STATE: ${{ needs.authorize_windows_release.outputs.release_state }}
+      WK_INITIAL_RELEASE_STATE_SHA256: ${{ needs.authorize_windows_release.outputs.release_state_sha256 }}
+      WK_STAGE_RESULT: ${{ needs.stage-release.result }}
+      WK_ACCEPTANCE_RESULT: ${{ needs.accept-windows-upgrade.result }}
+      WK_RELEASE_ID: ${{ needs.stage-release.outputs.release_id }}
+      WK_CANDIDATE_COMMIT: ${{ needs.stage-release.outputs.candidate_commit }}
+      WK_ASSET_MANIFEST_SHA256: ${{ needs.stage-release.outputs.asset_manifest_sha256 }}
+      WK_PRIOR_LATEST_ID: ${{ needs.stage-release.outputs.prior_latest_id }}
+      WK_PRIOR_LATEST_TAG: ${{ needs.stage-release.outputs.prior_latest_tag }}
+      WK_PUBLICATION_ATTEMPTED: ${{ needs.stage-release.outputs.publication_attempted }}
+      WK_STAGED_VERIFIED: ${{ needs.stage-release.outputs.staged_verified }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Require immutable GitHub Releases policy before finalization
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_ADMIN_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          policy="$(gh api --method GET -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/immutable-releases")"
+          test "$(jq -r 'if type == "object" and .enabled == true then "true" else "false" end' <<< "$policy")" = true
+
+      - name: Audit exact staged ID and promote only after both native gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$WK_INPUT_TAG"
+          release_id="$WK_RELEASE_ID"
+          marker="whykiki-release-run:$GITHUB_REPOSITORY:$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT:$WK_CANDIDATE_COMMIT"
+          [[ "$WK_INITIAL_RELEASE_STATE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+
+          fail_unknown() {
+            printf 'Release `%s` (ID `%s`) was not promoted, but its exact publication state is not proven. Do not delete, demote, republish, or reuse its tag. Reason: %s\n' \
+              "$tag" "${release_id:-unavailable}" "$1" | tee -a "$GITHUB_STEP_SUMMARY" >&2
+            exit 1
+          }
+
+          quarantine() {
+            printf 'Release `%s` (ID `%s`) was not promoted. It remains a public immutable prerelease and its tag must never be deleted or reused. Reason: %s\n' \
+              "$tag" "${release_id:-unavailable}" "$1" | tee -a "$GITHUB_STEP_SUMMARY" >&2
+            exit 1
+          }
+
+          fail_after_promotion() {
+            printf 'Release `%s` (ID `%s`) was already verified as immutable Stable+Latest, but its post-promotion history attestation failed. Do not delete, demote, republish, or reuse its tag; inspect the exact ID and public history. Reason: %s\n' \
+              "$tag" "$release_id" "$1" | tee -a "$GITHUB_STEP_SUMMARY" >&2
+            exit 1
+          }
+
+          if [[ ! "$release_id" =~ ^[1-9][0-9]*$ ]]; then
+            fail_unknown 'the staging job did not return a canonical release ID; inspect its logs before another release attempt'
+          fi
+          if [[ "$WK_PUBLICATION_ATTEMPTED" != true ]]; then
+            if gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+                 "repos/$GITHUB_REPOSITORY/releases/$release_id" >/dev/null 2>&1; then
+              fail_unknown 'staging failed before publication but its exact draft still exists'
+            fi
+            fail_unknown 'staging failed before publication; no public candidate was eligible for promotion'
+          fi
+
+          read_latest_state() {
+            local owner repository
+            owner="${GITHUB_REPOSITORY%%/*}"
+            repository="${GITHUB_REPOSITORY#*/}"
+            gh api graphql -F owner="$owner" -F repository="$repository" \
+              -f query='query($owner: String!, $repository: String!) {
+                repository(owner: $owner, name: $repository) {
+                  latestRelease { databaseId tagName }
+                }
+              }' \
+              --jq '.data.repository |
+                if type != "object" then error("latest-release query failed")
+                elif .latestRelease == null then ""
+                else [.latestRelease.databaseId, .latestRelease.tagName] | @tsv
+                end'
+          }
+
+          expected_latest_state=''
+          if [[ -n "$WK_PRIOR_LATEST_ID" || -n "$WK_PRIOR_LATEST_TAG" ]]; then
+            [[ "$WK_PRIOR_LATEST_ID" =~ ^[1-9][0-9]*$ ]] || fail_unknown 'the saved prior Latest ID is malformed'
+            [[ "$WK_PRIOR_LATEST_TAG" =~ ^v(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,4})$ ]] || \
+              fail_unknown 'the saved prior Latest tag is malformed'
+            expected_latest_state="$WK_PRIOR_LATEST_ID"$'\t'"$WK_PRIOR_LATEST_TAG"
+          fi
+
+          candidate_metadata="$(mktemp "$RUNNER_TEMP/whykiki-final-candidate.XXXXXX")"
+          gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$candidate_metadata" || \
+            fail_unknown 'the exact staged release cannot be read'
+          jq -e --argjson id "$release_id" --arg tag "$tag" \
+            --arg commit "$WK_CANDIDATE_COMMIT" --arg marker "$marker" '
+              type == "object" and .id == $id and .tag_name == $tag and
+              .target_commitish == $commit and (.body // "" | contains($marker)) and
+              .draft == false and .prerelease == true and .immutable == true and
+              (.assets | length == 8)
+          ' "$candidate_metadata" >/dev/null || fail_unknown 'candidate identity or immutable prerelease state changed'
+          manifest="$(jq -c '[.assets[] | {digest,id,name,size,state}] | sort_by(.name,.id)' "$candidate_metadata")" || \
+            fail_unknown 'candidate asset manifest is malformed'
+          actual_manifest_sha256="$(printf '%s' "$manifest" | sha256sum | awk '{print $1}')"
+          [[ "$actual_manifest_sha256" == "$WK_ASSET_MANIFEST_SHA256" ]] || \
+            fail_unknown 'candidate asset IDs, names, sizes, states, or digests changed'
+          [[ "$(read_latest_state)" == "$expected_latest_state" ]] || \
+            fail_unknown 'GitHub Latest changed while transition gates ran'
+
+          pages="$(mktemp "$RUNNER_TEMP/whykiki-final-pages.XXXXXX")"
+          filtered="$(mktemp "$RUNNER_TEMP/whykiki-final-filtered.XXXXXX")"
+          gh api --method GET -H 'X-GitHub-Api-Version: 2026-03-10' --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$pages" || \
+            quarantine 'complete release history cannot be read'
+          test "$(jq --argjson id "$release_id" '[.[][] | select(.id == $id)] | length' "$pages")" = 1 || \
+            quarantine 'candidate release ID is missing or duplicated in public history'
+          jq --argjson id "$release_id" '
+            [.[][] | select(.id != $id)] as $history |
+            [range(0; ($history | length); 100) as $offset |
+              $history[$offset:($offset + 100)]] |
+            if length == 0 then [[]] else . end
+          ' "$pages" > "$filtered" || \
+            quarantine 'candidate cannot be isolated from the history snapshot'
+          state="$(python3 -B scripts/check-windows-release-state.py \
+            --releases-json "$filtered" \
+            --policy-json Installer/Windows/bootstrap-policy.json \
+            --product "$PRODUCT" --candidate-tag "$tag" \
+            --confirmation "$WK_BOOTSTRAP_CONFIRMATION")" || \
+            quarantine 'baseline or release history changed while transition gates ran'
+          [[ "$state" == "$WK_INITIAL_RELEASE_STATE" ]] || quarantine 'release-state snapshot changed before promotion'
+          [[ "$(printf '%s' "$state" | sha256sum | awk '{print $1}')" == "$WK_INITIAL_RELEASE_STATE_SHA256" ]] || \
+            quarantine 'release-state snapshot digest changed before promotion'
+
+          if [[ "$WK_STAGE_RESULT" != success || "$WK_STAGED_VERIFIED" != true ||
+                "$WK_ACCEPTANCE_RESULT" != success ]]; then
+            quarantine "stage=$WK_STAGE_RESULT stagedVerified=$WK_STAGED_VERIFIED windowsGates=$WK_ACCEPTANCE_RESULT"
+          fi
+
+          promotion_attempted=true
+          stable_body="$(printf '%s\n\n<!-- %s -->' \
+            'Signed Windows x64 and native ARM64EC installers plus the signed, notarized universal macOS VST3 package and archive. Both native Windows transition gates passed.' \
+            "$marker")"
+          promotion_request_succeeded=false
+          if gh api --method PATCH -H 'X-GitHub-Api-Version: 2026-03-10' \
+               "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+               -f name="SubLab808 ${tag#v}" -f body="$stable_body" \
+               -F draft=false -F prerelease=false -f make_latest=true >/dev/null; then
+            promotion_request_succeeded=true
+          else
+            printf 'The promotion request returned an error; reconciling exact release ID %s before classifying the outcome.\n' \
+              "$release_id" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          promoted=false
+          for attempt in 1 2 3 4 5; do
+            if gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+                 "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$candidate_metadata" && \
+               jq -e --argjson id "$release_id" --arg tag "$tag" \
+                 --arg commit "$WK_CANDIDATE_COMMIT" --arg marker "$marker" \
+                 --arg name "SubLab808 ${tag#v}" --arg body "$stable_body" '
+                   type == "object" and .id == $id and .tag_name == $tag and
+                   .target_commitish == $commit and (.body // "" | contains($marker)) and
+                   .name == $name and .body == $body and
+                   .draft == false and .prerelease == false and .immutable == true and
+                   (.assets | length == 8)
+                 ' "$candidate_metadata" >/dev/null && \
+               [[ "$(printf '%s' "$(jq -c '[.assets[] | {digest,id,name,size,state}] | sort_by(.name,.id)' "$candidate_metadata")" | sha256sum | awk '{print $1}')" == "$WK_ASSET_MANIFEST_SHA256" ]] && \
+               [[ "$(read_latest_state)" == "$release_id"$'\t'"$tag" ]]; then
+              promoted=true
+              break
+            fi
+            sleep "$attempt"
+          done
+          if [[ "$promoted" != true ]]; then
+            if gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+                 "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$candidate_metadata" && \
+               jq -e --argjson id "$release_id" --arg tag "$tag" \
+                 --arg commit "$WK_CANDIDATE_COMMIT" --arg marker "$marker" '
+                   .id == $id and .tag_name == $tag and .target_commitish == $commit and
+                   (.body // "" | contains($marker)) and .draft == false and
+                   .prerelease == true and .immutable == true and (.assets | length == 8)
+                 ' "$candidate_metadata" >/dev/null && \
+               [[ "$(printf '%s' "$(jq -c '[.assets[] | {digest,id,name,size,state}] | sort_by(.name,.id)' "$candidate_metadata")" | sha256sum | awk '{print $1}')" == "$WK_ASSET_MANIFEST_SHA256" ]] && \
+               [[ "$(read_latest_state)" == "$expected_latest_state" ]]; then
+              quarantine "promotion request success=$promotion_request_succeeded; exact candidate remains the verified immutable prerelease"
+            fi
+            printf 'Release `%s` (ID `%s`) promotion outcome is UNKNOWN. Do not delete, demote, republish, or reuse its tag; inspect the exact ID and Latest before any new release.\n' \
+              "$tag" "$release_id" | tee -a "$GITHUB_STEP_SUMMARY" >&2
+            exit 1
+          fi
+
+          gh api --method GET -H 'X-GitHub-Api-Version: 2026-03-10' --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$pages" || \
+            fail_after_promotion 'post-promotion history cannot be read'
+          final_state="$(python3 -B scripts/check-windows-release-state.py \
+            --releases-json "$pages" \
+            --policy-json Installer/Windows/bootstrap-policy.json \
+            --product "$PRODUCT" --candidate-tag "$tag" \
+            --confirmation "$WK_BOOTSTRAP_CONFIRMATION" \
+            --allow-candidate-release-id "$release_id")" || \
+            fail_after_promotion 'post-promotion release-state validation failed'
+          [[ "$final_state" == "$WK_INITIAL_RELEASE_STATE" ]] || \
+            fail_after_promotion 'post-promotion baseline/history snapshot is not byte-identical to authorization'
+          [[ "$(printf '%s' "$final_state" | sha256sum | awk '{print $1}')" == "$WK_INITIAL_RELEASE_STATE_SHA256" ]] || \
+            fail_after_promotion 'post-promotion release-state digest is not byte-identical to authorization'
+          printf 'Release `%s` (ID `%s`) is the immutable stable Latest release after both native Windows gates passed.\n' \
+            "$tag" "$release_id" >> "$GITHUB_STEP_SUMMARY"

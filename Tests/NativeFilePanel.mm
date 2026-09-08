@@ -10,10 +10,21 @@
     NSUInteger beginReturnCount;
     NSUInteger completionEntryCount;
     NSUInteger completionReturnCount;
+    NSUInteger completionDiscardCount;
+    NSUInteger completionBlockReleaseCount;
 }
 @end
 
 @implementation WhyKikiNativePanelSessionObservation
+@end
+
+@interface WhyKikiNativePanelCompletionLifetime : NSObject
+{
+    WhyKikiNativePanelSessionObservation* observation;
+}
+- (instancetype)initWithObservation:(WhyKikiNativePanelSessionObservation*)state;
+- (void)completionWillEnter;
+- (void)completionDidReturn;
 @end
 
 namespace
@@ -25,15 +36,101 @@ BeginWithCompletionHandler originalBeginWithCompletionHandler = nullptr;
 NSMutableSet* activeCompletionObservations = nil;
 char completionObservationKey;
 
-bool returnedExactlyOnce(const WhyKikiNativePanelSessionObservation* state)
+bool resolvedExactlyOnce(const WhyKikiNativePanelSessionObservation* state)
 {
-    return state != nil && state->beginCount == 1 && state->beginReturnCount == 1
-        && state->completionEntryCount == 1 && state->completionReturnCount == 1;
+    if (state == nil || state->beginCount != 1 || state->beginReturnCount != 1)
+        return false;
+
+    const auto returned = state->completionEntryCount == 1
+                       && state->completionReturnCount == 1
+                       && state->completionDiscardCount == 0
+                       && state->completionBlockReleaseCount == 1;
+    const auto discarded = state->completionEntryCount == 0
+                        && state->completionReturnCount == 0
+                        && state->completionDiscardCount == 1
+                        && state->completionBlockReleaseCount == 1;
+    return returned || discarded;
 }
 
-void retireCompletedObservation(WhyKikiNativePanelSessionObservation* state)
+void retireResolvedObservation(WhyKikiNativePanelSessionObservation* state)
 {
-    if (returnedExactlyOnce(state)) [activeCompletionObservations removeObject:state];
+    if (resolvedExactlyOnce(state)) [activeCompletionObservations removeObject:state];
+}
+
+}
+
+@implementation WhyKikiNativePanelCompletionLifetime
+- (instancetype)initWithObservation:(WhyKikiNativePanelSessionObservation*)state
+{
+    self = [super init];
+    if (self != nil) observation = [state retain];
+    return self;
+}
+- (void)dealloc
+{
+    @synchronized ([NSSavePanel class])
+    {
+        // AppKit may dispose the completion block without invoking it when a
+        // panel is closed by owner teardown. Block disposal is the important
+        // safety boundary: after this point no stale JUCE callback can run.
+        if (observation->completionEntryCount == 0
+            && observation->completionReturnCount == 0)
+            ++observation->completionDiscardCount;
+        ++observation->completionBlockReleaseCount;
+        retireResolvedObservation(observation);
+    }
+    [observation release];
+    [super dealloc];
+}
+- (void)completionWillEnter
+{
+    @synchronized ([NSSavePanel class]) { ++observation->completionEntryCount; }
+}
+- (void)completionDidReturn
+{
+    @synchronized ([NSSavePanel class]) { ++observation->completionReturnCount; }
+}
+@end
+
+namespace
+{
+
+class ScopedCompletionLifetime final
+{
+public:
+    explicit ScopedCompletionLifetime(WhyKikiNativePanelCompletionLifetime* value)
+        : lifetime([value retain]) {}
+    ~ScopedCompletionLifetime() { [lifetime release]; }
+    WhyKikiNativePanelCompletionLifetime* get() const { return lifetime; }
+private:
+    WhyKikiNativePanelCompletionLifetime* lifetime;
+};
+
+void verifyCompletionObserverContract()
+{
+    auto* returnedState = [[WhyKikiNativePanelSessionObservation alloc] init];
+    returnedState->beginCount = 1;
+    returnedState->beginReturnCount = 1;
+    auto* returnedLifetime = [[WhyKikiNativePanelCompletionLifetime alloc]
+        initWithObservation:returnedState];
+    [returnedLifetime completionWillEnter];
+    [returnedLifetime completionDidReturn];
+    if (resolvedExactlyOnce(returnedState))
+        throw std::runtime_error("NATIVE_PANEL_SETUP: retained completion block looked retired");
+    [returnedLifetime release];
+    if (! resolvedExactlyOnce(returnedState))
+        throw std::runtime_error("NATIVE_PANEL_SETUP: returned and released completion did not retire");
+    [returnedState release];
+
+    auto* discardedState = [[WhyKikiNativePanelSessionObservation alloc] init];
+    discardedState->beginCount = 1;
+    discardedState->beginReturnCount = 1;
+    auto* discardedLifetime = [[WhyKikiNativePanelCompletionLifetime alloc]
+        initWithObservation:discardedState];
+    [discardedLifetime release];
+    if (! resolvedExactlyOnce(discardedState))
+        throw std::runtime_error("NATIVE_PANEL_SETUP: released unentered completion did not retire");
+    [discardedState release];
 }
 
 void trackedBeginWithCompletionHandler(id self, SEL selector, CompletionHandler handler)
@@ -49,7 +146,7 @@ void trackedBeginWithCompletionHandler(id self, SEL selector, CompletionHandler 
     {
         state = (WhyKikiNativePanelSessionObservation*)
             objc_getAssociatedObject(self, &completionObservationKey);
-        if (state == nil || returnedExactlyOnce(state))
+        if (state == nil || resolvedExactlyOnce(state))
         {
             state = [[WhyKikiNativePanelSessionObservation alloc] init];
             objc_setAssociatedObject(self, &completionObservationKey, state,
@@ -61,22 +158,25 @@ void trackedBeginWithCompletionHandler(id self, SEL selector, CompletionHandler 
         [activeCompletionObservations addObject:state];
     }
 
+    WhyKikiNativePanelCompletionLifetime* lifetime =
+        [[WhyKikiNativePanelCompletionLifetime alloc] initWithObservation:state];
     CompletionHandler trackedHandler = ^(NSModalResponse result)
     {
-        @synchronized ([NSSavePanel class]) { ++state->completionEntryCount; }
+        // The supplied handler may synchronously tear down the panel and its
+        // last AppKit block owner. Keep the sentinel alive through the return
+        // accounting even if that happens reentrantly.
+        ScopedCompletionLifetime executing(lifetime);
+        [executing.get() completionWillEnter];
         handler(result);
-        @synchronized ([NSSavePanel class])
-        {
-            ++state->completionReturnCount;
-            retireCompletedObservation(state);
-        }
+        [executing.get() completionDidReturn];
     };
     originalBeginWithCompletionHandler(self, selector, trackedHandler);
     @synchronized ([NSSavePanel class])
     {
         ++state->beginReturnCount;
-        retireCompletedObservation(state);
+        retireResolvedObservation(state);
     }
+    [lifetime release];
     [state release];
 }
 
@@ -128,7 +228,10 @@ void NativeFilePanel::prepareTestApplication()
         if (originalBeginWithCompletionHandler == nullptr)
         {
             if (activeCompletionObservations == nil)
+            {
                 activeCompletionObservations = [[NSMutableSet alloc] init];
+                verifyCompletionObserverContract();
+            }
             auto saveMethod = class_getInstanceMethod([NSSavePanel class],
                                                       @selector(beginWithCompletionHandler:));
             auto openMethod = class_getInstanceMethod([NSOpenPanel class],
@@ -226,7 +329,9 @@ bool NativeFilePanel::completionHasNotStarted() const
     {
         auto* state = (WhyKikiNativePanelSessionObservation*) observation;
         return state != nil && state->beginCount == 1 && state->beginReturnCount == 1
-            && state->completionEntryCount == 0 && state->completionReturnCount == 0;
+            && state->completionEntryCount == 0 && state->completionReturnCount == 0
+            && state->completionDiscardCount == 0
+            && state->completionBlockReleaseCount == 0;
     }
 }
 bool NativeFilePanel::completionProgressIsValid() const
@@ -236,14 +341,19 @@ bool NativeFilePanel::completionProgressIsValid() const
         auto* state = (WhyKikiNativePanelSessionObservation*) observation;
         return state != nil && state->beginCount == 1 && state->beginReturnCount == 1
             && state->completionEntryCount <= 1
-            && state->completionReturnCount <= state->completionEntryCount;
+            && state->completionReturnCount <= state->completionEntryCount
+            && state->completionDiscardCount <= 1
+            && state->completionBlockReleaseCount <= 1
+            && state->completionDiscardCount <= state->completionBlockReleaseCount
+            && (state->completionDiscardCount == 0 || state->completionEntryCount == 0)
+            && (state->completionBlockReleaseCount == 0 || resolvedExactlyOnce(state));
     }
 }
-bool NativeFilePanel::completionReturnedExactlyOnce() const
+bool NativeFilePanel::completionResolvedExactlyOnce() const
 {
     @synchronized ([NSSavePanel class])
     {
-        return returnedExactlyOnce((WhyKikiNativePanelSessionObservation*) observation);
+        return resolvedExactlyOnce((WhyKikiNativePanelSessionObservation*) observation);
     }
 }
 bool NativeFilePanel::hasActiveCompletionSession()

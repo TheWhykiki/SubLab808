@@ -99,8 +99,63 @@ target_compile_definitions(SubLab808 PUBLIC JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 J
 target_link_libraries(SubLab808 PRIVATE juce::juce_audio_utils juce::juce_dsp
     PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_lto_flags juce::juce_recommended_warning_flags)
 
+if(WIN32)
+    set(SUBLAB808_WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY "" CACHE STRING
+        "P-256 release-gate public key as 128 uppercase hex characters (X then Y)")
+    set(SUBLAB808_WINDOWS_RELEASE_GATE_NEXT_PUBLIC_KEY_XY "" CACHE STRING
+        "Optional next P-256 release-gate public key as 128 uppercase hex characters (X then Y)")
+endif()
+
 include(cmake/Updater.cmake)
 wk_add_updater(SubLab808)
+
+if(WIN32)
+    # These well-known points (private scalars 1 and 2) are used only by the
+    # non-distribution self-test/compile-shape binaries. Production must always
+    # receive separately managed public keys through the cache entries above.
+    set(sublab808_test_release_gate_public_key_xy
+        "6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C2964FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5")
+    set(sublab808_test_release_gate_next_public_key_xy
+        "7CF27B188D034F7E8A52380304B51AC3C08969E277F21B35A60B48FC4766997807775510DB8ED040293D9AC69F7430DBBA7DADE63CE982299E04B79D227873D1")
+    foreach(updater_test_target IN ITEMS
+            SubLab808WindowsUpdaterSelfTests
+            SubLab808WindowsUpdaterProductionShape)
+        if(TARGET ${updater_test_target})
+            target_compile_definitions(${updater_test_target} PRIVATE
+                WK_WINDOWS_UPDATER_RELEASE_GATE_PUBLIC_KEY_XY="${sublab808_test_release_gate_public_key_xy}"
+                WK_WINDOWS_UPDATER_RELEASE_GATE_NEXT_PUBLIC_KEY_XY="${sublab808_test_release_gate_next_public_key_xy}")
+        endif()
+    endforeach()
+
+    if(TARGET SubLab808WindowsUpdater)
+        string(LENGTH "${SUBLAB808_WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY}"
+            sublab808_release_gate_public_key_length)
+        if(NOT sublab808_release_gate_public_key_length EQUAL 128 OR
+           NOT SUBLAB808_WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY MATCHES "^[0-9A-F]+$")
+            message(FATAL_ERROR
+                "SUBLAB808_WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY must be exactly 128 uppercase hexadecimal characters (P-256 X then Y)")
+        endif()
+        set(sublab808_release_gate_next_public_key_xy
+            "${SUBLAB808_WINDOWS_RELEASE_GATE_NEXT_PUBLIC_KEY_XY}")
+        if(NOT sublab808_release_gate_next_public_key_xy STREQUAL "")
+            string(LENGTH "${sublab808_release_gate_next_public_key_xy}"
+                sublab808_release_gate_next_public_key_length)
+            if(NOT sublab808_release_gate_next_public_key_length EQUAL 128 OR
+               NOT sublab808_release_gate_next_public_key_xy MATCHES "^[0-9A-F]+$")
+                message(FATAL_ERROR
+                    "SUBLAB808_WINDOWS_RELEASE_GATE_NEXT_PUBLIC_KEY_XY must be empty or exactly 128 uppercase hexadecimal characters (P-256 X then Y)")
+            endif()
+            if(sublab808_release_gate_next_public_key_xy STREQUAL
+               SUBLAB808_WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY)
+                message(FATAL_ERROR
+                    "SUBLAB808_WINDOWS_RELEASE_GATE_NEXT_PUBLIC_KEY_XY must differ from SUBLAB808_WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY")
+            endif()
+        endif()
+        target_compile_definitions(SubLab808WindowsUpdater PRIVATE
+            WK_WINDOWS_UPDATER_RELEASE_GATE_PUBLIC_KEY_XY="${SUBLAB808_WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY}"
+            WK_WINDOWS_UPDATER_RELEASE_GATE_NEXT_PUBLIC_KEY_XY="${sublab808_release_gate_next_public_key_xy}")
+    endif()
+endif()
 
 if(APPLE)
     # The updater command above embeds the helper first. Sign nested code inside-out, then sign
@@ -211,3 +266,5 @@ add_test(NAME SubLab808WindowsReleaseContract COMMAND "${Python3_EXECUTABLE}" -B
     -s "${CMAKE_CURRENT_SOURCE_DIR}/scripts/tests" -p "test_windows_release_contract.py")
 add_test(NAME SubLab808WindowsReleaseBootstrap COMMAND "${Python3_EXECUTABLE}" -B -m unittest discover
     -s "${CMAKE_CURRENT_SOURCE_DIR}/scripts/tests" -p "test_windows_release_bootstrap.py")
+add_test(NAME SubLab808WindowsReleaseState COMMAND "${Python3_EXECUTABLE}" -B -m unittest discover
+    -s "${CMAKE_CURRENT_SOURCE_DIR}/scripts/tests" -p "test_windows_release_state.py")

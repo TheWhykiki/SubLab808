@@ -27,6 +27,23 @@ bool isAsciiAlphaNumeric(char value)
     return (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z')
         || (value >= '0' && value <= '9');
 }
+
+bool isUpperHex(char value)
+{
+    return (value >= '0' && value <= '9') || (value >= 'A' && value <= 'F');
+}
+
+bool isLowerHex(char value)
+{
+    return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f');
+}
+
+std::optional<std::uint8_t> hexNibble(char value)
+{
+    if (value >= '0' && value <= '9') return static_cast<std::uint8_t>(value - '0');
+    if (value >= 'A' && value <= 'F') return static_cast<std::uint8_t>(value - 'A' + 10);
+    return std::nullopt;
+}
 }
 
 std::optional<SemVersion> parseVersion(std::string_view text)
@@ -109,6 +126,76 @@ bool isSha256Hex(std::string_view value)
     });
 }
 
+bool isGitCommitHex(std::string_view value)
+{
+    if (value.size() != 40)
+        return false;
+    return std::all_of(value.begin(), value.end(), [] (char c)
+    {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    });
+}
+
+bool isP256PublicKeyXYHex(std::string_view value)
+{
+    return value.size() == 128
+        && std::all_of(value.begin(), value.end(), isUpperHex);
+}
+
+std::optional<std::array<std::uint8_t, 64>> decodeP256P1363SignatureHex(
+    std::string_view value)
+{
+    constexpr std::string_view order =
+        "FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551";
+    constexpr std::string_view halfOrder =
+        "7FFFFFFF800000007FFFFFFFFFFFFFFFDE737D56D38BCF4279DCE5617E3192A8";
+    constexpr std::string_view zero =
+        "0000000000000000000000000000000000000000000000000000000000000000";
+    if (value.size() != 128
+        || ! std::all_of(value.begin(), value.end(), isUpperHex))
+        return std::nullopt;
+    const auto r = value.substr(0, 64);
+    const auto s = value.substr(64, 64);
+    // Fixed-width uppercase hex makes lexical and numeric order identical.
+    // Low-S removes ECDSA's otherwise equivalent (r, n-s) representation.
+    if (r == zero || r >= order || s == zero || s > halfOrder)
+        return std::nullopt;
+    std::array<std::uint8_t, 64> result{};
+    for (std::size_t index{}; index < result.size(); ++index)
+    {
+        const auto high = hexNibble(value[index * 2]);
+        const auto low = hexNibble(value[index * 2 + 1]);
+        if (! high || ! low)
+            return std::nullopt;
+        result[index] = static_cast<std::uint8_t>((*high << 4) | *low);
+    }
+    return result;
+}
+
+std::string encodeP256P1363SignatureHex(const std::array<std::uint8_t, 64>& value)
+{
+    constexpr char alphabet[] = "0123456789ABCDEF";
+    std::string result;
+    result.reserve(value.size() * 2);
+    for (const auto byte : value)
+    {
+        result.push_back(alphabet[byte >> 4]);
+        result.push_back(alphabet[byte & 0x0f]);
+    }
+    return result;
+}
+
+std::optional<std::uint64_t> parseCanonicalPositiveUint64(std::string_view value)
+{
+    if (value.empty() || value.front() == '0')
+        return std::nullopt;
+    std::uint64_t parsed{};
+    const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), parsed);
+    if (error != std::errc{} || end != value.data() + value.size() || parsed == 0)
+        return std::nullopt;
+    return parsed;
+}
+
 std::optional<std::string> digestHex(std::string_view githubDigest)
 {
     constexpr std::string_view prefix = "sha256:";
@@ -135,6 +222,59 @@ bool isAllowedHttpsHost(std::string_view host)
         std::string_view { "github-releases.githubusercontent.com" }
     };
     return std::find(allowed.begin(), allowed.end(), host) != allowed.end();
+}
+
+bool isCanonicalReleaseGatePipeName(std::string_view value)
+{
+    constexpr std::string_view prefix = "WhykikiAudio.UpdaterReleaseGate.";
+    return value.size() == prefix.size() + 32 && value.starts_with(prefix)
+        && std::all_of(value.begin() + static_cast<std::ptrdiff_t>(prefix.size()),
+                       value.end(), isUpperHex);
+}
+
+bool isReleaseGateExpiryValid(std::uint64_t expiresAtUnixSeconds,
+                              std::uint64_t nowUnixSeconds)
+{
+    return nowUnixSeconds != 0 && expiresAtUnixSeconds > nowUnixSeconds
+        && expiresAtUnixSeconds - nowUnixSeconds <= releaseGateMaximumTtlSeconds;
+}
+
+std::optional<std::string> canonicalReleaseGateAuthorization(
+    const ReleaseGateAuthorizationFields& fields)
+{
+    const auto target = parseStableTag(fields.tag);
+    if (! isSafeRepositoryComponent(fields.owner)
+        || ! isSafeRepositoryComponent(fields.repository)
+        || ! isSafeRepositoryComponent(fields.product)
+        || fields.releaseId == 0 || fields.parentProcessId == 0
+        || fields.parentProcessCreatedAtFiletime == 0 || fields.expiresAtUnixSeconds == 0
+        || ! target || fields.tag != "v" + toString(*target)
+        || ! isStrictlyNewer(*target, fields.installedVersion)
+        || fields.sourceCommit.size() != 40
+        || ! std::all_of(fields.sourceCommit.begin(), fields.sourceCommit.end(), isLowerHex)
+        || fields.challenge.size() != 64
+        || ! std::all_of(fields.challenge.begin(), fields.challenge.end(), isUpperHex)
+        || ! isCanonicalReleaseGatePipeName(fields.responsePipe))
+        return std::nullopt;
+
+    // Every value above is a tightly bounded ASCII token that cannot contain
+    // '=' or LF.  The fixed field order, canonical decimal/version forms and
+    // final LF therefore define one unambiguous byte string for every request.
+    return std::string("domain=whykiki.windows-updater-release-gate-authorization\n")
+        + "schemaVersion=1\n"
+        + "repository=" + fields.owner + "/" + fields.repository + "\n"
+        + "product=" + fields.product + "\n"
+        + "architecture=" + architectureAssetSuffix(fields.architecture) + "\n"
+        + "installedVersion=" + toString(fields.installedVersion) + "\n"
+        + "releaseId=" + std::to_string(fields.releaseId) + "\n"
+        + "tag=" + fields.tag + "\n"
+        + "sourceCommit=" + fields.sourceCommit + "\n"
+        + "challenge=" + fields.challenge + "\n"
+        + "responsePipe=" + fields.responsePipe + "\n"
+        + "parentProcessId=" + std::to_string(fields.parentProcessId) + "\n"
+        + "parentProcessCreatedAtFiletime="
+        + std::to_string(fields.parentProcessCreatedAtFiletime) + "\n"
+        + "expiresAtUnixSeconds=" + std::to_string(fields.expiresAtUnixSeconds) + "\n";
 }
 
 std::string architectureAssetSuffix(Architecture architecture)
@@ -171,6 +311,14 @@ std::string releasesApiUrl(std::string_view owner, std::string_view repository)
 {
     return "https://api.github.com/repos/" + std::string(owner) + "/"
          + std::string(repository) + "/releases?per_page=100";
+}
+
+std::string releaseByIdApiUrl(std::string_view owner,
+                              std::string_view repository,
+                              std::uint64_t releaseId)
+{
+    return "https://api.github.com/repos/" + std::string(owner) + "/"
+         + std::string(repository) + "/releases/" + std::to_string(releaseId);
 }
 
 bool isForbiddenMsiSideEffectTable(std::string_view table)

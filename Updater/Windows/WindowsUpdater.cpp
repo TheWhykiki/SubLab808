@@ -88,6 +88,12 @@
 #ifndef WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256
 #define WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256 ""
 #endif
+#ifndef WK_WINDOWS_UPDATER_RELEASE_GATE_PUBLIC_KEY_XY
+#error "Updater builds require WK_WINDOWS_UPDATER_RELEASE_GATE_PUBLIC_KEY_XY"
+#endif
+#ifndef WK_WINDOWS_UPDATER_RELEASE_GATE_NEXT_PUBLIC_KEY_XY
+#define WK_WINDOWS_UPDATER_RELEASE_GATE_NEXT_PUBLIC_KEY_XY ""
+#endif
 
 #if defined(_M_ARM64EC)
 #define WK_WINDOWS_UPDATER_ARCHITECTURE_ARM64EC 1
@@ -108,6 +114,8 @@ constexpr std::uint64_t kMaximumMetadataBytes = 1024u * 1024u;
 constexpr std::uint64_t kMaximumMsiBytes = 256u * 1024u * 1024u;
 constexpr std::uint64_t kMaximumManifestBytes = 1024u * 1024u;
 constexpr DWORD kMaximumRedirects = 5;
+constexpr wchar_t kGithubApiHeaders[] = L"Accept: application/vnd.github+json\r\n"
+                                         L"X-GitHub-Api-Version: 2026-03-10\r\n";
 // SummaryInformation property identifiers from [MS-OLEPS] section 2.18.2.
 // Keep these local: the Windows SDK does not expose the PIDSI_* aliases in
 // every supported header configuration.
@@ -129,10 +137,19 @@ constexpr std::string_view kUpgradeCode = WK_WINDOWS_UPDATER_UPGRADE_CODE;
 constexpr std::string_view kOtherUpgradeCode = WK_WINDOWS_UPDATER_OTHER_UPGRADE_CODE;
 constexpr std::string_view kCurrentSignerSha256 = WK_WINDOWS_UPDATER_SIGNER_SHA256;
 constexpr std::string_view kNextSignerSha256 = WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256;
+constexpr std::string_view kReleaseGatePublicKeyXY =
+    WK_WINDOWS_UPDATER_RELEASE_GATE_PUBLIC_KEY_XY;
+constexpr std::string_view kReleaseGateNextPublicKeyXY =
+    WK_WINDOWS_UPDATER_RELEASE_GATE_NEXT_PUBLIC_KEY_XY;
 
 constexpr bool isHex(char c)
 {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+constexpr bool isUpperHex(char c)
+{
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F');
 }
 
 constexpr bool pinsEqualInsensitive(std::string_view left, std::string_view right)
@@ -160,12 +177,24 @@ constexpr bool compileTimePinsAreValid()
         && (kNextSignerSha256.size() != 64
             || ! std::all_of(kNextSignerSha256.begin(), kNextSignerSha256.end(), isHex)))
         return false;
-    return kNextSignerSha256.empty()
-        || ! pinsEqualInsensitive(kCurrentSignerSha256, kNextSignerSha256);
+    if (! kNextSignerSha256.empty()
+        && pinsEqualInsensitive(kCurrentSignerSha256, kNextSignerSha256))
+        return false;
+    if (kReleaseGatePublicKeyXY.size() != 128
+        || ! std::all_of(kReleaseGatePublicKeyXY.begin(),
+                         kReleaseGatePublicKeyXY.end(), isUpperHex))
+        return false;
+    if (! kReleaseGateNextPublicKeyXY.empty()
+        && (kReleaseGateNextPublicKeyXY.size() != 128
+            || ! std::all_of(kReleaseGateNextPublicKeyXY.begin(),
+                             kReleaseGateNextPublicKeyXY.end(), isUpperHex)))
+        return false;
+    return kReleaseGateNextPublicKeyXY.empty()
+        || kReleaseGatePublicKeyXY != kReleaseGateNextPublicKeyXY;
 }
 
 static_assert(compileTimePinsAreValid(),
-              "Updater signer pins must be one or two distinct 64-character hexadecimal values");
+              "Updater signer pins and release-gate P-256 public keys are malformed or duplicated");
 
 class Failure final : public std::runtime_error
 {
@@ -235,6 +264,15 @@ std::string upperAscii(std::string value)
     std::transform(value.begin(), value.end(), value.begin(), [] (unsigned char c)
     {
         return static_cast<char>(c >= 'a' && c <= 'z' ? c - ('a' - 'A') : c);
+    });
+    return value;
+}
+
+std::string lowerAscii(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [] (unsigned char c)
+    {
+        return static_cast<char>(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
     });
     return value;
 }
@@ -394,13 +432,18 @@ public:
                                static_cast<ULONG>(bytes), 0) >= 0,
                 "BCryptHashData failed");
     }
-    std::string finish()
+    std::array<unsigned char, 32> finishBytes()
     {
         require(! finished, "SHA-256 was already finalized");
         std::array<unsigned char, 32> digest{};
         require(BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0) >= 0,
                 "BCryptFinishHash failed");
         finished = true;
+        return digest;
+    }
+    std::string finish()
+    {
+        const auto digest = finishBytes();
         constexpr char alphabet[] = "0123456789ABCDEF";
         std::string result;
         result.reserve(64);
@@ -417,6 +460,137 @@ private:
     std::vector<unsigned char> object;
     bool finished{};
 };
+
+class BCryptAlgorithmHandle
+{
+public:
+    BCryptAlgorithmHandle()
+    {
+        require(BCryptOpenAlgorithmProvider(&value, BCRYPT_ECDSA_P256_ALGORITHM,
+                                            nullptr, 0) >= 0,
+                "Cannot open the Windows P-256 provider");
+    }
+    ~BCryptAlgorithmHandle()
+    {
+        if (value != nullptr) BCryptCloseAlgorithmProvider(value, 0);
+    }
+    BCryptAlgorithmHandle(const BCryptAlgorithmHandle&) = delete;
+    BCryptAlgorithmHandle& operator=(const BCryptAlgorithmHandle&) = delete;
+    BCRYPT_ALG_HANDLE get() const { return value; }
+private:
+    BCRYPT_ALG_HANDLE value{};
+};
+
+class BCryptKeyHandle
+{
+public:
+    BCryptKeyHandle() = default;
+    ~BCryptKeyHandle() { if (value != nullptr) BCryptDestroyKey(value); }
+    BCryptKeyHandle(const BCryptKeyHandle&) = delete;
+    BCryptKeyHandle& operator=(const BCryptKeyHandle&) = delete;
+    BCRYPT_KEY_HANDLE get() const { return value; }
+    BCRYPT_KEY_HANDLE* put()
+    {
+        require(value == nullptr, "CNG key handle was already initialized");
+        return &value;
+    }
+private:
+    BCRYPT_KEY_HANDLE value{};
+};
+
+template <std::size_t ByteCount>
+std::array<unsigned char, ByteCount> decodeUpperHex(std::string_view value)
+{
+    require(value.size() == ByteCount * 2,
+            "Hex value does not contain the required fixed number of bytes");
+    const auto nibble = [] (char character) -> std::optional<unsigned char>
+    {
+        if (character >= '0' && character <= '9')
+            return static_cast<unsigned char>(character - '0');
+        if (character >= 'A' && character <= 'F')
+            return static_cast<unsigned char>(character - 'A' + 10);
+        return std::nullopt;
+    };
+    std::array<unsigned char, ByteCount> result{};
+    for (std::size_t index{}; index < result.size(); ++index)
+    {
+        const auto high = nibble(value[index * 2]);
+        const auto low = nibble(value[index * 2 + 1]);
+        require(high && low, "P-256 value is not canonical uppercase hexadecimal");
+        result[index] = static_cast<unsigned char>((*high << 4) | *low);
+    }
+    return result;
+}
+
+class P256PublicKey
+{
+public:
+    explicit P256PublicKey(std::string_view xyHex)
+    {
+        const auto coordinates = decodeUpperHex<64>(xyHex);
+        struct PublicBlob
+        {
+            BCRYPT_ECCKEY_BLOB header;
+            std::array<unsigned char, 64> xy;
+        } blob { { BCRYPT_ECDSA_PUBLIC_P256_MAGIC, 32 }, coordinates };
+        static_assert(sizeof(PublicBlob) == sizeof(BCRYPT_ECCKEY_BLOB) + 64);
+        require(BCryptImportKeyPair(algorithm.get(), nullptr, BCRYPT_ECCPUBLIC_BLOB,
+                                    key.put(), reinterpret_cast<PUCHAR>(&blob),
+                                    static_cast<ULONG>(sizeof(blob)), 0) >= 0,
+                "Configured release-gate P-256 public key is not a valid curve point");
+    }
+
+    bool verifies(const std::array<unsigned char, 32>& digest,
+                  const std::array<std::uint8_t, 64>& signature) const
+    {
+        return BCryptVerifySignature(key.get(), nullptr,
+                                     const_cast<PUCHAR>(digest.data()),
+                                     static_cast<ULONG>(digest.size()),
+                                     const_cast<PUCHAR>(signature.data()),
+                                     static_cast<ULONG>(signature.size()), 0) >= 0;
+    }
+private:
+    BCryptAlgorithmHandle algorithm;
+    BCryptKeyHandle key;
+};
+
+bool p256PublicKeyIsOnCurve(std::string_view xyHex) noexcept
+{
+    try
+    {
+        if (! isP256PublicKeyXYHex(xyHex)) return false;
+        const P256PublicKey key(xyHex);
+        (void) key;
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+std::array<unsigned char, 32> sha256Bytes(std::string_view value)
+{
+    Sha256 hash;
+    hash.add(value.data(), value.size());
+    return hash.finishBytes();
+}
+
+std::uint64_t currentUnixSeconds()
+{
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(now).count();
+    require(seconds > 0, "System UTC clock is outside the supported range");
+    return static_cast<std::uint64_t>(seconds);
+}
+
+std::uint64_t fileTimeValue(const FILETIME& value)
+{
+    ULARGE_INTEGER integer{};
+    integer.LowPart = value.dwLowDateTime;
+    integer.HighPart = value.dwHighDateTime;
+    return integer.QuadPart;
+}
 
 std::pair<std::uint64_t, std::string> hashFile(const Path& path)
 {
@@ -623,6 +797,34 @@ void atomicWrite(const Path& destination, std::string_view content)
 
 enum class Phase { created, noUpdate, metadata, downloaded, extracted, installed, verified };
 
+enum class OperationMode { normal, releaseGate };
+
+struct ReleaseGateIdentity
+{
+    std::uint64_t releaseId{};
+    std::string tag;
+    std::string sourceCommit;
+
+    friend bool operator==(const ReleaseGateIdentity&, const ReleaseGateIdentity&) = default;
+};
+
+struct ReleaseGateInvocation
+{
+    ReleaseGateIdentity identity;
+    std::string challenge;
+    std::string responsePipe;
+    DWORD parentProcessId{};
+    std::uint64_t parentProcessCreatedAtFiletime{};
+    std::uint64_t expiresAtUnixSeconds{};
+    std::string authorizationSignatureP1363;
+};
+
+struct Invocation
+{
+    std::optional<std::string> resumeId;
+    std::optional<ReleaseGateInvocation> releaseGate;
+};
+
 const char* phaseName(Phase phase)
 {
     switch (phase)
@@ -650,6 +852,8 @@ struct Journal
 {
     std::string operationId;
     std::string writerVersion;
+    OperationMode mode = OperationMode::normal;
+    std::optional<ReleaseGateIdentity> releaseGate;
     Phase phase = Phase::created;
     std::string targetVersion;
     std::string assetUrl;
@@ -687,6 +891,15 @@ void writeJournal(const Path& operation, const Journal& journal)
     object->setProperty("installedVersion", juce::String::fromUTF8(kInstalledVersion.data(),
                                                                     static_cast<int>(kInstalledVersion.size())));
     object->setProperty("operationId", juceString(journal.operationId));
+    object->setProperty("operationMode",
+                        journal.mode == OperationMode::releaseGate ? "release-gate" : "normal");
+    if (journal.mode == OperationMode::releaseGate)
+    {
+        require(journal.releaseGate.has_value(), "Release-gate journal identity is missing");
+        object->setProperty("releaseId", juceString(std::to_string(journal.releaseGate->releaseId)));
+        object->setProperty("releaseTag", juceString(journal.releaseGate->tag));
+        object->setProperty("sourceCommit", juceString(journal.releaseGate->sourceCommit));
+    }
     object->setProperty("phase", phaseName(journal.phase));
     object->setProperty("targetVersion", juceString(journal.targetVersion));
     object->setProperty("assetUrl", juceString(journal.assetUrl));
@@ -700,7 +913,8 @@ void writeJournal(const Path& operation, const Journal& journal)
 enum class JournalReadPurpose { resume, cleanup };
 
 Journal readJournal(const Path& operation, std::string_view expectedId,
-                    JournalReadPurpose purpose)
+                    JournalReadPurpose purpose,
+                    const std::optional<ReleaseGateIdentity>& expectedReleaseGate = std::nullopt)
 {
     ensureNotReparsePoint(operation / L"journal.json", "Updater journal");
     const auto text = fileUtf8(operation / L"journal.json", 64u * 1024u);
@@ -729,9 +943,51 @@ Journal readJournal(const Path& operation, std::string_view expectedId,
     result.operationId = requiredString(*object, "operationId");
     result.writerVersion = writerVersion;
     require(result.operationId == expectedId && isOperationId(result.operationId), "Journal operation mismatch");
+    if (object->hasProperty("operationMode"))
+    {
+        const auto mode = requiredString(*object, "operationMode");
+        require(mode == "normal" || mode == "release-gate", "Journal operation mode is invalid");
+        result.mode = mode == "release-gate" ? OperationMode::releaseGate : OperationMode::normal;
+    }
+    if (result.mode == OperationMode::releaseGate)
+    {
+        const auto releaseIdText = requiredString(*object, "releaseId");
+        const auto releaseId = parseCanonicalPositiveUint64(releaseIdText);
+        require(releaseId.has_value(), "Journal release ID is invalid");
+        ReleaseGateIdentity identity;
+        identity.releaseId = *releaseId;
+        identity.tag = requiredString(*object, "releaseTag");
+        identity.sourceCommit = requiredString(*object, "sourceCommit");
+        const auto version = parseStableTag(identity.tag);
+        require(version.has_value() && identity.tag == "v" + toString(*version),
+                "Journal release tag is invalid");
+        require(isGitCommitHex(identity.sourceCommit)
+                    && identity.sourceCommit == lowerAscii(identity.sourceCommit),
+                "Journal source commit is invalid or non-canonical");
+        result.releaseGate = std::move(identity);
+    }
+    else
+    {
+        require(! object->hasProperty("releaseId") && ! object->hasProperty("releaseTag")
+                    && ! object->hasProperty("sourceCommit"),
+                "Normal journal contains release-gate identity fields");
+    }
+    if (purpose == JournalReadPurpose::resume)
+    {
+        require(expectedReleaseGate.has_value() == result.releaseGate.has_value(),
+                "Journal operation mode does not match the requested resume mode");
+        if (expectedReleaseGate)
+            require(*result.releaseGate == *expectedReleaseGate,
+                    "Journal release-gate identity does not match the command line");
+    }
     const auto phase = parsePhase(requiredString(*object, "phase"));
     require(phase.has_value(), "Journal phase is invalid");
     result.phase = *phase;
+    if (purpose == JournalReadPurpose::resume && expectedReleaseGate)
+        require(result.phase == Phase::created,
+                "Release-gate operations are one-shot and cannot resume persisted progress");
+    require(result.mode != OperationMode::releaseGate || result.phase != Phase::noUpdate,
+            "Release-gate journal cannot enter no-update state");
     result.targetVersion = requiredString(*object, "targetVersion");
     result.assetUrl = requiredString(*object, "assetUrl");
     result.digest = requiredString(*object, "digest");
@@ -897,6 +1153,8 @@ std::optional<std::string> cleanupOldOperations(
             Path path;
             std::string id;
             std::string writerVersion;
+            OperationMode mode;
+            std::optional<ReleaseGateIdentity> releaseGate;
             Phase phase;
             std::filesystem::file_time_type time;
         };
@@ -919,7 +1177,8 @@ std::optional<std::string> cleanupOldOperations(
                 const auto journal = readJournal(path, id, JournalReadPurpose::cleanup);
                 const auto time = std::filesystem::last_write_time(path / L"journal.json", error);
                 if (error || ! ids.insert(id).second) return std::nullopt;
-                records.push_back({ path, id, journal.writerVersion, journal.phase, time });
+                records.push_back({ path, id, journal.writerVersion, journal.mode,
+                                    journal.releaseGate, journal.phase, time });
             }
             catch (...) {}
         }
@@ -927,6 +1186,7 @@ std::optional<std::string> cleanupOldOperations(
         std::optional<std::size_t> newest;
         for (std::size_t index{}; index < records.size(); ++index)
             if (records[index].writerVersion == kInstalledVersion
+                && records[index].mode == OperationMode::normal
                 && ! isTerminal(records[index].phase)
                 && (! newest || records[index].time > records[*newest].time
                     || (records[index].time == records[*newest].time
@@ -952,7 +1212,10 @@ std::optional<std::string> cleanupOldOperations(
                 // Revalidate while DELETE-without-delete-sharing proves that
                 // no running updater holds this exact operation directory.
                 const auto journal = readJournal(record.path, record.id, JournalReadPurpose::cleanup);
-                if (journal.writerVersion != record.writerVersion || journal.phase != record.phase) continue;
+                if (journal.writerVersion != record.writerVersion || journal.mode != record.mode
+                    || journal.releaseGate != record.releaseGate
+                    || journal.phase != record.phase)
+                    continue;
                 if (deleteOperationContents(record.path, journal))
                     (void) markForDeletion(lease.get());
             }
@@ -1092,9 +1355,7 @@ HttpResult httpGet(const std::wstring& firstUrl, std::uint64_t maximumBytes,
         DWORD disabled = WINHTTP_DISABLE_REDIRECTS;
         require(WinHttpSetOption(request.get(), WINHTTP_OPTION_DISABLE_FEATURE,
                                  &disabled, sizeof(disabled)), winError("Cannot disable automatic redirects"));
-        constexpr wchar_t headers[] = L"Accept: application/vnd.github+json\r\n"
-                                      L"X-GitHub-Api-Version: 2022-11-28\r\n";
-        require(WinHttpSendRequest(request.get(), headers, static_cast<DWORD>(-1),
+        require(WinHttpSendRequest(request.get(), kGithubApiHeaders, static_cast<DWORD>(-1),
                                    WINHTTP_NO_REQUEST_DATA, 0, 0, 0),
                 winError("HTTPS request failed"));
         require(WinHttpReceiveResponse(request.get(), nullptr), winError("HTTPS response failed"));
@@ -1198,6 +1459,42 @@ Release parsePublishedRelease(juce::DynamicObject& object, const SemVersion& ver
     return *found;
 }
 
+Release parseReleaseGateCandidate(const std::string& json,
+                                  const SemVersion& baseline,
+                                  const ReleaseGateIdentity& expected)
+{
+    const auto parsed = juce::JSON::parse(
+        juce::String::fromUTF8(json.data(), static_cast<int>(json.size())));
+    auto* object = parsed.getDynamicObject();
+    require(object != nullptr, "Release-gate metadata is not a JSON object");
+
+    const auto idValue = object->getProperty("id");
+    require(idValue.isInt() || idValue.isInt64(), "Release-gate release ID is not an integer");
+    const auto signedId = static_cast<juce::int64>(idValue);
+    require(signedId > 0 && static_cast<std::uint64_t>(signedId) == expected.releaseId,
+            "Release-gate metadata belongs to a different release ID");
+
+    const auto draft = object->getProperty("draft");
+    const auto prerelease = object->getProperty("prerelease");
+    const auto immutable = object->getProperty("immutable");
+    require(draft.isBool() && prerelease.isBool() && immutable.isBool(),
+            "Release-gate publication flags are not booleans");
+    require(! static_cast<bool>(draft) && static_cast<bool>(prerelease)
+                && static_cast<bool>(immutable),
+            "Release-gate candidate must be a published immutable prerelease");
+
+    const auto tag = object->getProperty("tag_name").toString().toStdString();
+    const auto version = parseStableTag(tag);
+    require(version.has_value() && tag == "v" + toString(*version) && tag == expected.tag,
+            "Release-gate tag is not the exact canonical requested tag");
+    require(isStrictlyNewer(*version, baseline),
+            "Release-gate target is not newer than the installed helper version");
+    require(object->getProperty("target_commitish").toString().toStdString()
+                == expected.sourceCommit,
+            "Release-gate target commit does not match the requested source commit");
+    return parsePublishedRelease(*object, *version, tag);
+}
+
 std::optional<Release> parseNextRelease(const std::string& json, const SemVersion& baseline)
 {
     const auto parsed = juce::JSON::parse(juce::String::fromUTF8(json.data(), static_cast<int>(json.size())));
@@ -1224,6 +1521,13 @@ std::optional<Release> parseNextRelease(const std::string& json, const SemVersio
         require(stableTags.insert(tagText).second, "GitHub releases metadata contains a duplicate stable tag");
         if (! isStrictlyNewer(*version, baseline))
             continue;
+        // Immutable Releases was introduced after some legacy macOS-only
+        // history entries. Only an actually selectable newer stable release
+        // must carry the new field, but for that candidate neither absence,
+        // truthy coercion nor false is acceptable.
+        const auto immutable = object->getProperty("immutable");
+        require(immutable.isBool() && static_cast<bool>(immutable),
+                "Newer stable GitHub release is not explicitly immutable");
         const auto candidate = parsePublishedRelease(*object, *version, tagText);
         if (! selected || isStrictlyNewer(selected->version, candidate.version))
             selected = candidate;
@@ -1959,6 +2263,20 @@ Path installedBundlePath()
     return bundle;
 }
 
+Path installedUpdaterPath()
+{
+    const auto bundle = installedBundlePath();
+    require(std::filesystem::is_directory(bundle), "Installed VST3 bundle is missing");
+    const auto contents = bundle / L"Contents";
+    const auto helpers = contents / L"Helpers";
+    const auto updater = helpers / (widen(kProduct) + L"Updater.exe");
+    ensureNotReparsePoint(contents, "Installed VST3 Contents");
+    ensureNotReparsePoint(helpers, "Installed VST3 Helpers");
+    ensureNotReparsePoint(updater, "Installed updater executable");
+    require(std::filesystem::is_regular_file(updater), "Installed updater executable is missing");
+    return std::filesystem::weakly_canonical(updater);
+}
+
 std::optional<SemVersion> installedSystemVersion()
 {
     const auto bundle = installedBundlePath();
@@ -2097,7 +2415,9 @@ std::optional<std::string> copiedUpdaterOperationId(const Path& root, const Path
 }
 
 void launchCopiedUpdater(const Path& executable, const Path& source,
-                         std::string_view operationId)
+                         std::string_view operationId,
+                         const std::optional<ReleaseGateInvocation>& releaseGate,
+                         Handle& launchedProcess)
 {
     ensureNotReparsePoint(executable, "Copied updater executable");
     Handle locked(CreateFileW(executable.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
@@ -2114,7 +2434,22 @@ void launchCopiedUpdater(const Path& executable, const Path& source,
     require(hashFile(source) == hashFile(executable),
             "Copied updater differs from its source executable");
 
-    const auto arguments = L"--resume " + widen(operationId);
+    auto arguments = L"--resume " + widen(operationId);
+    if (releaseGate)
+    {
+        arguments += L" --release-gate --challenge " + widen(releaseGate->challenge)
+                   + L" --response-pipe " + widen(releaseGate->responsePipe)
+                   + L" --parent-process-id " + std::to_wstring(releaseGate->parentProcessId)
+                   + L" --release-id " + std::to_wstring(releaseGate->identity.releaseId)
+                   + L" --tag " + widen(releaseGate->identity.tag)
+                   + L" --source-commit " + widen(releaseGate->identity.sourceCommit)
+                   + L" --parent-process-created-at-filetime "
+                   + std::to_wstring(releaseGate->parentProcessCreatedAtFiletime)
+                   + L" --expires-at-unix-seconds "
+                   + std::to_wstring(releaseGate->expiresAtUnixSeconds)
+                   + L" --authorization-signature-p1363 "
+                   + widen(releaseGate->authorizationSignatureP1363);
+    }
     SHELLEXECUTEINFOW launch{};
     launch.cbSize = sizeof(launch);
     launch.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
@@ -2122,7 +2457,8 @@ void launchCopiedUpdater(const Path& executable, const Path& source,
     launch.lpParameters = arguments.c_str();
     launch.nShow = SW_SHOWNORMAL;
     require(ShellExecuteExW(&launch), winError("Cannot launch copied updater"));
-    Handle process(launch.hProcess);
+    launchedProcess.reset(launch.hProcess);
+    require(launchedProcess.valid(), "Copied updater launch returned no process handle");
 }
 
 class ProductMutex
@@ -2138,18 +2474,28 @@ public:
                 "Another updater operation is active; try again after it finishes");
         acquired = true;
     }
+    void release()
+    {
+        if (acquired)
+        {
+            require(ReleaseMutex(handle.get()), winError("Cannot release updater process lock"));
+            acquired = false;
+        }
+    }
     ~ProductMutex() { if (acquired) ReleaseMutex(handle.get()); }
 private:
     Handle handle;
     bool acquired{};
 };
 
-struct Invocation { std::optional<std::string> resumeId; };
-
 constexpr std::string_view kBuildContractSchema =
     "whykiki.windows-updater-build-contract";
 constexpr std::string_view kBuildContractPipePrefix =
     "WhykikiAudio.UpdaterBuildContract.";
+constexpr std::string_view kReleaseGateSchema =
+    "whykiki.windows-updater-release-gate";
+constexpr std::string_view kReleaseGatePipePrefix =
+    "WhykikiAudio.UpdaterReleaseGate.";
 
 bool isSafeBuildIdentityText(std::string_view value)
 {
@@ -2178,6 +2524,11 @@ bool isBuildContractPipeName(std::string_view value)
                        value.end(), isHex);
 }
 
+bool isReleaseGatePipeName(std::string_view value)
+{
+    return isCanonicalReleaseGatePipeName(value);
+}
+
 std::optional<DWORD> parseBuildContractProcessId(std::string_view value)
 {
     if (value.empty() || (value.size() > 1 && value.front() == '0'))
@@ -2199,7 +2550,9 @@ bool compiledBuildIdentityMatches(std::string_view product,
                                   std::string_view upgradeCode,
                                   std::string_view otherUpgradeCode,
                                   std::string_view currentSignerSha256,
-                                  std::string_view nextSignerSha256)
+                                  std::string_view nextSignerSha256,
+                                  std::string_view releaseGatePublicKeyXY = kReleaseGatePublicKeyXY,
+                                  std::string_view releaseGateNextPublicKeyXY = kReleaseGateNextPublicKeyXY)
 {
     const auto parsedVersion = parseVersion(kInstalledVersion);
     const auto configured = isSafeRepositoryComponent(kProduct)
@@ -2214,7 +2567,13 @@ bool compiledBuildIdentityMatches(std::string_view product,
         && (kNextSignerSha256.empty() || isSha256Hex(kNextSignerSha256))
         && (kNextSignerSha256.empty()
             || ! constantTimeEqual(upperAscii(std::string(kCurrentSignerSha256)),
-                                   upperAscii(std::string(kNextSignerSha256))));
+                                   upperAscii(std::string(kNextSignerSha256))))
+        && isP256PublicKeyXYHex(kReleaseGatePublicKeyXY)
+        && p256PublicKeyIsOnCurve(kReleaseGatePublicKeyXY)
+        && (kReleaseGateNextPublicKeyXY.empty()
+            || (isP256PublicKeyXYHex(kReleaseGateNextPublicKeyXY)
+                && kReleaseGateNextPublicKeyXY != kReleaseGatePublicKeyXY
+                && p256PublicKeyIsOnCurve(kReleaseGateNextPublicKeyXY)));
     return configured
         && product == kProduct
         && version == kInstalledVersion
@@ -2227,7 +2586,9 @@ bool compiledBuildIdentityMatches(std::string_view product,
         && upperAscii(std::string(currentSignerSha256))
             == upperAscii(std::string(kCurrentSignerSha256))
         && upperAscii(std::string(nextSignerSha256))
-            == upperAscii(std::string(kNextSignerSha256));
+            == upperAscii(std::string(kNextSignerSha256))
+        && releaseGatePublicKeyXY == kReleaseGatePublicKeyXY
+        && releaseGateNextPublicKeyXY == kReleaseGateNextPublicKeyXY;
 }
 
 bool buildContractMatches(std::string_view product,
@@ -2239,7 +2600,9 @@ bool buildContractMatches(std::string_view product,
                           std::string_view upgradeCode,
                           std::string_view otherUpgradeCode,
                           std::string_view currentSignerSha256,
-                          std::string_view nextSignerSha256)
+                          std::string_view nextSignerSha256,
+                          std::string_view releaseGatePublicKeyXY = kReleaseGatePublicKeyXY,
+                          std::string_view releaseGateNextPublicKeyXY = kReleaseGateNextPublicKeyXY)
 {
     // A test-mode executable can never certify a distribution build, even if a
     // caller supplies values matching all of its other compile definitions.
@@ -2247,13 +2610,14 @@ bool buildContractMatches(std::string_view product,
         && compiledBuildIdentityMatches(product, version, manufacturer, githubOwner,
                                         githubRepository, architecture, upgradeCode,
                                         otherUpgradeCode, currentSignerSha256,
-                                        nextSignerSha256);
+                                        nextSignerSha256, releaseGatePublicKeyXY,
+                                        releaseGateNextPublicKeyXY);
 }
 
 std::string canonicalBuildContractResponse(std::string_view challenge, DWORD serverProcessId)
 {
     return "{\"schema\":\"" + std::string(kBuildContractSchema)
-        + "\",\"schemaVersion\":2,\"challenge\":\"" + upperAscii(std::string(challenge))
+        + "\",\"schemaVersion\":3,\"challenge\":\"" + upperAscii(std::string(challenge))
         + "\",\"serverProcessId\":" + std::to_string(serverProcessId)
         + ",\"buildMode\":\"production\",\"compileOnly\":false,\"product\":\""
         + std::string(kProduct) + "\",\"version\":\"" + std::string(kInstalledVersion)
@@ -2264,7 +2628,10 @@ std::string canonicalBuildContractResponse(std::string_view challenge, DWORD ser
         + "\",\"upgradeCode\":\"" + std::string(kUpgradeCode)
         + "\",\"otherUpgradeCode\":\"" + std::string(kOtherUpgradeCode)
         + "\",\"currentSignerSha256\":\"" + upperAscii(std::string(kCurrentSignerSha256))
-        + "\",\"nextSignerSha256\":\"" + upperAscii(std::string(kNextSignerSha256)) + "\"}\n";
+        + "\",\"nextSignerSha256\":\"" + upperAscii(std::string(kNextSignerSha256))
+        + "\",\"releaseGatePublicKeyXY\":\"" + std::string(kReleaseGatePublicKeyXY)
+        + "\",\"releaseGateNextPublicKeyXY\":\"" + std::string(kReleaseGateNextPublicKeyXY)
+        + "\"}\n";
 }
 
 void writeBuildContractResponse(std::string_view pipeName,
@@ -2300,11 +2667,12 @@ std::optional<int> validateBuildContractCommandLine() noexcept
         struct Args { wchar_t** value; ~Args() { LocalFree(value); } } arguments { raw };
         if (count < 2 || std::wstring_view(raw[1]) != L"--validate-build-contract")
             return std::nullopt;
-        constexpr std::array<std::wstring_view, 13> flags {
+        constexpr std::array<std::wstring_view, 15> flags {
             L"--challenge", L"--response-pipe", L"--parent-process-id",
             L"--product", L"--version", L"--manufacturer", L"--github-owner",
             L"--github-repository", L"--architecture", L"--upgrade-code",
-            L"--other-upgrade-code", L"--current-signer-sha256", L"--next-signer-sha256"
+            L"--other-upgrade-code", L"--current-signer-sha256", L"--next-signer-sha256",
+            L"--release-gate-public-key-xy", L"--release-gate-next-public-key-xy"
         };
         if (count != 2 + static_cast<int>(flags.size()) * 2) return 2;
         std::array<std::string, flags.size()> values;
@@ -2317,7 +2685,8 @@ std::optional<int> validateBuildContractCommandLine() noexcept
         if (! isBuildContractChallenge(values[0]) || ! isBuildContractPipeName(values[1])
             || ! parentProcessId
             || ! buildContractMatches(values[3], values[4], values[5], values[6], values[7],
-                                       values[8], values[9], values[10], values[11], values[12]))
+                                       values[8], values[9], values[10], values[11], values[12],
+                                       values[13], values[14]))
             return 3;
         writeBuildContractResponse(values[1], values[0], *parentProcessId);
         return 0;
@@ -2328,18 +2697,309 @@ std::optional<int> validateBuildContractCommandLine() noexcept
     }
 }
 
+ReleaseGateAuthorizationFields releaseGateAuthorizationFields(
+    const ReleaseGateInvocation& gate)
+{
+    const auto installed = parseVersion(kInstalledVersion);
+    require(installed.has_value(), "Installed updater version is not canonical");
+    return {
+        std::string(kOwner),
+        std::string(kRepository),
+        std::string(kProduct),
+        kArchitecture,
+        *installed,
+        gate.identity.releaseId,
+        gate.identity.tag,
+        gate.identity.sourceCommit,
+        gate.challenge,
+        gate.responsePipe,
+        static_cast<std::uint32_t>(gate.parentProcessId),
+        gate.parentProcessCreatedAtFiletime,
+        gate.expiresAtUnixSeconds
+    };
+}
+
+void validateReleaseGateAuthorization(const ReleaseGateInvocation& gate,
+                                      std::uint64_t nowUnixSeconds)
+{
+    require(isReleaseGateExpiryValid(gate.expiresAtUnixSeconds, nowUnixSeconds),
+            "Release-gate authorization is expired or exceeds its five-minute lifetime");
+    const auto canonical = canonicalReleaseGateAuthorization(
+        releaseGateAuthorizationFields(gate));
+    require(canonical.has_value(), "Release-gate authorization fields are not canonical");
+    const auto signature = decodeP256P1363SignatureHex(
+        gate.authorizationSignatureP1363);
+    require(signature.has_value(),
+            "Release-gate authorization signature is malformed or non-canonical");
+    const auto digest = sha256Bytes(*canonical);
+    const P256PublicKey currentKey(kReleaseGatePublicKeyXY);
+    const auto currentAccepted = currentKey.verifies(digest, *signature);
+    auto nextAccepted = false;
+    if (! kReleaseGateNextPublicKeyXY.empty())
+    {
+        const P256PublicKey nextKey(kReleaseGateNextPublicKeyXY);
+        nextAccepted = nextKey.verifies(digest, *signature);
+    }
+    require(currentAccepted || nextAccepted,
+            "Release-gate invocation is not authorized by a pinned P-256 key");
+}
+
+#if defined(WK_WINDOWS_UPDATER_TEST_MODE) && WK_WINDOWS_UPDATER_TEST_MODE
+std::array<std::uint8_t, 64> normalizeTestSignatureLowS(
+    std::array<std::uint8_t, 64> signature)
+{
+    constexpr std::string_view orderHex =
+        "FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551";
+    constexpr std::string_view halfOrderHex =
+        "7FFFFFFF800000007FFFFFFFFFFFFFFFDE737D56D38BCF4279DCE5617E3192A8";
+    const auto order = decodeUpperHex<32>(orderHex);
+    const auto halfOrder = decodeUpperHex<32>(halfOrderHex);
+    const auto sBegin = signature.begin() + 32;
+    if (! std::lexicographical_compare(halfOrder.begin(), halfOrder.end(),
+                                      sBegin, signature.end()))
+        return signature;
+
+    unsigned int borrow{};
+    for (std::size_t offset{}; offset < 32; ++offset)
+    {
+        const auto index = 31 - offset;
+        auto difference = static_cast<int>(order[index])
+                        - static_cast<int>(signature[32 + index])
+                        - static_cast<int>(borrow);
+        if (difference < 0)
+        {
+            difference += 256;
+            borrow = 1;
+        }
+        else
+        {
+            borrow = 0;
+        }
+        signature[32 + index] = static_cast<std::uint8_t>(difference);
+    }
+    require(borrow == 0, "Test ECDSA signature scalar exceeds the P-256 order");
+    return signature;
+}
+
+std::string correspondingHighSTestSignature(std::string_view lowSignatureHex)
+{
+    const auto decoded = decodeP256P1363SignatureHex(lowSignatureHex);
+    require(decoded.has_value(), "Test low-S signature is not canonical");
+    auto result = *decoded;
+    constexpr std::string_view orderHex =
+        "FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551";
+    const auto order = decodeUpperHex<32>(orderHex);
+    unsigned int borrow{};
+    for (std::size_t offset{}; offset < 32; ++offset)
+    {
+        const auto index = 31 - offset;
+        auto difference = static_cast<int>(order[index])
+                        - static_cast<int>(result[32 + index])
+                        - static_cast<int>(borrow);
+        if (difference < 0)
+        {
+            difference += 256;
+            borrow = 1;
+        }
+        else
+        {
+            borrow = 0;
+        }
+        result[32 + index] = static_cast<std::uint8_t>(difference);
+    }
+    require(borrow == 0, "Cannot construct corresponding high-S test signature");
+    return encodeP256P1363SignatureHex(result);
+}
+
+std::string signReleaseGateAuthorizationForTest(
+    const ReleaseGateAuthorizationFields& fields,
+    std::string_view publicKeyXY,
+    std::string_view privateScalarHex)
+{
+    const auto canonical = canonicalReleaseGateAuthorization(fields);
+    require(canonical.has_value(), "Test release-gate authorization is not canonical");
+    const auto coordinates = decodeUpperHex<64>(publicKeyXY);
+    const auto privateScalar = decodeUpperHex<32>(privateScalarHex);
+    struct PrivateBlob
+    {
+        BCRYPT_ECCKEY_BLOB header;
+        std::array<unsigned char, 64> xy;
+        std::array<unsigned char, 32> scalar;
+    } blob { { BCRYPT_ECDSA_PRIVATE_P256_MAGIC, 32 }, coordinates, privateScalar };
+    static_assert(sizeof(PrivateBlob) == sizeof(BCRYPT_ECCKEY_BLOB) + 96);
+    BCryptAlgorithmHandle algorithm;
+    BCryptKeyHandle key;
+    require(BCryptImportKeyPair(algorithm.get(), nullptr, BCRYPT_ECCPRIVATE_BLOB,
+                                key.put(), reinterpret_cast<PUCHAR>(&blob),
+                                static_cast<ULONG>(sizeof(blob)), 0) >= 0,
+            "Cannot import test P-256 private key");
+    const auto digest = sha256Bytes(*canonical);
+    std::array<std::uint8_t, 64> signature{};
+    ULONG signatureBytes{};
+    require(BCryptSignHash(key.get(), nullptr,
+                           const_cast<PUCHAR>(digest.data()),
+                           static_cast<ULONG>(digest.size()), signature.data(),
+                           static_cast<ULONG>(signature.size()), &signatureBytes, 0) >= 0
+                && signatureBytes == static_cast<ULONG>(signature.size()),
+            "Cannot create test P-256 P1363 signature");
+    SecureZeroMemory(&blob, sizeof(blob));
+    return encodeP256P1363SignatureHex(normalizeTestSignatureLowS(signature));
+}
+#endif
+
+Invocation parseInvocationArguments(const std::vector<std::string>& arguments)
+{
+    Invocation result;
+    if (arguments.empty()) return result;
+
+    std::size_t index{};
+    if (arguments[index] == "--resume")
+    {
+        require(arguments.size() >= 2, "Missing updater resume operation ID");
+        const auto id = upperAscii(arguments[1]);
+        require(isOperationId(id), "Invalid updater resume operation ID");
+        result.resumeId = id;
+        index = 2;
+        if (index == arguments.size()) return result;
+    }
+
+    require(arguments[index] == "--release-gate", "Unsupported updater command line");
+    ++index;
+    constexpr std::array<std::string_view, 9> flags {
+        "--challenge", "--response-pipe", "--parent-process-id",
+        "--release-id", "--tag", "--source-commit",
+        "--parent-process-created-at-filetime", "--expires-at-unix-seconds",
+        "--authorization-signature-p1363"
+    };
+    require(arguments.size() - index == flags.size() * 2,
+            "Release-gate command line has the wrong number of fields");
+    std::array<std::string, flags.size()> values;
+    for (std::size_t field{}; field < flags.size(); ++field)
+    {
+        require(arguments[index + field * 2] == flags[field],
+                "Release-gate command-line fields are not in canonical order");
+        values[field] = arguments[index + field * 2 + 1];
+    }
+
+    const auto parentProcessId = parseBuildContractProcessId(values[2]);
+    const auto releaseId = parseCanonicalPositiveUint64(values[3]);
+    const auto target = parseStableTag(values[4]);
+    const auto installed = parseVersion(kInstalledVersion);
+    const auto parentProcessCreatedAtFiletime = parseCanonicalPositiveUint64(values[6]);
+    const auto expiresAtUnixSeconds = parseCanonicalPositiveUint64(values[7]);
+    const auto signature = decodeP256P1363SignatureHex(values[8]);
+    require(isSha256Hex(values[0]) && values[0] == upperAscii(values[0]),
+            "Invalid or non-canonical release-gate challenge");
+    require(isReleaseGatePipeName(values[1]), "Invalid release-gate response pipe name");
+    require(parentProcessId.has_value(), "Invalid release-gate parent process ID");
+    require(releaseId.has_value(), "Invalid release-gate release ID");
+    require(target.has_value() && values[4] == "v" + toString(*target),
+            "Invalid release-gate tag");
+    require(installed.has_value() && isStrictlyNewer(*target, *installed),
+            "Release-gate target must be newer than the installed helper version");
+    require(isGitCommitHex(values[5]) && values[5] == lowerAscii(values[5]),
+            "Invalid or non-canonical release-gate source commit");
+    require(parentProcessCreatedAtFiletime.has_value(),
+            "Invalid release-gate parent process creation FILETIME");
+    require(expiresAtUnixSeconds.has_value(), "Invalid release-gate expiry");
+    require(signature.has_value(),
+            "Invalid, non-canonical or high-S release-gate P1363 signature");
+
+    ReleaseGateInvocation gate;
+    gate.challenge = values[0];
+    gate.responsePipe = values[1];
+    gate.parentProcessId = *parentProcessId;
+    gate.identity.releaseId = *releaseId;
+    gate.identity.tag = values[4];
+    gate.identity.sourceCommit = values[5];
+    gate.parentProcessCreatedAtFiletime = *parentProcessCreatedAtFiletime;
+    gate.expiresAtUnixSeconds = *expiresAtUnixSeconds;
+    gate.authorizationSignatureP1363 = values[8];
+    result.releaseGate = std::move(gate);
+    return result;
+}
+
 Invocation invocation()
 {
     int count{};
     auto** arguments = CommandLineToArgvW(GetCommandLineW(), &count);
     require(arguments != nullptr, winError("Cannot parse command line"));
     struct Args { wchar_t** value; ~Args() { LocalFree(value); } } owner { arguments };
-    if (count == 1) return {};
-    require(count == 3 && std::wstring_view(arguments[1]) == L"--resume",
-            "Unsupported updater command line");
-    const auto id = upperAscii(narrow(arguments[2]));
-    require(isOperationId(id), "Invalid updater resume operation ID");
-    return { id };
+    std::vector<std::string> values;
+    values.reserve(count > 1 ? static_cast<std::size_t>(count - 1) : 0u);
+    for (int index = 1; index < count; ++index) values.push_back(narrow(arguments[index]));
+    return parseInvocationArguments(values);
+}
+
+bool commandLineRequestsReleaseGate() noexcept
+{
+    int count{};
+    auto** arguments = CommandLineToArgvW(GetCommandLineW(), &count);
+    if (arguments == nullptr) return false;
+    struct Args { wchar_t** value; ~Args() { LocalFree(value); } } owner { arguments };
+    for (int index = 1; index < count; ++index)
+        if (std::wstring_view(arguments[index]) == L"--release-gate") return true;
+    return false;
+}
+
+std::string canonicalReleaseGateReceipt(const ReleaseGateInvocation& gate,
+                                        const Journal& journal)
+{
+    require(journal.mode == OperationMode::releaseGate && journal.releaseGate
+                && *journal.releaseGate == gate.identity,
+            "Release-gate receipt identity does not match the verified journal");
+    require(journal.phase == Phase::verified, "Release-gate receipt requires verified state");
+    const auto target = parseStableTag(gate.identity.tag);
+    require(target && journal.targetVersion == toString(*target),
+            "Release-gate receipt target version does not match its release tag");
+    require(isSha256Hex(journal.digest), "Release-gate receipt MSI digest is invalid");
+    return "{\"schema\":\"" + std::string(kReleaseGateSchema)
+        + "\",\"schemaVersion\":1,\"challenge\":\"" + gate.challenge
+        + "\",\"serverProcessId\":" + std::to_string(gate.parentProcessId)
+        + ",\"product\":\"" + std::string(kProduct)
+        + "\",\"installedVersion\":\"" + std::string(kInstalledVersion)
+        + "\",\"targetVersion\":\"" + journal.targetVersion
+        + "\",\"architecture\":\"" + architectureAssetSuffix(kArchitecture)
+        + "\",\"releaseId\":" + std::to_string(gate.identity.releaseId)
+        + ",\"sourceCommit\":\"" + gate.identity.sourceCommit
+        + "\",\"msiSha256\":\"" + upperAscii(journal.digest)
+        + "\",\"phase\":\"verified\"}\n";
+}
+
+Handle connectReleaseGateResponsePipe(const ReleaseGateInvocation& gate)
+{
+    require(isReleaseGatePipeName(gate.responsePipe), "Invalid release-gate response pipe name");
+    const auto endpoint = L"\\\\.\\pipe\\" + widen(gate.responsePipe);
+    if (! WaitNamedPipeW(endpoint.c_str(), 30000))
+        fail(winError("Release-gate response pipe is unavailable"));
+    Handle pipe(CreateFileW(endpoint.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                            nullptr));
+    require(pipe.valid(), winError("Cannot connect to release-gate response pipe"));
+    ULONG serverProcessId{};
+    require(GetNamedPipeServerProcessId(pipe.get(), &serverProcessId),
+            winError("Cannot identify release-gate response pipe server"));
+    require(serverProcessId == gate.parentProcessId,
+            "Release-gate response pipe belongs to a different process");
+    Handle serverProcess(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                                     serverProcessId));
+    require(serverProcess.valid(), winError("Cannot open release-gate pipe server process"));
+    FILETIME creation{}, exit{}, kernel{}, user{};
+    require(GetProcessTimes(serverProcess.get(), &creation, &exit, &kernel, &user),
+            winError("Cannot read release-gate pipe server creation time"));
+    require(fileTimeValue(creation) == gate.parentProcessCreatedAtFiletime,
+            "Release-gate response pipe server is not the authorized process instance");
+    return pipe;
+}
+
+void writeReleaseGateReceipt(HANDLE pipe,
+                             const ReleaseGateInvocation& gate,
+                             const Journal& journal)
+{
+    const auto receipt = canonicalReleaseGateReceipt(gate, journal);
+    require(receipt.size() <= 4096, "Release-gate receipt exceeds its fixed transport bound");
+    writeAll(pipe, receipt.data(), receipt.size());
+    require(FlushFileBuffers(pipe), winError("Cannot flush release-gate receipt"));
 }
 
 std::string prepareOperation(const Path& root, const std::optional<std::string>& newest)
@@ -2366,6 +3026,21 @@ std::string prepareOperation(const Path& root, const std::optional<std::string>&
     return id;
 }
 
+std::string prepareReleaseGateOperation(const Path& root,
+                                        const ReleaseGateIdentity& identity)
+{
+    const auto id = newOperationId();
+    const auto operation = root / widen(id);
+    createPrivateDirectory(operation, true);
+    createPrivateDirectory(operation / L"private-temp", true);
+    Journal journal;
+    journal.operationId = id;
+    journal.mode = OperationMode::releaseGate;
+    journal.releaseGate = identity;
+    writeJournal(operation, journal);
+    return id;
+}
+
 void validateConfiguration()
 {
     require(isSafeRepositoryComponent(kProduct) && isSafeRepositoryComponent(kOwner)
@@ -2383,26 +3058,53 @@ void validateConfiguration()
                 || ! constantTimeEqual(upperAscii(std::string(kCurrentSignerSha256)),
                                        upperAscii(std::string(kNextSignerSha256))),
             "Current and next signer pins must be distinct");
+    require(isP256PublicKeyXYHex(kReleaseGatePublicKeyXY)
+                && p256PublicKeyIsOnCurve(kReleaseGatePublicKeyXY),
+            "Production release-gate current P-256 public key is invalid");
+    require(kReleaseGateNextPublicKeyXY.empty()
+                || (isP256PublicKeyXYHex(kReleaseGateNextPublicKeyXY)
+                    && p256PublicKeyIsOnCurve(kReleaseGateNextPublicKeyXY)),
+            "Optional release-gate next P-256 public key is invalid");
+    require(kReleaseGateNextPublicKeyXY.empty()
+                || kReleaseGateNextPublicKeyXY != kReleaseGatePublicKeyXY,
+            "Current and next release-gate public keys must be distinct");
 }
 
-int worker(const Path& operation, Journal& journal)
+int worker(const Path& operation, Journal& journal,
+           const std::optional<ReleaseGateInvocation>& releaseGate)
 {
     const auto title = widen(kProduct) + L" Update";
+    const auto headless = releaseGate.has_value();
+    std::optional<Release> currentGateCandidate;
+    if (releaseGate)
+    {
+        require(journal.releaseGate && *journal.releaseGate == releaseGate->identity,
+                "Release-gate invocation does not match its journal");
+        require(journal.phase == Phase::created,
+                "Release-gate operations must start from a fresh one-shot journal");
+        const auto installed = *parseVersion(kInstalledVersion);
+        currentGateCandidate = parseReleaseGateCandidate(
+            httpGetText(releaseByIdApiUrl(kOwner, kRepository,
+                                          releaseGate->identity.releaseId)),
+            installed, releaseGate->identity);
+    }
     if (journal.phase == Phase::verified)
     {
         cleanupVerifiedPayload(operation, journal);
-        taskDialog(title, L"Update bereits installiert und geprüft",
-                   journal.lastError == "restart-required"
-                       ? L"Die installierte VST3-Nutzlast wurde bereits vollständig geprüft. Windows verlangt einen Neustart."
-                       : L"Die installierte VST3-Nutzlast wurde bereits vollständig geprüft.",
-                   TDCBF_OK_BUTTON);
+        if (! headless)
+            taskDialog(title, L"Update bereits installiert und geprüft",
+                       journal.lastError == "restart-required"
+                           ? L"Die installierte VST3-Nutzlast wurde bereits vollständig geprüft. Windows verlangt einen Neustart."
+                           : L"Die installierte VST3-Nutzlast wurde bereits vollständig geprüft.",
+                       TDCBF_OK_BUTTON);
         return 0;
     }
     if (journal.phase == Phase::noUpdate)
     {
-        taskDialog(title, L"Kein Update verfügbar",
-                   L"Es ist keine neuere passende stabile Version verfügbar. Es wurde nichts installiert.",
-                   TDCBF_OK_BUTTON);
+        if (! headless)
+            taskDialog(title, L"Kein Update verfügbar",
+                       L"Es ist keine neuere passende stabile Version verfügbar. Es wurde nichts installiert.",
+                       TDCBF_OK_BUTTON);
         return 0;
     }
     if (journal.phase == Phase::created)
@@ -2410,11 +3112,24 @@ int worker(const Path& operation, Journal& journal)
         const auto installed = *parseVersion(kInstalledVersion);
         const auto system = installedSystemVersion();
         auto baseline = installed;
-        if (system && isStrictlyNewer(*system, baseline)) baseline = *system;
-        const auto release = parseNextRelease(
-            httpGetText(releasesApiUrl(kOwner, kRepository)), baseline);
+        std::optional<Release> release;
+        if (releaseGate)
+        {
+            require(system.has_value() && *system == installed,
+                    "Release gate requires the exact installed N system version");
+            require(currentGateCandidate.has_value(),
+                    "Release-gate candidate metadata is unavailable");
+            release = *currentGateCandidate;
+        }
+        else
+        {
+            if (system && isStrictlyNewer(*system, baseline)) baseline = *system;
+            release = parseNextRelease(
+                httpGetText(releasesApiUrl(kOwner, kRepository)), baseline);
+        }
         if (! release)
         {
+            require(! releaseGate.has_value(), "Release-gate candidate metadata is missing");
             journal.phase = Phase::noUpdate;
             journal.lastError.clear();
             writeJournal(operation, journal);
@@ -2423,12 +3138,15 @@ int worker(const Path& operation, Journal& journal)
                        TDCBF_OK_BUTTON);
             return 0;
         }
-        const auto answer = taskDialog(title, L"Update verfügbar",
-            widen("Installiert: " + toString(baseline) + "\nVerfügbar: " + toString(release->version)
-                + "\n\nDas MSI wird ausschließlich von der festgelegten GitHub-Release-Adresse geladen. "
-                  "Escape bricht den Download ab; der Vorgang kann später fortgesetzt werden."),
-            TDCBF_YES_BUTTON | TDCBF_NO_BUTTON);
-        if (answer != IDYES) fail("Update canceled before download");
+        if (! headless)
+        {
+            const auto answer = taskDialog(title, L"Update verfügbar",
+                widen("Installiert: " + toString(baseline) + "\nVerfügbar: " + toString(release->version)
+                    + "\n\nDas MSI wird ausschließlich von der festgelegten GitHub-Release-Adresse geladen. "
+                      "Escape bricht den Download ab; der Vorgang kann später fortgesetzt werden."),
+                TDCBF_YES_BUTTON | TDCBF_NO_BUTTON);
+            if (answer != IDYES) fail("Update canceled before download");
+        }
         journal.targetVersion = toString(release->version);
         journal.assetUrl = release->url;
         journal.digest = release->digest;
@@ -2458,11 +3176,12 @@ int worker(const Path& operation, Journal& journal)
     const auto extraction = operation / L"private-temp" / L"administrative-image";
     if (journal.phase == Phase::downloaded)
     {
-        require(taskDialog(title, L"Updatepaket sicher prüfen",
-            L"Das geprüfte MSI wird ohne Installation und ohne Administratorrechte in einen privaten "
-             L"Prüfordner extrahiert. Escape oder Abbrechen beendet diesen Schritt; der Vorgang bleibt fortsetzbar.",
-            TDCBF_OK_BUTTON | TDCBF_CANCEL_BUTTON, TD_WARNING_ICON) == IDOK,
-            "Update canceled before administrative extraction");
+        if (! headless)
+            require(taskDialog(title, L"Updatepaket sicher prüfen",
+                L"Das geprüfte MSI wird ohne Installation und ohne Administratorrechte in einen privaten "
+                 L"Prüfordner extrahiert. Escape oder Abbrechen beendet diesen Schritt; der Vorgang bleibt fortsetzbar.",
+                TDCBF_OK_BUTTON | TDCBF_CANCEL_BUTTON, TD_WARNING_ICON) == IDOK,
+                "Update canceled before administrative extraction");
         administrativeExtract(expectedMsi, journal, extraction);
         const auto extractedBundle = findSingleVst3(extraction);
         const auto fingerprint = fingerprintBundle(extractedBundle, target, packageSigner);
@@ -2492,12 +3211,13 @@ int worker(const Path& operation, Journal& journal)
         {
             require(! systemVersion || isStrictlyNewer(target, *systemVersion),
                     "The system VST3 became newer while this operation was paused; downgrade refused");
-            require(taskDialog(title, L"Geprüftes Update installieren",
-                L"MSI, Herausgeber, Architektur, Installer-Tabellen und die vollständige VST3-Nutzlast "
-                 L"wurden geprüft. Lassen Sie alle DAWs geschlossen und starten Sie jetzt den sichtbaren Windows Installer. "
-                 L"Der Updater beendet keine Programme und fragt niemals selbst nach einem Passwort; nur Windows kann eine UAC-Bestätigung anzeigen.",
-                TDCBF_OK_BUTTON | TDCBF_CANCEL_BUTTON, TD_WARNING_ICON) == IDOK,
-                "Update canceled before installation");
+            if (! headless)
+                require(taskDialog(title, L"Geprüftes Update installieren",
+                    L"MSI, Herausgeber, Architektur, Installer-Tabellen und die vollständige VST3-Nutzlast "
+                     L"wurden geprüft. Lassen Sie alle DAWs geschlossen und starten Sie jetzt den sichtbaren Windows Installer. "
+                     L"Der Updater beendet keine Programme und fragt niemals selbst nach einem Passwort; nur Windows kann eine UAC-Bestätigung anzeigen.",
+                    TDCBF_OK_BUTTON | TDCBF_CANCEL_BUTTON, TD_WARNING_ICON) == IDOK,
+                    "Update canceled before installation");
             const auto result = installMsi(expectedMsi, journal);
             journal.phase = Phase::installed;
             journal.lastError = result == ERROR_SUCCESS_REBOOT_REQUIRED ? "restart-required" : "";
@@ -2515,12 +3235,18 @@ int worker(const Path& operation, Journal& journal)
     journal.phase = Phase::verified;
     writeJournal(operation, journal);
     cleanupVerifiedPayload(operation, journal);
-    taskDialog(title, L"Update installiert und geprüft",
-        journal.lastError == "restart-required"
-            ? L"Die installierte VST3-Nutzlast stimmt vollständig überein. Windows verlangt einen Neustart."
-            : L"Die installierte VST3-Nutzlast stimmt vollständig überein. Starten Sie die DAW neu und führen Sie einen Plugin-Rescan aus.",
-        TDCBF_OK_BUTTON);
+    if (! headless)
+        taskDialog(title, L"Update installiert und geprüft",
+            journal.lastError == "restart-required"
+                ? L"Die installierte VST3-Nutzlast stimmt vollständig überein. Windows verlangt einen Neustart."
+                : L"Die installierte VST3-Nutzlast stimmt vollständig überein. Starten Sie die DAW neu und führen Sie einen Plugin-Rescan aus.",
+            TDCBF_OK_BUTTON);
     return 0;
+}
+
+int worker(const Path& operation, Journal& journal)
+{
+    return worker(operation, journal, std::nullopt);
 }
 }
 
@@ -2528,6 +3254,7 @@ int runWindowsUpdater()
 {
     if (const auto contractStatus = validateBuildContractCommandLine()) return *contractStatus;
     if (kCompileOnly) return 4;
+    const auto releaseGateCommandLine = commandLineRequestsReleaseGate();
     try
     {
         validateConfiguration();
@@ -2535,19 +3262,41 @@ int runWindowsUpdater()
         const auto arguments = invocation();
         const auto self = currentExecutable();
         verifyAuthenticodeCurrentSigner(self);
+        if (arguments.releaseGate)
+            validateReleaseGateAuthorization(*arguments.releaseGate, currentUnixSeconds());
         const auto root = localOperationsRoot();
         const auto selfOperation = copiedUpdaterOperationId(root, self);
         require(! selfOperation || ! arguments.resumeId || *selfOperation == *arguments.resumeId,
                 "Copied updater operation does not match --resume");
+        if (arguments.releaseGate)
+        {
+            if (selfOperation)
+                require(arguments.resumeId.has_value(),
+                        "A copied release-gate updater requires its explicit --resume operation ID");
+            else
+            {
+                require(! arguments.resumeId.has_value(),
+                        "The installed release-gate helper cannot resume an existing operation");
+                require(equalInsensitive(self.wstring(), installedUpdaterPath().wstring()),
+                        "Release gate must start from the exact installed N updater helper");
+                const auto compiledVersion = parseVersion(kInstalledVersion);
+                const auto systemVersion = installedSystemVersion();
+                require(compiledVersion && systemVersion && *systemVersion == *compiledVersion,
+                        "Release gate requires the exact installed N system version");
+            }
+        }
         const auto protectedOperation = selfOperation ? selfOperation : arguments.resumeId;
         std::optional<Handle> protectedOperationLock;
         if (protectedOperation)
             protectedOperationLock.emplace(lockDirectoryAgainstReplacement(
                 root / widen(*protectedOperation), "Current updater operation"));
         ProductMutex mutex;
-        const auto newest = cleanupOldOperations(root, ! arguments.resumeId.has_value());
+        const auto newest = cleanupOldOperations(
+            root, arguments.releaseGate.has_value() || ! arguments.resumeId.has_value());
         const auto id = arguments.resumeId ? *arguments.resumeId
-                                           : prepareOperation(root, newest);
+                      : arguments.releaseGate
+                          ? prepareReleaseGateOperation(root, arguments.releaseGate->identity)
+                          : prepareOperation(root, newest);
         const auto operation = root / widen(id);
         ensureNotReparsePoint(operation, "Updater operation");
         auto operationDirectoryLock = lockDirectoryAgainstReplacement(operation, "Updater operation");
@@ -2560,7 +3309,23 @@ int runWindowsUpdater()
             {
                 require(CopyFileW(self.c_str(), copied.c_str(), TRUE), winError("Cannot copy updater outside VST3"));
             }
-            launchCopiedUpdater(copied, self, id);
+            Handle child;
+            launchCopiedUpdater(copied, self, id, arguments.releaseGate, child);
+            if (arguments.releaseGate)
+            {
+                // The copied child owns the operation from here. Release the
+                // product mutex that the child must acquire, but retain the
+                // share-compatible directory leases so no competing process
+                // can delete this exact operation before the child locks it.
+                mutex.release();
+                const auto wait = WaitForSingleObject(child.get(), INFINITE);
+                require(wait == WAIT_OBJECT_0, winError("Cannot wait for copied release-gate updater"));
+                DWORD exitCode{};
+                require(GetExitCodeProcess(child.get(), &exitCode),
+                        winError("Cannot read copied release-gate updater result"));
+                require(exitCode == 0,
+                        "Copied release-gate updater failed with code " + std::to_string(exitCode));
+            }
             return 0;
         }
 
@@ -2569,10 +3334,26 @@ int runWindowsUpdater()
                                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
         require(operationLock.valid(), "This saved updater operation is already active");
         ensureNotReparsePoint(operation / L"operation.lock", "Updater operation lock");
-        auto journal = readJournal(operation, id, JournalReadPurpose::resume);
+        const auto expectedReleaseGate = arguments.releaseGate
+            ? std::optional<ReleaseGateIdentity>(arguments.releaseGate->identity)
+            : std::nullopt;
+        auto journal = readJournal(operation, id, JournalReadPurpose::resume,
+                                   expectedReleaseGate);
+        std::optional<Handle> releaseGatePipe;
+        if (arguments.releaseGate)
+            releaseGatePipe.emplace(connectReleaseGateResponsePipe(*arguments.releaseGate));
         try
         {
-            return worker(operation, journal);
+            const auto result = arguments.releaseGate
+                ? worker(operation, journal, arguments.releaseGate)
+                : worker(operation, journal);
+            if (arguments.releaseGate)
+            {
+                require(releaseGatePipe && releaseGatePipe->valid(),
+                        "Release-gate response pipe is unavailable");
+                writeReleaseGateReceipt(releaseGatePipe->get(), *arguments.releaseGate, journal);
+            }
+            return result;
         }
         catch (const std::exception& error)
         {
@@ -2583,11 +3364,12 @@ int runWindowsUpdater()
     }
     catch (const std::exception& error)
     {
-        taskDialog(widen(kProduct) + L" Update", L"Update nicht abgeschlossen",
-                   widen(std::string(error.what())
-                       + "\n\nEs wurde kein Erfolg gemeldet. Offline-, Abbruch- und Neustartfälle können "
-                         "über den gespeicherten Vorgang erneut versucht werden."),
-                   TDCBF_OK_BUTTON, TD_ERROR_ICON);
+        if (! releaseGateCommandLine)
+            taskDialog(widen(kProduct) + L" Update", L"Update nicht abgeschlossen",
+                       widen(std::string(error.what())
+                           + "\n\nEs wurde kein Erfolg gemeldet. Offline-, Abbruch- und Neustartfälle können "
+                             "über den gespeicherten Vorgang erneut versucht werden."),
+                       TDCBF_OK_BUTTON, TD_ERROR_ICON);
         return 1;
     }
 }
@@ -2663,6 +3445,32 @@ int runWindowsUpdaterSelfTests()
                                                architectureAssetSuffix(kArchitecture), kUpgradeCode,
                                                kOtherUpgradeCode, kCurrentSignerSha256, "00"),
                 "Build-contract next-signer mutation was accepted");
+        require(! compiledBuildIdentityMatches(kProduct, kInstalledVersion,
+                                               kManufacturer, kOwner, kRepository,
+                                               architectureAssetSuffix(kArchitecture), kUpgradeCode,
+                                               kOtherUpgradeCode, kCurrentSignerSha256,
+                                               kNextSignerSha256, "00",
+                                               kReleaseGateNextPublicKeyXY),
+                "Build-contract release-gate current-key mutation was accepted");
+        require(! compiledBuildIdentityMatches(kProduct, kInstalledVersion,
+                                               kManufacturer, kOwner, kRepository,
+                                               architectureAssetSuffix(kArchitecture), kUpgradeCode,
+                                               kOtherUpgradeCode, kCurrentSignerSha256,
+                                               kNextSignerSha256, kReleaseGatePublicKeyXY, "00"),
+                "Build-contract release-gate next-key mutation was accepted");
+        require(p256PublicKeyIsOnCurve(kReleaseGatePublicKeyXY)
+                    && (kReleaseGateNextPublicKeyXY.empty()
+                        || p256PublicKeyIsOnCurve(kReleaseGateNextPublicKeyXY))
+                    && ! p256PublicKeyIsOnCurve(std::string(128, '0')),
+                "Build-contract release-gate keys did not enforce real P-256 curve points");
+        const auto buildContractResponse = canonicalBuildContractResponse(
+            std::string(64, 'A'), 42);
+        require(buildContractResponse.find("\"schemaVersion\":3") != std::string::npos
+                    && buildContractResponse.find("\"releaseGatePublicKeyXY\":\""
+                        + std::string(kReleaseGatePublicKeyXY) + "\"") != std::string::npos
+                    && buildContractResponse.find("\"releaseGateNextPublicKeyXY\":\""
+                        + std::string(kReleaseGateNextPublicKeyXY) + "\"") != std::string::npos,
+                "Build-contract response does not attest the exact release-gate key pair");
         require(isBuildContractChallenge(
                     "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF")
                     && ! isBuildContractChallenge("predictable"),
@@ -2675,17 +3483,255 @@ int runWindowsUpdaterSelfTests()
                     && ! parseBuildContractProcessId("0")
                     && ! parseBuildContractProcessId("01"),
                 "Build-contract process-ID validation failed");
-        const auto releaseJson = [] (const SemVersion& version, bool draft, bool prerelease)
+        const auto expectFailure = [] (const std::function<void()>& action)
+        {
+            try { action(); }
+            catch (const Failure&) { return true; }
+            return false;
+        };
+        auto gateTarget = *parseVersion(kInstalledVersion);
+        if (gateTarget.patch < 65535)
+            ++gateTarget.patch;
+        else if (gateTarget.minor < 255)
+        {
+            ++gateTarget.minor;
+            gateTarget.patch = 0;
+        }
+        else
+        {
+            require(gateTarget.major < 255, "Test helper version leaves no valid newer MSI version");
+            ++gateTarget.major;
+            gateTarget.minor = 0;
+            gateTarget.patch = 0;
+        }
+        const auto gateTag = "v" + toString(gateTarget);
+        const std::string gateChallenge(64, 'A');
+        const std::string gatePipe = std::string(kReleaseGatePipePrefix)
+            + "0123456789ABCDEF0123456789ABCDEF";
+        const std::string gateCommit = "0123456789abcdef0123456789abcdef01234567";
+        constexpr std::uint64_t gateParentCreatedAt = 133444736000000000;
+        constexpr std::uint64_t gateNow = 1700000000;
+        constexpr std::uint64_t gateExpiresAt = gateNow + 300;
+        const ReleaseGateAuthorizationFields gateAuthorization {
+            std::string(kOwner), std::string(kRepository), std::string(kProduct),
+            kArchitecture, *parseVersion(kInstalledVersion), 123456789, gateTag,
+            gateCommit, gateChallenge, gatePipe, 42, gateParentCreatedAt,
+            gateExpiresAt
+        };
+        const auto gateSignature = signReleaseGateAuthorizationForTest(
+            gateAuthorization, kReleaseGatePublicKeyXY,
+            "0000000000000000000000000000000000000000000000000000000000000001");
+        const std::vector<std::string> gateArguments {
+            "--release-gate",
+            "--challenge", gateChallenge,
+            "--response-pipe", gatePipe,
+            "--parent-process-id", "42",
+            "--release-id", "123456789",
+            "--tag", gateTag,
+            "--source-commit", gateCommit,
+            "--parent-process-created-at-filetime", std::to_string(gateParentCreatedAt),
+            "--expires-at-unix-seconds", std::to_string(gateExpiresAt),
+            "--authorization-signature-p1363", gateSignature
+        };
+        const auto parsedGateInvocation = parseInvocationArguments(gateArguments);
+        require(! parsedGateInvocation.resumeId && parsedGateInvocation.releaseGate
+                    && parsedGateInvocation.releaseGate->challenge == gateChallenge
+                    && parsedGateInvocation.releaseGate->responsePipe == gatePipe
+                    && parsedGateInvocation.releaseGate->parentProcessId == 42
+                    && parsedGateInvocation.releaseGate->parentProcessCreatedAtFiletime
+                        == gateParentCreatedAt
+                    && parsedGateInvocation.releaseGate->expiresAtUnixSeconds == gateExpiresAt
+                    && parsedGateInvocation.releaseGate->authorizationSignatureP1363
+                        == gateSignature
+                    && parsedGateInvocation.releaseGate->identity.releaseId == 123456789
+                    && parsedGateInvocation.releaseGate->identity.tag == gateTag
+                    && parsedGateInvocation.releaseGate->identity.sourceCommit == gateCommit,
+                "Canonical initial release-gate command line was not parsed exactly");
+        validateReleaseGateAuthorization(*parsedGateInvocation.releaseGate, gateNow);
+        auto gateResumeArguments = std::vector<std::string> {
+            "--resume", "01234567-89AB-CDEF-0123-456789ABCDEF"
+        };
+        gateResumeArguments.insert(gateResumeArguments.end(), gateArguments.begin(), gateArguments.end());
+        const auto parsedGateResume = parseInvocationArguments(gateResumeArguments);
+        require(parsedGateResume.resumeId == "01234567-89AB-CDEF-0123-456789ABCDEF"
+                    && parsedGateResume.releaseGate
+                    && parsedGateResume.releaseGate->identity
+                        == parsedGateInvocation.releaseGate->identity
+                    && parsedGateResume.releaseGate->challenge
+                        == parsedGateInvocation.releaseGate->challenge
+                    && parsedGateResume.releaseGate->responsePipe
+                        == parsedGateInvocation.releaseGate->responsePipe
+                    && parsedGateResume.releaseGate->parentProcessId
+                        == parsedGateInvocation.releaseGate->parentProcessId
+                    && parsedGateResume.releaseGate->parentProcessCreatedAtFiletime
+                        == parsedGateInvocation.releaseGate->parentProcessCreatedAtFiletime
+                    && parsedGateResume.releaseGate->expiresAtUnixSeconds
+                        == parsedGateInvocation.releaseGate->expiresAtUnixSeconds
+                    && parsedGateResume.releaseGate->authorizationSignatureP1363
+                        == parsedGateInvocation.releaseGate->authorizationSignatureP1363,
+                "Canonical release-gate resume command line did not preserve every authorization field");
+        require(! parseInvocationArguments({}).resumeId
+                    && ! parseInvocationArguments({}).releaseGate
+                    && parseInvocationArguments({ "--resume",
+                         "01234567-89AB-CDEF-0123-456789ABCDEF" }).resumeId.has_value(),
+                "Normal stable invocation forms changed");
+        auto mutatedGateArguments = gateArguments;
+        mutatedGateArguments[3] = "--parent-process-id";
+        require(expectFailure([&] { (void) parseInvocationArguments(mutatedGateArguments); }),
+                "Reordered release-gate fields were accepted");
+        mutatedGateArguments = gateArguments;
+        mutatedGateArguments[2] = "short";
+        require(expectFailure([&] { (void) parseInvocationArguments(mutatedGateArguments); }),
+                "Malformed release-gate challenge was accepted");
+        mutatedGateArguments = gateArguments;
+        mutatedGateArguments[2] = std::string(64, 'a');
+        require(expectFailure([&] { (void) parseInvocationArguments(mutatedGateArguments); }),
+                "Non-canonical lowercase release-gate challenge was accepted");
+        mutatedGateArguments = gateArguments;
+        mutatedGateArguments[4].back() = 'a';
+        require(expectFailure([&] { (void) parseInvocationArguments(mutatedGateArguments); }),
+                "Non-canonical lowercase release-gate pipe token was accepted");
+        mutatedGateArguments = gateArguments;
+        mutatedGateArguments[6] = "01";
+        require(expectFailure([&] { (void) parseInvocationArguments(mutatedGateArguments); }),
+                "Non-canonical release-gate parent process ID was accepted");
+        mutatedGateArguments = gateArguments;
+        mutatedGateArguments[8] = "01";
+        require(expectFailure([&] { (void) parseInvocationArguments(mutatedGateArguments); }),
+                "Non-canonical release-gate release ID was accepted");
+        mutatedGateArguments = gateArguments;
+        mutatedGateArguments[10] = std::string(kInstalledVersion).insert(0, "v");
+        require(expectFailure([&] { (void) parseInvocationArguments(mutatedGateArguments); }),
+                "Non-newer release-gate tag was accepted");
+        mutatedGateArguments = gateArguments;
+        mutatedGateArguments[12] = std::string(40, 'g');
+        require(expectFailure([&] { (void) parseInvocationArguments(mutatedGateArguments); }),
+                "Malformed release-gate source commit was accepted");
+        mutatedGateArguments = gateArguments;
+        mutatedGateArguments[12][0] = 'A';
+        require(expectFailure([&] { (void) parseInvocationArguments(mutatedGateArguments); }),
+                "Non-canonical uppercase release-gate source commit was accepted");
+        mutatedGateArguments = gateArguments;
+        mutatedGateArguments[14] = "01";
+        require(expectFailure([&] { (void) parseInvocationArguments(mutatedGateArguments); }),
+                "Non-canonical parent creation FILETIME was accepted");
+        mutatedGateArguments = gateArguments;
+        mutatedGateArguments[16] = "01";
+        require(expectFailure([&] { (void) parseInvocationArguments(mutatedGateArguments); }),
+                "Non-canonical release-gate expiry was accepted");
+        mutatedGateArguments = gateArguments;
+        mutatedGateArguments[18] = gateSignature.substr(2);
+        require(expectFailure([&] { (void) parseInvocationArguments(mutatedGateArguments); }),
+                "Truncated release-gate P1363 signature was accepted");
+        mutatedGateArguments = gateArguments;
+        mutatedGateArguments[18] = lowerAscii(gateSignature);
+        require(expectFailure([&] { (void) parseInvocationArguments(mutatedGateArguments); }),
+                "Lowercase release-gate P1363 signature was accepted");
+        mutatedGateArguments = gateArguments;
+        mutatedGateArguments[18] = correspondingHighSTestSignature(gateSignature);
+        require(expectFailure([&] { (void) parseInvocationArguments(mutatedGateArguments); }),
+                "Malleated high-S release-gate P1363 signature was accepted");
+        mutatedGateArguments = gateArguments;
+        mutatedGateArguments.insert(mutatedGateArguments.end(), { "--github-owner", "attacker" });
+        require(expectFailure([&] { (void) parseInvocationArguments(mutatedGateArguments); }),
+                "Release-gate repository override was accepted");
+        require(isReleaseGatePipeName(gatePipe)
+                    && ! isReleaseGatePipeName("WhykikiAudio.UpdaterReleaseGate.short")
+                    && ! isReleaseGatePipeName("\\\\.\\pipe\\WhykikiAudio.UpdaterReleaseGate.0123456789ABCDEF0123456789ABCDEF"),
+                "Release-gate pipe-name validation failed");
+        require(expectFailure([&]
+                {
+                    validateReleaseGateAuthorization(*parsedGateInvocation.releaseGate,
+                                                     gateNow - 1);
+                })
+                    && expectFailure([&]
+                {
+                    validateReleaseGateAuthorization(*parsedGateInvocation.releaseGate,
+                                                     gateExpiresAt);
+                }),
+                "Release-gate authorization accepted a lifetime beyond five minutes or an expired token");
+        auto nextKeyGate = *parsedGateInvocation.releaseGate;
+        nextKeyGate.authorizationSignatureP1363 = signReleaseGateAuthorizationForTest(
+            releaseGateAuthorizationFields(nextKeyGate), kReleaseGateNextPublicKeyXY,
+            "0000000000000000000000000000000000000000000000000000000000000002");
+        validateReleaseGateAuthorization(nextKeyGate, gateNow);
+
+        const auto requireSignedFieldMutationRejected = [&] (ReleaseGateInvocation mutation)
+        {
+            require(expectFailure([&]
+                    {
+                        validateReleaseGateAuthorization(mutation, gateNow);
+                    }),
+                    "Mutation of a signed release-gate field retained authorization");
+        };
+        auto mutatedGate = *parsedGateInvocation.releaseGate;
+        ++mutatedGate.identity.releaseId;
+        requireSignedFieldMutationRejected(mutatedGate);
+        mutatedGate = *parsedGateInvocation.releaseGate;
+        mutatedGate.identity.tag = "v1.4.2";
+        requireSignedFieldMutationRejected(mutatedGate);
+        mutatedGate = *parsedGateInvocation.releaseGate;
+        mutatedGate.identity.sourceCommit = std::string(40, 'f');
+        requireSignedFieldMutationRejected(mutatedGate);
+        mutatedGate = *parsedGateInvocation.releaseGate;
+        mutatedGate.challenge = std::string(64, 'B');
+        requireSignedFieldMutationRejected(mutatedGate);
+        mutatedGate = *parsedGateInvocation.releaseGate;
+        mutatedGate.responsePipe = std::string(kReleaseGatePipePrefix)
+            + "FEDCBA9876543210FEDCBA9876543210";
+        requireSignedFieldMutationRejected(mutatedGate);
+        mutatedGate = *parsedGateInvocation.releaseGate;
+        ++mutatedGate.parentProcessId;
+        requireSignedFieldMutationRejected(mutatedGate);
+        mutatedGate = *parsedGateInvocation.releaseGate;
+        ++mutatedGate.parentProcessCreatedAtFiletime;
+        requireSignedFieldMutationRejected(mutatedGate);
+        mutatedGate = *parsedGateInvocation.releaseGate;
+        --mutatedGate.expiresAtUnixSeconds;
+        requireSignedFieldMutationRejected(mutatedGate);
+        mutatedGate = *parsedGateInvocation.releaseGate;
+        mutatedGate.authorizationSignatureP1363[0] =
+            mutatedGate.authorizationSignatureP1363[0] == '0' ? '1' : '0';
+        requireSignedFieldMutationRejected(mutatedGate);
+        const auto releaseJson = [] (const SemVersion& version, bool draft, bool prerelease,
+                                     std::string_view immutableJson = "true")
         {
             const auto tag = "v" + toString(version);
             const auto name = expectedAssetName(kProduct, version, kArchitecture);
             const auto url = expectedAssetUrl(kOwner, kRepository, kProduct, version, kArchitecture);
             return std::string("{\"draft\":") + (draft ? "true" : "false")
                 + ",\"prerelease\":" + (prerelease ? "true" : "false")
+                + (immutableJson.empty()
+                    ? std::string()
+                    : ",\"immutable\":" + std::string(immutableJson))
                 + ",\"tag_name\":\"" + tag + "\",\"html_url\":\"https://github.com/"
                 + std::string(kOwner) + "/" + std::string(kRepository) + "/releases/tag/" + tag
                 + "\",\"assets\":[{\"name\":\"" + name
                 + "\",\"state\":\"uploaded\",\"browser_download_url\":\"" + url
+                + "\",\"digest\":\"sha256:" + std::string(64, 'A') + "\",\"size\":42}]}";
+        };
+        const auto gateReleaseJson = [&] (std::uint64_t releaseId,
+                                          bool draft,
+                                          bool prerelease,
+                                          bool immutable,
+                                          std::string_view tag,
+                                          std::string_view sourceCommit,
+                                          std::string_view assetUrl)
+        {
+            const auto version = parseStableTag(tag);
+            require(version.has_value(), "Release-gate JSON test tag is invalid");
+            const auto name = expectedAssetName(kProduct, *version, kArchitecture);
+            return std::string("{\"id\":") + std::to_string(releaseId)
+                + ",\"draft\":" + (draft ? "true" : "false")
+                + ",\"prerelease\":" + (prerelease ? "true" : "false")
+                + ",\"immutable\":" + (immutable ? "true" : "false")
+                + ",\"tag_name\":\"" + std::string(tag)
+                + "\",\"target_commitish\":\"" + std::string(sourceCommit)
+                + "\",\"html_url\":\"https://github.com/" + std::string(kOwner)
+                + "/" + std::string(kRepository) + "/releases/tag/" + std::string(tag)
+                + "\",\"assets\":[{\"name\":\"" + name
+                + "\",\"state\":\"uploaded\",\"browser_download_url\":\""
+                + std::string(assetUrl)
                 + "\",\"digest\":\"sha256:" + std::string(64, 'A') + "\",\"size\":42}]}";
         };
         const auto baseline = *parseVersion("1.0.0");
@@ -2697,11 +3743,93 @@ int runWindowsUpdaterSelfTests()
             baseline);
         require(nextRelease && nextRelease->version == *parseVersion("1.1.0"),
                 "Bounded release history did not select the smallest stable newer version");
+        const auto nextStableVersion = *parseVersion("1.1.0");
+        for (const auto malformedImmutable : {
+                 std::string_view {}, std::string_view { "false" },
+                 std::string_view { "\"true\"" } })
+            require(expectFailure([&]
+                    {
+                        (void) parseNextRelease(
+                            "[" + releaseJson(nextStableVersion, false, false,
+                                               malformedImmutable) + "]",
+                            baseline);
+                    }),
+                    "Newer stable release with missing, false, or non-boolean immutable was accepted");
+        const auto stableAfterLegacyMutable = parseNextRelease(
+            "[" + releaseJson(baseline, false, false, "false") + ","
+                + releaseJson(nextStableVersion, false, false) + "]",
+            baseline);
+        require(stableAfterLegacyMutable
+                    && stableAfterLegacyMutable->version == nextStableVersion,
+                "Legacy non-newer mutable history blocked a newer immutable stable release");
+        const ReleaseGateIdentity gateIdentity { 123456789, gateTag, gateCommit };
+        const auto canonicalGateAssetUrl = expectedAssetUrl(
+            kOwner, kRepository, kProduct, gateTarget, kArchitecture);
+        const auto canonicalGateJson = gateReleaseJson(
+            gateIdentity.releaseId, false, true, true, gateIdentity.tag,
+            gateIdentity.sourceCommit, canonicalGateAssetUrl);
+        const auto parsedGateRelease = parseReleaseGateCandidate(
+            canonicalGateJson, *parseVersion(kInstalledVersion), gateIdentity);
+        require(parsedGateRelease.version == gateTarget
+                    && parsedGateRelease.url == canonicalGateAssetUrl
+                    && parsedGateRelease.digest == std::string(64, 'A')
+                    && parsedGateRelease.size == 42,
+                "Canonical immutable prerelease was not accepted by the exact-ID release gate");
+        require(expectFailure([&]
+                {
+                    (void) parseReleaseGateCandidate(
+                        gateReleaseJson(gateIdentity.releaseId + 1, false, true, true,
+                                        gateIdentity.tag, gateIdentity.sourceCommit,
+                                        canonicalGateAssetUrl),
+                        *parseVersion(kInstalledVersion), gateIdentity);
+                }),
+                "Different release ID was accepted by the release gate");
+        for (const auto flags : { std::array { true, true, true },
+                                  std::array { false, false, true },
+                                  std::array { false, true, false } })
+            require(expectFailure([&]
+                    {
+                        (void) parseReleaseGateCandidate(
+                            gateReleaseJson(gateIdentity.releaseId, flags[0], flags[1], flags[2],
+                                            gateIdentity.tag, gateIdentity.sourceCommit,
+                                            canonicalGateAssetUrl),
+                            *parseVersion(kInstalledVersion), gateIdentity);
+                    }),
+                    "Wrong draft/prerelease/immutable state was accepted by the release gate");
+        require(expectFailure([&]
+                {
+                    (void) parseReleaseGateCandidate(
+                        gateReleaseJson(gateIdentity.releaseId, false, true, true,
+                                        gateIdentity.tag, std::string(40, 'f'),
+                                        canonicalGateAssetUrl),
+                        *parseVersion(kInstalledVersion), gateIdentity);
+                }),
+                "Different source commit was accepted by the release gate");
+        require(expectFailure([&]
+                {
+                    (void) parseReleaseGateCandidate(
+                        gateReleaseJson(gateIdentity.releaseId, false, true, true,
+                                        gateIdentity.tag, gateIdentity.sourceCommit,
+                                        "https://github.com/TheWhykiki/Other/releases/download/v1.0.0/a.msi"),
+                        *parseVersion(kInstalledVersion), gateIdentity);
+                }),
+                "Non-canonical release-gate asset URL was accepted");
+        const auto stableBesideGate = parseNextRelease(
+            "[" + canonicalGateJson + ","
+                + releaseJson(gateTarget, false, false) + "]",
+            *parseVersion(kInstalledVersion));
+        require(stableBesideGate && stableBesideGate->version == gateTarget,
+                "Normal update selection consumed or was confused by the release-gate prerelease");
         require(! parseNextRelease(
                     "[" + releaseJson(baseline, false, false) + ","
                         + releaseJson(*parseVersion("9.0.0"), true, false) + "]",
                     baseline),
                 "Old, draft, or prerelease records produced an update candidate");
+        require(std::wstring_view(kGithubApiHeaders).find(L"X-GitHub-Api-Version: 2026-03-10\r\n")
+                    != std::wstring_view::npos
+                    && std::wstring_view(kGithubApiHeaders).find(L"2022-11-28")
+                        == std::wstring_view::npos,
+                "GitHub REST API header does not pin the immutable-release schema version");
         bool duplicateTagDenied{};
         try
         {
@@ -2759,6 +3887,26 @@ int runWindowsUpdaterSelfTests()
                     == std::string(kProduct) + "-2.3.4-Windows-"
                        + architectureAssetSuffix(kArchitecture) + ".msi",
                 "Architecture asset contract failed");
+        Journal receiptJournal;
+        receiptJournal.mode = OperationMode::releaseGate;
+        receiptJournal.releaseGate = gateIdentity;
+        receiptJournal.phase = Phase::verified;
+        receiptJournal.targetVersion = toString(gateTarget);
+        receiptJournal.digest = std::string(64, 'B');
+        const auto receipt = canonicalReleaseGateReceipt(
+            *parsedGateInvocation.releaseGate, receiptJournal);
+        const auto expectedReceipt = std::string("{\"schema\":\"")
+            + std::string(kReleaseGateSchema)
+            + "\",\"schemaVersion\":1,\"challenge\":\"" + std::string(64, 'A')
+            + "\",\"serverProcessId\":42,\"product\":\"" + std::string(kProduct)
+            + "\",\"installedVersion\":\"" + std::string(kInstalledVersion)
+            + "\",\"targetVersion\":\"" + toString(gateTarget)
+            + "\",\"architecture\":\"" + architectureAssetSuffix(kArchitecture)
+            + "\",\"releaseId\":123456789,\"sourceCommit\":\"" + gateCommit
+            + "\",\"msiSha256\":\"" + std::string(64, 'B')
+            + "\",\"phase\":\"verified\"}\n";
+        require(receipt == expectedReceipt,
+                "Release-gate receipt is not the canonical challenge/version/architecture/release/commit/digest attestation");
 
         wchar_t temporaryBuffer[MAX_PATH + 1]{};
         const auto length = GetTempPathW(static_cast<DWORD>(std::size(temporaryBuffer)), temporaryBuffer);
@@ -2771,6 +3919,77 @@ int runWindowsUpdaterSelfTests()
         {
             (void) deleteChild(temporaryRoot, cleanupRoot.filename().wstring());
         } };
+
+        const auto gateJournalId = newOperationId();
+        const auto gateJournalOperation = cleanupRoot / widen(gateJournalId);
+        createPrivateDirectory(gateJournalOperation, true);
+        Journal gateJournal;
+        gateJournal.operationId = gateJournalId;
+        gateJournal.mode = OperationMode::releaseGate;
+        gateJournal.releaseGate = gateIdentity;
+        writeJournal(gateJournalOperation, gateJournal);
+        const auto gateJournalText = fileUtf8(gateJournalOperation / L"journal.json", 64u * 1024u);
+        require(gateJournalText.find("\"operationMode\": \"release-gate\"") != std::string::npos
+                    && gateJournalText.find("\"releaseId\": \"123456789\"") != std::string::npos
+                    && gateJournalText.find("\"challenge\"") == std::string::npos
+                    && gateJournalText.find(gateChallenge) == std::string::npos
+                    && gateJournalText.find(gatePipe) == std::string::npos
+                    && gateJournalText.find(gateSignature) == std::string::npos
+                    && gateJournalText.find("\"parentProcessId\"") == std::string::npos
+                    && gateJournalText.find("\"parentProcessCreatedAtFiletime\"") == std::string::npos
+                    && gateJournalText.find("\"expiresAtUnixSeconds\"") == std::string::npos
+                    && gateJournalText.find("\"authorizationSignatureP1363\"") == std::string::npos,
+                "Release-gate journal persisted transport secrets or omitted its non-secret identity");
+        require(readJournal(gateJournalOperation, gateJournalId,
+                            JournalReadPurpose::resume, gateIdentity).releaseGate == gateIdentity,
+                "Fresh matching release-gate journal could not be consumed by its copied child");
+        gateJournal.phase = Phase::verified;
+        gateJournal.targetVersion = toString(gateTarget);
+        gateJournal.assetUrl = canonicalGateAssetUrl;
+        gateJournal.digest = std::string(64, 'A');
+        gateJournal.size = 42;
+        writeJournal(gateJournalOperation, gateJournal);
+        require(expectFailure([&]
+                {
+                    (void) readJournal(gateJournalOperation, gateJournalId,
+                                       JournalReadPurpose::resume, gateIdentity);
+                }),
+                "Persisted verified release-gate journal was replayable as a fresh acceptance");
+        gateJournal.phase = Phase::created;
+        gateJournal.targetVersion.clear();
+        gateJournal.assetUrl.clear();
+        gateJournal.digest.clear();
+        gateJournal.size = 0;
+        writeJournal(gateJournalOperation, gateJournal);
+        require(expectFailure([&]
+                {
+                    (void) readJournal(gateJournalOperation, gateJournalId,
+                                       JournalReadPurpose::resume);
+                }),
+                "Normal resume accepted a release-gate journal");
+        auto mutatedGateIdentity = gateIdentity;
+        ++mutatedGateIdentity.releaseId;
+        require(expectFailure([&]
+                {
+                    (void) readJournal(gateJournalOperation, gateJournalId,
+                                       JournalReadPurpose::resume, mutatedGateIdentity);
+                }),
+                "Release-gate resume accepted a mutated release identity");
+        const auto normalJournalId = newOperationId();
+        const auto normalJournalOperation = cleanupRoot / widen(normalJournalId);
+        createPrivateDirectory(normalJournalOperation, true);
+        Journal normalJournal;
+        normalJournal.operationId = normalJournalId;
+        writeJournal(normalJournalOperation, normalJournal);
+        require(expectFailure([&]
+                {
+                    (void) readJournal(normalJournalOperation, normalJournalId,
+                                       JournalReadPurpose::resume, gateIdentity);
+                }),
+                "Release-gate resume accepted a normal stable journal");
+        require(deleteChild(cleanupRoot, gateJournalOperation.filename().wstring())
+                    && deleteChild(cleanupRoot, normalJournalOperation.filename().wstring()),
+                "Cannot remove release-gate journal-isolation fixtures");
 
         const auto makeOperation = [&] (Phase phase, int ageMinutes)
         {
