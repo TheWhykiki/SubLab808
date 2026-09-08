@@ -698,9 +698,8 @@ private:
         std::fputs("NATIVE_APP_LOOP_STOP_READY_BEGIN\n", stderr);
         std::fflush(stderr);
         // Stable readiness is established on timer turns. The final turn arms
-        // an independent watchdog and retires this recurring timer before
-        // AppKit retrieves the two control events, so it can no longer keep
-        // feeding JUCE's shared common-mode queue source.
+        // an independent watchdog and retires this recurring timer before the
+        // bridge starts its bounded native-event wake and queues SETTLE.
         startTimer(10);
     }
 
@@ -737,9 +736,9 @@ private:
         }
         std::fputs("NATIVE_APP_LOOP_RETURN_WATCHDOG_ARMED\n", stderr);
         std::fflush(stderr);
-        // Retire the recurring timer before enqueuing SETTLE. stopTimer() is
-        // synchronous and supported from inside this callback; postEvent:
-        // cannot dispatch re-entrantly.
+        // Retire the recurring timer before arming the native-event wake and
+        // enqueuing SETTLE. stopTimer() is synchronous and supported from
+        // inside this callback; neither operation dispatches re-entrantly.
         stopTimer();
         std::fputs("NATIVE_APP_LOOP_SETTLE_BEGIN\n", stderr);
         nativeApplicationSettleEventPosted = NativeFilePanel::postApplicationSettleEvent();

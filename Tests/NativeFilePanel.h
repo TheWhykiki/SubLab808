@@ -13,8 +13,8 @@ public:
     static void prepareTestApplication(ApplicationStopCallback);
     [[nodiscard]] static bool applicationIsRunning() noexcept;
     // Private START/SETTLE events prove that NSApplication is dispatching.
-    // A valid SETTLE handler posts STOP; that subsequent real event calls
-    // stop: while the app is running and has no modal window.
+    // A bounded periodic wake keeps native event acquisition live from SETTLE
+    // through STOP; STOP retires that wake before calling stop:.
     [[nodiscard]] static bool postApplicationStartEvent() noexcept;
     [[nodiscard]] static bool applicationStartEventWasHandled() noexcept;
     [[nodiscard]] static bool applicationIsReadyForSettleEvent() noexcept;

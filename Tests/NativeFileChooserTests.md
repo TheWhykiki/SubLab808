@@ -70,13 +70,18 @@ main loop, shutdown first requires three consecutive timer turns while `NSApplic
 is running without an AppKit modal window. On that final ready turn the coordinator arms
 an independent GCD watchdog, stops the recurring 10 ms timer, and posts one private
 prioritized SETTLE event at the front of AppKit's queue. Stopping the recurring timer
-prevents further timer messages from keeping JUCE's shared common-mode queue source ready
-and starving the queued event. The local monitor must confirm that AppKit
-retrieved this exact SETTLE event while the application was running without a modal window.
-Only then does that handler post prioritized STOP before consuming SETTLE.
+prevents further coordinator-timer messages. Since `postEvent:` does not itself guarantee
+that a waiting `nextEventMatchingMask:` revisits AppKit's queue, the bridge starts one
+bounded, test-owned AppKit periodic-event stream before posting SETTLE. The periodic events
+are a wake stimulus only and are not counted as dispatch proof. The local monitor must confirm
+that AppKit retrieved the exact SETTLE event while the application was running without a
+modal window. Only then does that handler post prioritized STOP before consuming SETTLE,
+while the wake stream remains active.
 `postEvent:` is asynchronous, so STOP can be retrieved only as a subsequent, distinct
-AppKit event; its monitor validates the same context and invokes JUCE's stop request from
-that real event-handler boundary. START, SETTLE and STOP must each be handled exactly once.
+AppKit event. Its monitor validates the same context, stops the test-owned periodic stream,
+and only then invokes JUCE's stop request from that real event-handler boundary; this leaves
+JUCE free to start its own periodic wake for `NSApplication.stop`. START, SETTLE and STOP
+must each be handled exactly once.
 An atomic return acknowledgement lets the independent GCD watchdog require SETTLE delivery,
 STOP delivery and `[NSApp run]` return to complete within five seconds.
 The coordinator destructor retains an idempotent timer stop, and the harness retires JUCE's
