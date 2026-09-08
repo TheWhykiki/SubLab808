@@ -38,6 +38,8 @@ using BeginWithCompletionHandler = void (*)(id, SEL, CompletionHandler);
 
 BeginWithCompletionHandler originalBeginWithCompletionHandler = nullptr;
 NSMutableSet* activeCompletionObservations = nil;
+id applicationDidFinishLaunchingObserver = nil;
+bool testApplicationDidFinishLaunching = false;
 NSUInteger globalLateCompletionEntryCount = 0;
 char completionObservationKey;
 
@@ -299,13 +301,33 @@ bool NativeFilePanel::isAlive() const
 void NativeFilePanel::prepareTestApplication()
 {
     // ScopedJuceInitialiser_GUI in a console test does not provide an active
-    // regular app. Create one here; the suite's single top-level
-    // MessageManager/NSApplication loop completes the normal launch sequence.
+    // regular app. Create and configure one here; the coordinator independently
+    // waits for the top-level NSApplication event loop before touching the UI.
     @autoreleasepool
     {
         if (![NSThread isMainThread])
             throw std::runtime_error("NATIVE_PANEL_SETUP: native chooser tests require the main thread");
         [NSApplication sharedApplication];
+        if ([NSApp isRunning])
+            throw std::runtime_error("NATIVE_PANEL_SETUP: launch observer must be installed before the app loop");
+
+        if (applicationDidFinishLaunchingObserver == nil)
+        {
+            testApplicationDidFinishLaunching = false;
+            applicationDidFinishLaunchingObserver =
+                [[NSNotificationCenter defaultCenter]
+                    addObserverForName:NSApplicationDidFinishLaunchingNotification
+                                object:NSApp
+                                 queue:nil
+                            usingBlock:^(NSNotification*)
+                            {
+                                if ([NSThread isMainThread])
+                                    testApplicationDidFinishLaunching = true;
+                            }];
+            if (applicationDidFinishLaunchingObserver == nil)
+                throw std::runtime_error("NATIVE_PANEL_SETUP: cannot observe application launch completion");
+        }
+
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         if ([NSApp activationPolicy] != NSApplicationActivationPolicyRegular)
             throw std::runtime_error("NATIVE_PANEL_SETUP: test application cannot become a regular GUI process");
@@ -338,6 +360,20 @@ void NativeFilePanel::prepareTestApplication()
             if (displaced != original)
                 throw std::runtime_error("NATIVE_PANEL_SETUP: native panel completion observer changed concurrently");
         }
+    }
+}
+bool NativeFilePanel::applicationHasFinishedLaunching() noexcept
+{
+    @autoreleasepool
+    {
+        return [NSThread isMainThread] && testApplicationDidFinishLaunching;
+    }
+}
+bool NativeFilePanel::applicationIsRunning() noexcept
+{
+    @autoreleasepool
+    {
+        return [NSThread isMainThread] && NSApp != nil && [NSApp isRunning];
     }
 }
 bool NativeFilePanel::postApplicationStopWakeEvent() noexcept

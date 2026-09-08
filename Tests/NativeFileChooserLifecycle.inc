@@ -56,10 +56,13 @@ struct NativeChooserCaseState
 };
 
 bool nativeApplicationStopWakePosted = false;
+bool nativeApplicationWasRunningAtStop = false;
 
 void stopNativeChooserApplicationLoop() noexcept
 {
-    std::fputs("NATIVE_APP_LOOP_STOP_BEGIN\n", stderr);
+    nativeApplicationWasRunningAtStop = NativeFilePanel::applicationIsRunning();
+    std::fprintf(stderr, "NATIVE_APP_LOOP_STOP_BEGIN running=%d\n",
+                 nativeApplicationWasRunningAtStop ? 1 : 0);
     auto* messageManager = juce::MessageManager::getInstanceWithoutCreating();
     if (messageManager == nullptr)
     {
@@ -106,10 +109,9 @@ public:
     {
         require(juce::MessageManager::getInstance()->isThisTheMessageThread(),
                 "native chooser coordinator starts on the message thread");
-        // Finish through the coordinator before CTest's 60/480-second hard
-        // process watchdog so failures retain their case and phase diagnostics.
-        runDeadline = now() + (cases.size() == 1 ? 45000.0 : 450000.0);
-        enter(Phase::createCase);
+        // NSApplication::run performs launch work before normal event dispatch,
+        // and that work may service Timer sources. timerCallback gates the first
+        // phase and deadline on both DidFinishLaunching and isRunning.
         startTimer(10);
     }
 
@@ -183,6 +185,17 @@ private:
     {
         try
         {
+            if (! applicationLoopStarted)
+            {
+                if (! NativeFilePanel::applicationHasFinishedLaunching()
+                    || ! NativeFilePanel::applicationIsRunning()) return;
+                applicationLoopStarted = true;
+                // Finish through the coordinator before CTest's 60/480-second
+                // process watchdog so failures retain case/phase diagnostics.
+                runDeadline = now() + (cases.size() == 1 ? 45000.0 : 450000.0);
+                enter(Phase::createCase);
+                std::fputs("NATIVE_APP_LOOP_ACTIVE launched=1 running=1\n", stderr);
+            }
             if (failure.empty()) auditRetiredCases();
             if (failure.empty() && runDeadline > 0.0 && now() >= runDeadline)
                 throw std::runtime_error(
@@ -669,6 +682,7 @@ private:
     std::string lastNativeClass;
     std::size_t lastLateCompletionEntries = 0;
     bool completed = false;
+    bool applicationLoopStarted = false;
     std::string failure;
 };
 
@@ -682,6 +696,7 @@ int runNativeFileChooserLifecycles(const juce::File& root, const juce::String& r
             "native chooser platform implementation is available");
     NativeFilePanel::prepareTestApplication();
     nativeApplicationStopWakePosted = false;
+    nativeApplicationWasRunningAtStop = false;
     nativeFileChooserHarnessEnabled = true;
     NativeChooserCoordinator coordinator(root, requestedCase);
     coordinator.start();
@@ -690,6 +705,8 @@ int runNativeFileChooserLifecycles(const juce::File& root, const juce::String& r
     std::fputs("NATIVE_APP_LOOP_RETURN\n", stderr);
     nativeFileChooserHarnessEnabled = false;
     require(coordinator.completedNormally(), "native chooser application loop stopped before completion");
+    require(nativeApplicationWasRunningAtStop,
+            "native chooser requested shutdown before the AppKit event loop was running");
     require(nativeApplicationStopWakePosted,
             "native chooser application loop stopped without its AppKit wake event");
     if (! coordinator.failureMessage().empty())

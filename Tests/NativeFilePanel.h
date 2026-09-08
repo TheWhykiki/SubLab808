@@ -10,6 +10,8 @@ class NativeFilePanel final
 {
 public:
     static void prepareTestApplication();
+    [[nodiscard]] static bool applicationHasFinishedLaunching() noexcept;
+    [[nodiscard]] static bool applicationIsRunning() noexcept;
     // NSApplication only observes stop: after dispatching a real NSEvent. The
     // native suite finishes from a JUCE Timer, so it must enqueue one wake event.
     [[nodiscard]] static bool postApplicationStopWakeEvent() noexcept;
