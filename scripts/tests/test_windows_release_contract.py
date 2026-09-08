@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import pathlib
 import re
 import shutil
@@ -773,15 +774,19 @@ class WindowsReleaseContractTests(unittest.TestCase):
     def test_transition_gate_has_no_powershell_parser_errors(self) -> None:
         script = ROOT / "scripts" / "test-windows-updater-transition.ps1"
         command = (
+            "$path=$env:WK_TRANSITION_SCRIPT_PATH;"
+            "if([string]::IsNullOrWhiteSpace($path)){"
+            "[Console]::Error.WriteLine('transition script path is missing');exit 2};"
             "$tokens=$null;$errors=$null;"
             "[System.Management.Automation.Language.Parser]::ParseFile("
-            "$args[0],[ref]$tokens,[ref]$errors)>$null;"
+            "$path,[ref]$tokens,[ref]$errors)>$null;"
             "if($errors.Count){$errors|ForEach-Object{[Console]::Error.WriteLine($_)};exit 1}"
         )
         completed = subprocess.run(
-            ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command, str(script)],
+            ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
             check=False,
             capture_output=True,
+            env={**os.environ, "WK_TRANSITION_SCRIPT_PATH": str(script)},
             text=True,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
