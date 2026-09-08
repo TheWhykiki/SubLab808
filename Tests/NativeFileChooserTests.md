@@ -67,10 +67,10 @@ editor reopen and control probe.
 It never calls `CFRunLoopRunInMode`, directly invokes `sendEvent:`, or enters a nested
 JUCE dispatch loop. Because `NSApplication.stop` called from a timer does not stop the
 main loop, shutdown first requires three consecutive timer turns while `NSApplication`
-is running in `NSDefaultRunLoopMode` without an AppKit modal window, then posts one private
+is running without an AppKit modal window, then posts one private
 SETTLE event at the back of AppKit's queue. The local monitor must confirm that AppKit
 retrieved this exact event while the application was running without a modal window. On
-a later default-mode timer turn,
+a later timer turn while the application is still running without a modal window,
 the coordinator posts STOP at the back of the queue; the monitor invokes JUCE's stop
 request from that real event-handler boundary. START, SETTLE and STOP must each be handled
 exactly once. The 10 ms timer stays armed through the STOP post as a run-loop wake source,

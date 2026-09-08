@@ -12,8 +12,9 @@ public:
     using ApplicationStopCallback = bool (*)() noexcept;
     static void prepareTestApplication(ApplicationStopCallback);
     [[nodiscard]] static bool applicationIsRunning() noexcept;
-    // Private START/SETTLE events prove that NSApplication is dispatching in
-    // the expected loop context. STOP calls stop: from a later real event.
+    // Private START/SETTLE events prove that NSApplication is dispatching.
+    // STOP calls stop: from a later real event while the app is running and
+    // has no modal window.
     [[nodiscard]] static bool postApplicationStartEvent() noexcept;
     [[nodiscard]] static bool applicationStartEventWasHandled() noexcept;
     [[nodiscard]] static bool applicationIsReadyForSettleEvent() noexcept;

@@ -46,11 +46,11 @@ NSUInteger applicationSettleEventCount = 0;
 NSUInteger applicationStopEventCount = 0;
 bool applicationStartEventHandledWhileRunning = false;
 bool applicationSettleEventHandledWhileRunning = false;
-bool applicationSettleEventPostedFromDefaultMode = false;
+bool applicationSettleEventPostedFromReadyContext = false;
 bool applicationSettleEventWasCurrentEvent = false;
 bool applicationSettleEventHandledWithoutModalWindow = false;
 bool applicationStopEventHandledWhileRunning = false;
-bool applicationStopEventPostedFromDefaultMode = false;
+bool applicationStopEventPostedFromReadyContext = false;
 bool applicationStopEventWasCurrentEvent = false;
 bool applicationStopEventHandledWithoutModalWindow = false;
 bool applicationStopCallbackSucceeded = false;
@@ -66,10 +66,9 @@ constexpr NSInteger applicationStartEventCode = 1;
 constexpr NSInteger applicationSettleEventCode = 2;
 constexpr NSInteger applicationStopEventCode = 3;
 
-bool isDefaultApplicationEventContext() noexcept
+bool isRunnableApplicationEventContext() noexcept
 {
-    auto* mode = [[NSRunLoop currentRunLoop] currentMode];
-    return mode != nil && [mode isEqualToString:NSDefaultRunLoopMode]
+    return [NSThread isMainThread] && NSApp != nil && [NSApp isRunning]
         && [NSApp modalWindow] == nil;
 }
 
@@ -409,11 +408,11 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
         applicationStopEventCount = 0;
         applicationStartEventHandledWhileRunning = false;
         applicationSettleEventHandledWhileRunning = false;
-        applicationSettleEventPostedFromDefaultMode = false;
+        applicationSettleEventPostedFromReadyContext = false;
         applicationSettleEventWasCurrentEvent = false;
         applicationSettleEventHandledWithoutModalWindow = false;
         applicationStopEventHandledWhileRunning = false;
-        applicationStopEventPostedFromDefaultMode = false;
+        applicationStopEventPostedFromReadyContext = false;
         applicationStopEventWasCurrentEvent = false;
         applicationStopEventHandledWithoutModalWindow = false;
         applicationStopCallbackSucceeded = false;
@@ -451,10 +450,10 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
                                                applicationSettleEventHandledWithoutModalWindow =
                                                    [NSApp modalWindow] == nil;
                                                std::fprintf(stderr,
-                                                            "NATIVE_APP_LOOP_SETTLE_HANDLED count=%lu running=%d postedFromDefault=%d currentEvent=%d modalWindow=%d\n",
+                                                            "NATIVE_APP_LOOP_SETTLE_HANDLED count=%lu running=%d postedFromReady=%d currentEvent=%d modalWindow=%d\n",
                                                             static_cast<unsigned long>(applicationSettleEventCount),
                                                             running ? 1 : 0,
-                                                            applicationSettleEventPostedFromDefaultMode ? 1 : 0,
+                                                            applicationSettleEventPostedFromReadyContext ? 1 : 0,
                                                             applicationSettleEventWasCurrentEvent ? 1 : 0,
                                                             applicationSettleEventHandledWithoutModalWindow ? 0 : 1);
                                                std::fflush(stderr);
@@ -471,16 +470,16 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
                                                applicationStopEventHandledWithoutModalWindow =
                                                    [NSApp modalWindow] == nil;
                                                applicationStopCallbackSucceeded = running
-                                                   && applicationStopEventPostedFromDefaultMode
+                                                   && applicationStopEventPostedFromReadyContext
                                                    && applicationStopEventWasCurrentEvent
                                                    && applicationStopEventHandledWithoutModalWindow
                                                    && applicationStopCallback != nullptr
                                                    && applicationStopCallback();
                                                std::fprintf(stderr,
-                                                            "NATIVE_APP_LOOP_STOP_HANDLED count=%lu running=%d postedFromDefault=%d currentEvent=%d modalWindow=%d callback=%d\n",
+                                                            "NATIVE_APP_LOOP_STOP_HANDLED count=%lu running=%d postedFromReady=%d currentEvent=%d modalWindow=%d callback=%d\n",
                                                             static_cast<unsigned long>(applicationStopEventCount),
                                                             running ? 1 : 0,
-                                                            applicationStopEventPostedFromDefaultMode ? 1 : 0,
+                                                            applicationStopEventPostedFromReadyContext ? 1 : 0,
                                                             applicationStopEventWasCurrentEvent ? 1 : 0,
                                                             applicationStopEventHandledWithoutModalWindow ? 0 : 1,
                                                             applicationStopCallbackSucceeded ? 1 : 0);
@@ -526,20 +525,21 @@ bool NativeFilePanel::applicationIsReadyForSettleEvent() noexcept
 {
     @autoreleasepool
     {
-        return [NSThread isMainThread] && [NSApp isRunning]
-            && isDefaultApplicationEventContext();
+        return isRunnableApplicationEventContext();
     }
 }
 bool NativeFilePanel::postApplicationSettleEvent() noexcept
 {
     @autoreleasepool
     {
-        if (! applicationIsReadyForSettleEvent() || applicationSettleEventPosted
+        const auto postedFromReadyContext = applicationIsReadyForSettleEvent();
+        if (! postedFromReadyContext || applicationSettleEventPosted
             || applicationSettleEventCount != 0 || applicationStopEventPosted
             || applicationStopEventCount != 0)
             return false;
         applicationSettleEventPosted = postApplicationControlEvent(applicationSettleEventCode, false);
-        applicationSettleEventPostedFromDefaultMode = applicationSettleEventPosted;
+        applicationSettleEventPostedFromReadyContext =
+            postedFromReadyContext && applicationSettleEventPosted;
         return applicationSettleEventPosted;
     }
 }
@@ -550,7 +550,7 @@ bool NativeFilePanel::applicationSettleEventWasHandled() noexcept
         return [NSThread isMainThread] && applicationSettleEventPosted
             && applicationSettleEventCount == 1
             && applicationSettleEventHandledWhileRunning
-            && applicationSettleEventPostedFromDefaultMode
+            && applicationSettleEventPostedFromReadyContext
             && applicationSettleEventWasCurrentEvent
             && applicationSettleEventHandledWithoutModalWindow;
     }
@@ -559,19 +559,21 @@ bool NativeFilePanel::applicationIsReadyForStopEvent() noexcept
 {
     @autoreleasepool
     {
-        return [NSThread isMainThread] && applicationSettleEventWasHandled()
-            && [NSApp isRunning] && isDefaultApplicationEventContext();
+        return applicationSettleEventWasHandled()
+            && isRunnableApplicationEventContext();
     }
 }
 bool NativeFilePanel::postApplicationStopEvent() noexcept
 {
     @autoreleasepool
     {
-        if (! applicationIsReadyForStopEvent() || applicationStopEventPosted
+        const auto postedFromReadyContext = applicationIsReadyForStopEvent();
+        if (! postedFromReadyContext || applicationStopEventPosted
             || applicationStopEventCount != 0)
             return false;
         applicationStopEventPosted = postApplicationControlEvent(applicationStopEventCode, false);
-        applicationStopEventPostedFromDefaultMode = applicationStopEventPosted;
+        applicationStopEventPostedFromReadyContext =
+            postedFromReadyContext && applicationStopEventPosted;
         return applicationStopEventPosted;
     }
 }
@@ -582,7 +584,7 @@ bool NativeFilePanel::applicationStopEventWasHandled() noexcept
         return [NSThread isMainThread] && applicationStopEventPosted
             && applicationStopEventCount == 1
             && applicationStopEventHandledWhileRunning
-            && applicationStopEventPostedFromDefaultMode
+            && applicationStopEventPostedFromReadyContext
             && applicationStopEventWasCurrentEvent
             && applicationStopEventHandledWithoutModalWindow
             && applicationStopCallbackSucceeded;

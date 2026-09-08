@@ -895,7 +895,7 @@ int runNativeFileChooserLifecycles(const juce::File& root, const juce::String& r
     require(nativeApplicationSettleEventPosted,
             "native chooser application loop stopped without its AppKit settle event");
     require(settleEventWasHandled,
-            "native chooser AppKit settle event was not handled once in the default loop");
+            "native chooser AppKit settle event was not handled once in the AppKit dispatch path");
     require(nativeApplicationStopEventPosted,
             "native chooser application loop stopped without its AppKit stop event");
     require(stopEventWasHandled,
