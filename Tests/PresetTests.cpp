@@ -488,7 +488,7 @@ struct TestWindow final : juce::DocumentWindow
             // Turn off only this short-lived test host's AppKit animation.
             auto* peer = getPeer();
             require(peer != nullptr, "native chooser test host has a desktop peer");
-            NativeFilePanel::disableAutomaticHostWindowAnimations(peer->getNativeHandle());
+            NativeFilePanel::disableAutomaticWindowAnimations(peer->getNativeHandle());
         }
 #endif
         setVisible(true); toFront(true);

@@ -131,6 +131,14 @@ public:
         require(! cases.empty(), "WHYKIKI_PRESET_TEST_NATIVE_CASE names a supported native chooser case");
     }
 
+    ~NativeChooserCoordinator() override
+    {
+        // STOP keeps the timer armed until NSApplication::run returns. Stop it
+        // in the most-derived destructor, before C++ destroys the retained
+        // case state and only later reaches juce::Timer's base destructor.
+        stopTimer();
+    }
+
     void start()
     {
         require(juce::MessageManager::getInstance()->isThisTheMessageThread(),
@@ -195,6 +203,13 @@ private:
         if (ready) return true;
         if (deadline > 0.0 && now() >= deadline) throw std::runtime_error(timeoutMessage);
         return false;
+    }
+
+    static void disableAutomaticAnimations(juce::Component& component)
+    {
+        auto* peer = component.getPeer();
+        require(peer != nullptr, "test-owned component resolves to a containing native desktop peer");
+        NativeFilePanel::disableAutomaticWindowAnimations(peer->getNativeHandle());
     }
 
     void auditRetiredCases()
@@ -373,6 +388,7 @@ private:
         state.filesBefore = std::make_unique<NativeFixtureSnapshot>(state.testCase.root);
         auto* menu = openManagement(*state.owner->editor);
         state.managementMenu = menu;
+        disableAutomaticAnimations(*menu);
         menu->exitModalState(state.testCase.importing ? 3 : 4);
         enter(Phase::awaitManagementGone, 2000.0);
     }
@@ -394,6 +410,7 @@ private:
                     && dynamic_cast<juce::CallOutBox*>(modal) == nullptr,
                 "the product created a real file-chooser modal");
         current->nativeModal = modal;
+        disableAutomaticAnimations(*modal);
         enter(Phase::awaitPanel, 10000.0);
     }
 
@@ -532,6 +549,7 @@ private:
         require(alert != nullptr && alert->getName() == "Save preset as",
                 "real reopened Save As dialog opened");
         current->reopenedDialog = alert;
+        disableAutomaticAnimations(*alert);
         alert->exitModalState(0);
         enter(Phase::awaitReopenedDialogGone, 2000.0);
     }

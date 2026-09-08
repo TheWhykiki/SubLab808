@@ -24,9 +24,9 @@ public:
     [[nodiscard]] static bool postApplicationStopEvent() noexcept;
     [[nodiscard]] static bool applicationStopEventWasHandled() noexcept;
     static void finishTestApplication() noexcept;
-    // The short-lived synthetic host window must not leave an AppKit display-
-    // link animation running after the console test exits.
-    static void disableAutomaticHostWindowAnimations(void* nativeView);
+    // A captured, test-owned JUCE desktop peer must not leave an AppKit
+    // display-link animation running after the console test exits.
+    static void disableAutomaticWindowAnimations(void* nativeView);
     static std::unique_ptr<NativeFilePanel> findVisible(bool importing, const char* title);
     static int visibleCount();
     ~NativeFilePanel();

@@ -72,7 +72,7 @@ bool isRunnableApplicationEventContext() noexcept
         && [NSApp modalWindow] == nil;
 }
 
-bool postApplicationControlEvent(NSInteger code, bool atStart) noexcept
+bool postApplicationControlEvent(NSInteger code) noexcept
 {
     @autoreleasepool
     {
@@ -90,7 +90,12 @@ bool postApplicationControlEvent(NSInteger code, bool atStart) noexcept
                                             data2:code];
         if (event == nil)
             return false;
-        [NSApp postEvent:event atStart:atStart ? YES : NO];
+        // JUCE's common-mode CFRunLoop source may remain continuously ready
+        // while the shutdown timer is armed, so AppKit does not guarantee
+        // progress for a private event left at the queue tail. Front insertion
+        // is still asynchronous; the local monitor below must observe this
+        // exact event through NSApplication's real dispatch path.
+        [NSApp postEvent:event atStart:YES];
         return true;
     }
 }
@@ -276,6 +281,12 @@ void trackedBeginWithCompletionHandler(id self, SEL selector, CompletionHandler 
         originalBeginWithCompletionHandler(self, selector, handler);
         return;
     }
+
+    // This short-lived console harness exits immediately after its final
+    // lifecycle audit. Prevent AppKit's private window-transform display link
+    // from outliving that process teardown; the real panel, delegate and
+    // completion path remain unchanged and fully observed.
+    [(NSSavePanel*) self setAnimationBehavior:NSWindowAnimationBehaviorNone];
 
     WhyKikiNativePanelSessionObservation* state = nil;
     @synchronized ([NSSavePanel class])
@@ -483,6 +494,11 @@ void NativeFilePanel::prepareTestApplication(ApplicationStopCallback stopCallbac
                                                             applicationStopEventWasCurrentEvent ? 1 : 0,
                                                             applicationStopEventHandledWithoutModalWindow ? 0 : 1,
                                                             applicationStopCallbackSucceeded ? 1 : 0);
+                                               std::fflush(stderr);
+                                               // STOP is private control input and has already
+                                               // provided the required real event-handler boundary.
+                                               // Do not send it through NSApplication after stop:.
+                                               return nil;
                                            }
                                            std::fflush(stderr);
                                            return event;
@@ -508,7 +524,7 @@ bool NativeFilePanel::postApplicationStartEvent() noexcept
         if (![NSThread isMainThread] || applicationStartEventPosted
             || applicationStartEventCount != 0)
             return false;
-        applicationStartEventPosted = postApplicationControlEvent(applicationStartEventCode, true);
+        applicationStartEventPosted = postApplicationControlEvent(applicationStartEventCode);
         return applicationStartEventPosted;
     }
 }
@@ -537,7 +553,7 @@ bool NativeFilePanel::postApplicationSettleEvent() noexcept
             || applicationSettleEventCount != 0 || applicationStopEventPosted
             || applicationStopEventCount != 0)
             return false;
-        applicationSettleEventPosted = postApplicationControlEvent(applicationSettleEventCode, false);
+        applicationSettleEventPosted = postApplicationControlEvent(applicationSettleEventCode);
         applicationSettleEventPostedFromReadyContext =
             postedFromReadyContext && applicationSettleEventPosted;
         return applicationSettleEventPosted;
@@ -571,7 +587,7 @@ bool NativeFilePanel::postApplicationStopEvent() noexcept
         if (! postedFromReadyContext || applicationStopEventPosted
             || applicationStopEventCount != 0)
             return false;
-        applicationStopEventPosted = postApplicationControlEvent(applicationStopEventCode, false);
+        applicationStopEventPosted = postApplicationControlEvent(applicationStopEventCode);
         applicationStopEventPostedFromReadyContext =
             postedFromReadyContext && applicationStopEventPosted;
         return applicationStopEventPosted;
@@ -596,20 +612,28 @@ void NativeFilePanel::finishTestApplication() noexcept
     {
         if (![NSThread isMainThread] || applicationEventMonitor == nil)
             return;
+        // JUCE's macOS stopDispatchLoop() starts AppKit periodic events to wake
+        // NSApplication::run. This dedicated console process must retire that
+        // wake source after run has returned, before framework/global teardown.
+        [NSEvent stopPeriodicEvents];
         [NSEvent removeMonitor:applicationEventMonitor];
         applicationEventMonitor = nil;
         applicationStopCallback = nullptr;
     }
 }
-void NativeFilePanel::disableAutomaticHostWindowAnimations(void* nativeView)
+void NativeFilePanel::disableAutomaticWindowAnimations(void* nativeView)
 {
     @autoreleasepool
     {
+        if (![NSThread isMainThread])
+            throw std::runtime_error("Native panel tests require AppKit window access on the main thread");
         auto* view = (NSView*) nativeView;
         NSWindow* window = view == nil || ! [view isKindOfClass:[NSView class]] ? nil : [view window];
-        if (window == nil || ! [[window title] isEqualToString:@"Preset UI Tests"])
-            throw std::runtime_error("Native panel tests could not resolve their synthetic host window");
+        if (window == nil)
+            throw std::runtime_error("Native panel tests could not resolve a captured JUCE peer window");
         [window setAnimationBehavior:NSWindowAnimationBehaviorNone];
+        if ([window animationBehavior] != NSWindowAnimationBehaviorNone)
+            throw std::runtime_error("Native panel tests could not disable automatic AppKit window animations");
     }
 }
 std::unique_ptr<NativeFilePanel> NativeFilePanel::findVisible(bool importing, const char* title)

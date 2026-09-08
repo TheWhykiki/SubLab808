@@ -67,29 +67,35 @@ editor reopen and control probe.
 It never calls `CFRunLoopRunInMode`, directly invokes `sendEvent:`, or enters a nested
 JUCE dispatch loop. Because `NSApplication.stop` called from a timer does not stop the
 main loop, shutdown first requires three consecutive timer turns while `NSApplication`
-is running without an AppKit modal window, then posts one private
-SETTLE event at the back of AppKit's queue. The local monitor must confirm that AppKit
+is running without an AppKit modal window, then posts one private prioritized
+SETTLE event at the front of AppKit's queue. The local monitor must confirm that AppKit
 retrieved this exact event while the application was running without a modal window. On
 a later timer turn while the application is still running without a modal window,
-the coordinator posts STOP at the back of the queue; the monitor invokes JUCE's stop
+the coordinator posts a prioritized STOP event at the front of the queue; the monitor invokes JUCE's stop
 request from that real event-handler boundary. START, SETTLE and STOP must each be handled
 exactly once. The 10 ms timer stays armed through the STOP post as a run-loop wake source,
 with separate five-second readiness, SETTLE and STOP diagnostics. Because JUCE stops
 delivering message callbacks after accepting STOP, an independent GCD watchdog also
 requires `[NSApp run]` to return within five seconds; the main thread acknowledges that
-return atomically. A final state/files/global-modal audit closes the last timer-to-STOP
-gap before the monitor is removed exactly once. It does not assume
+return atomically. The coordinator stops its timer before its retained case members are
+destroyed, and the harness retires JUCE's periodic AppKit wake events after the loop returns.
+A final state/files/global-modal audit closes the last timer-to-STOP gap before the monitor
+is removed exactly once. It does not assume
 that AppKit invokes, discards, or releases a modeless panel completion after a programmatic
 close. Instead it marks the verified JUCE/AppKit owner-retirement boundary atomically
 and keeps the late-entry sentinel active across subsequent editor interaction and
 chooser sessions.
 Completed processors and their final state/file snapshots are retained and audited
 on every later coordinator turn, so a late callback cannot hide in the final fence.
-Before its first order-in, the
-synthetic `Preset UI Tests` host window also disables AppKit's automatic order
-animation; otherwise that short-lived console-only window can leave a display-link
-worker running after `main()` exits. Native
-file-panel animations remain enabled. A callback itself can still block inside
+Before their first order-in, both the synthetic `Preset UI Tests` host window and the
+intercepted genuine file panel disable AppKit's automatic window-transform animations.
+The containing JUCE peer windows resolved from the captured test-owned management menu,
+native-modal wrapper and reopened Save As dialog do the same before harness-induced
+teardown. Those visuals are outside the lifetime contract and can otherwise leave a
+private display-link worker running after every observable panel/session state is gone
+in this short-lived process; the real panel class, delegate and completion path are
+unchanged.
+A callback itself can still block inside
 AppKit, so CTest remains the hard process watchdog. The lifetime guard is product
 code; the AppKit interception remains test-only and relaxes none of the assertions.
 
@@ -147,6 +153,8 @@ instrument this `.mm` bridge or the MRC/block lifetime that it observes.
 ## Limits
 
 These cases test JUCE owner hide/detach/destruction with genuine native panels.
+They deliberately exclude AppKit's default window-transform animation timing;
+the animations are visual behavior, not part of the asserted ownership contract.
 They do **not** establish behavior when a particular DAW only hides an NSWindow
 without changing the JUCE owner hierarchy. Cubase/REAPER acceptance on the exact
 delivered bundle remains a separate requirement. They also do not exercise actual
