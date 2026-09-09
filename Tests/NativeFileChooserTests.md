@@ -83,8 +83,9 @@ root and establish a session ledger. After START, a generation- and session-boun
 one-shot runs separately in `NSEventTrackingRunLoopMode`; immediately before calling
 the public `NSMenu.cancelTrackingWithoutAnimation` API it re-proves the exact retained
 menu, a nested instrumented fetch, its bound tracking mode, balanced periodic ownership,
-and the absence of any shutdown control request. A skipped proof may retry, but at most
-32 requests and one actual cancellation are allowed. Every observed session has one
+and the absence of any shutdown control request. A skipped proof may retry, but one run
+allows at most 32 sessions, 32 request blocks and 32 actual calls, with never more than
+one cancellation in the same session. Every observed session has one
 independent three-second atomic-ticket watchdog, covering a block that never runs, a
 call that never returns, a missing end notification, and failure to reach a later outer
 fetch boundary. Reentrant timer turns may only queue this one-shot and never advance or

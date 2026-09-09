@@ -168,8 +168,10 @@ static constexpr NSUInteger allApplicationControlEventsPostedMask = 0x0f;
 static constexpr NSUInteger maximumApplicationEventFetchPeriodicPulseAttempts = 512;
 static constexpr NSUInteger maximumApplicationEventFetchRequestTransitions = 4096;
 static constexpr NSUInteger maximumApplicationEventFetchAttemptsWithoutDepthProgress = 32;
+static constexpr NSUInteger maximumApplicationMainMenuTrackingSessions = 32;
 static constexpr NSUInteger maximumApplicationMainMenuTrackingCancellationRequests = 32;
-static constexpr NSUInteger maximumApplicationMainMenuTrackingCancellationCalls = 1;
+static constexpr NSUInteger maximumApplicationMainMenuTrackingCancellationCalls =
+    maximumApplicationMainMenuTrackingSessions;
 static constexpr NSTimeInterval applicationEventFetchPeriodicPulsePeriod = 0.1;
 static constexpr auto applicationEventFetchPeriodicPulseRetryCooldown =
     std::chrono::milliseconds { 100 };
@@ -292,10 +294,16 @@ static bool applicationMainMenuTrackingStateIsConsistent() noexcept
             == (applicationActiveMainMenuTrackingRoot == nil)
         && applicationMainMenuTrackingSessionCount
             <= applicationMainMenuTrackingBeginCount
+        && applicationMainMenuTrackingSessionCount
+            <= maximumApplicationMainMenuTrackingSessions
         && applicationMainMenuTrackingCancellationRequestCount
             <= maximumApplicationMainMenuTrackingCancellationRequests
         && applicationMainMenuTrackingCancelCount
             <= maximumApplicationMainMenuTrackingCancellationCalls
+        && applicationMainMenuTrackingCancelCount
+            <= applicationMainMenuTrackingSessionCount
+        && applicationMainMenuTrackingCancelCount
+            <= applicationMainMenuTrackingCancellationCalledSession
         && applicationMainMenuTrackingCancellationRequestCount
             == applicationMainMenuTrackingCancelCount
                 + applicationMainMenuTrackingCancellationSkipCount
@@ -1303,12 +1311,15 @@ static bool proveApplicationPeriodicSlotForJuceHandoff() noexcept
 
     if (![NSThread isMainThread]
         || (applicationMainMenuTrackingDepth != 0
-            && applicationActiveMainMenuTrackingRoot != menu))
+            && applicationActiveMainMenuTrackingRoot != menu)
+        || (applicationMainMenuTrackingDepth == 0
+            && applicationMainMenuTrackingSessionCount
+                >= maximumApplicationMainMenuTrackingSessions))
     {
         applicationMainMenuTrackingObservationInvalid = true;
         std::fputs("NATIVE_APP_LOOP_MAIN_MENU_TRACKING_BEGIN_INVALID\n", stderr);
         std::fflush(stderr);
-        return;
+        std::terminate();
     }
 
     if (applicationMainMenuTrackingDepth == 0)
@@ -1375,7 +1386,7 @@ static bool proveApplicationPeriodicSlotForJuceHandoff() noexcept
         applicationMainMenuTrackingObservationInvalid = true;
         std::fputs("NATIVE_APP_LOOP_MAIN_MENU_TRACKING_END_INVALID\n", stderr);
         std::fflush(stderr);
-        return;
+        std::terminate();
     }
 
     --applicationMainMenuTrackingDepth;
@@ -2148,16 +2159,15 @@ NativeFilePanel::requestApplicationMenuTrackingCancellationIfNeeded() noexcept
                 return ApplicationMenuTrackingCancellationResult::waitingForSafeRequest;
             return ApplicationMenuTrackingCancellationResult::notNeeded;
         }
-        if (! applicationMainMenuTrackingCancellationAllowed
-            || (applicationMainMenuTrackingCancelCount
-                    == maximumApplicationMainMenuTrackingCancellationCalls
-                && applicationMainMenuTrackingCancellationCalledSession
-                    != applicationMainMenuTrackingSessionCount))
+        if (! applicationMainMenuTrackingCancellationAllowed)
             return ApplicationMenuTrackingCancellationResult::failed;
         if (applicationMainMenuTrackingCancellationPendingRequest != 0
             || applicationMainMenuTrackingCancellationCalledSession
                 == applicationMainMenuTrackingSessionCount)
             return ApplicationMenuTrackingCancellationResult::waitingForSafeRequest;
+        if (applicationMainMenuTrackingCancelCount
+            >= maximumApplicationMainMenuTrackingCancellationCalls)
+            return ApplicationMenuTrackingCancellationResult::failed;
 
         if (applicationEventFetchReturnRequested
             || applicationFetchBarrierEventPosted
@@ -2167,7 +2177,7 @@ NativeFilePanel::requestApplicationMenuTrackingCancellationIfNeeded() noexcept
             || ! applicationEventFetchPeriodicPulseIsInactiveAndBalanced())
             return ApplicationMenuTrackingCancellationResult::waitingForSafeRequest;
         if (applicationMainMenuTrackingCancellationRequestCount
-            == maximumApplicationMainMenuTrackingCancellationRequests)
+            >= maximumApplicationMainMenuTrackingCancellationRequests)
             return ApplicationMenuTrackingCancellationResult::failed;
 
         const auto generation = applicationMainMenuTrackingObservationGeneration;
