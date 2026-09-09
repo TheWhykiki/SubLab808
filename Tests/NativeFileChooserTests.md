@@ -75,17 +75,20 @@ activation, menu dismissal, panel presentation, owner transition, panel retireme
 editor reopen and control probe.
 It never calls `CFRunLoopRunInMode`, directly invokes `sendEvent:`, or enters a nested
 JUCE dispatch loop. Because `NSApplication.stop` called from a timer does not stop the
-main loop, the final clean case boundary first calls the public
-`NSMenu.cancelTrackingWithoutAnimation` API exactly once on the test application's
-main menu. AppKit can create a nested menu-bar tracking session while its remote view
-makes the synthetic host window key; a queued event cannot end that session. The
-coordinator immediately returns from the cancellation turn and will not accept
-shutdown readiness until a later turn observes either no active event fetch or an
-eligible outermost depth-one fetch. It then requires three consecutive timer turns
-while `NSApplication` is running without an AppKit modal window. An independent
-five-second shutdown watchdog is armed before cancellation, so a blocking cancel,
-a menu stack that does not unwind, or a later event-loop return failure stays
-fail-closed. This
+main loop, the final clean case boundary first enters its shutdown phase and arms an
+independent five-second watchdog. AppKit can create a nested menu-bar tracking session
+later, while its remote view makes the synthetic host window key; a queued event cannot
+end that session. If a coordinator turn proves both a nested instrumented fetch and the
+exact `NSEventTrackingRunLoopMode`, the test app calls the public
+`NSMenu.cancelTrackingWithoutAnimation` API at most once on its main menu. Clean
+depth-zero and outer depth-one fetches do not cancel a menu. A separate in-progress
+gate makes any synchronous reentrant timer turn inert, and the callback then returns so
+AppKit can unwind. The same detection remains active after the shutdown request to
+close a late tracking-session race. Readiness otherwise requires either no active
+event fetch or a valid outermost depth-one fetch, followed by three consecutive timer
+turns while `NSApplication` is running without an AppKit modal window. A blocking
+cancel, a tracking stack that does not unwind, or a later event-loop return failure
+stays fail-closed. This
 test-process-only cleanup is never linked into a plugin target and cannot cancel a
 Cubase or Reaper host menu. JUCE may deliver those timer messages
 from any common run-loop mode, so posting does not depend on AppKit's transient
@@ -99,7 +102,7 @@ successfully queued.
 
 If the current AppKit fetch is an eligible outermost depth-one fetch, the harness
 binds and posts one private prioritized BARRIER event directly. AppKit may instead
-be blocked in nested tracking fetches, or in an outer fetch which deliberately
+be blocked in another nested fetch, or in an outer fetch which deliberately
 excludes ApplicationDefined events. When that exact supplied mask accepts
 `NSEventTypePeriodic`, dequeue is enabled, and its supplied mode equals the current
 main-run-loop mode, the harness starts one short, fetch-bound public AppKit periodic

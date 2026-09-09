@@ -1823,24 +1823,32 @@ bool NativeFilePanel::applicationIsRunning() noexcept
         return [NSThread isMainThread] && NSApp != nil && [NSApp isRunning];
     }
 }
-bool NativeFilePanel::cancelApplicationMenuTrackingForShutdown() noexcept
+NativeFilePanel::ApplicationMenuTrackingCancellationResult
+NativeFilePanel::cancelApplicationMenuTrackingForShutdownIfNeeded() noexcept
 {
     @autoreleasepool
     {
-        if (! isRunnableApplicationEventContext()
-            || ! applicationStartEventWasHandled()
-            || applicationMainMenuTrackingCancelCount != 0
-            || applicationEventFetchReturnRequested
-            || applicationEventFetchReturnRequestCount != 0
-            || ! applicationEventFetchHasNoPeriodicPulseHistory()
+        auto* runLoop = CFRunLoopGetCurrent();
+        const auto nestedTrackingFetch = isRunnableApplicationEventContext()
+            && applicationStartEventWasHandled()
+            && applicationEventFetchDepth > 1
+            && currentApplicationEventFetchHasBoundContext()
+            && [applicationEventFetchMode isEqualToString:NSEventTrackingRunLoopMode]
+            && runLoop != nullptr
+            && runLoop == CFRunLoopGetMain()
+            && currentRunLoopModeMatchesApplicationEventFetch(runLoop);
+        if (! nestedTrackingFetch || applicationMainMenuTrackingCancelCount == 1)
+            return ApplicationMenuTrackingCancellationResult::notNeeded;
+        if (applicationMainMenuTrackingCancelCount != 0
             || applicationFetchBarrierEventPosted
             || applicationSettleEventPosted
-            || applicationStopEventPosted)
-            return false;
+            || applicationStopEventPosted
+            || ! applicationEventFetchPeriodicPulseStateIsConsistent())
+            return ApplicationMenuTrackingCancellationResult::failed;
 
         auto* mainMenu = [NSApp mainMenu];
         if (mainMenu == nil)
-            return false;
+            return ApplicationMenuTrackingCancellationResult::failed;
 
         ++applicationMainMenuTrackingCancelCount;
         @try
@@ -1858,15 +1866,17 @@ bool NativeFilePanel::cancelApplicationMenuTrackingForShutdown() noexcept
                          "NATIVE_APP_LOOP_MENU_TRACKING_CANCEL_FAILED name=%s\n",
                          name != nullptr ? name : "<unavailable>");
             std::fflush(stderr);
-            return false;
+            return ApplicationMenuTrackingCancellationResult::failed;
         }
 
         std::fprintf(stderr,
-                     "NATIVE_APP_LOOP_MENU_TRACKING_CANCELLED count=%lu activeFetchDepth=%lu\n",
+                     "NATIVE_APP_LOOP_MENU_TRACKING_CANCELLED count=%lu activeFetchDepth=%lu invocation=%lu request=%d\n",
                      static_cast<unsigned long>(applicationMainMenuTrackingCancelCount),
-                     static_cast<unsigned long>(applicationEventFetchDepth));
+                     static_cast<unsigned long>(applicationEventFetchDepth),
+                     static_cast<unsigned long>(applicationEventFetchActiveInvocation),
+                     applicationEventFetchReturnRequested ? 1 : 0);
         std::fflush(stderr);
-        return true;
+        return ApplicationMenuTrackingCancellationResult::cancelled;
     }
 }
 bool NativeFilePanel::postApplicationStartEvent() noexcept
@@ -1900,7 +1910,8 @@ bool NativeFilePanel::applicationIsReadyForSettleEvent() noexcept
         const auto betweenFetches = applicationEventFetchDepth == 0
             && applicationEventFetchActiveInvocation == 0
             && ! applicationEventFetchContextRecorded;
-        const auto bindableOuterFetch = currentApplicationEventFetchCanBindBarrier()
+        const auto activeOuterFetch = applicationEventFetchDepth == 1
+            && currentApplicationEventFetchHasBoundContext()
             && runLoop != nullptr
             && runLoop == CFRunLoopGetMain()
             && currentRunLoopModeMatchesApplicationEventFetch(runLoop);
@@ -1913,8 +1924,8 @@ bool NativeFilePanel::applicationIsReadyForSettleEvent() noexcept
             && ! applicationStopEventPosted
             && applicationStopEventCount == 0
             && ! applicationEventFetchReturnRequested
-            && applicationMainMenuTrackingCancelCount == 1
-            && (betweenFetches || bindableOuterFetch)
+            && applicationMainMenuTrackingCancelCount <= 1
+            && (betweenFetches || activeOuterFetch)
             && isRunnableApplicationEventContext();
     }
 }
@@ -2321,7 +2332,7 @@ bool NativeFilePanel::applicationStopEventWasHandled() noexcept
             && applicationStopEventDequeueInvocation > applicationSettleEventDequeueInvocation
             && applicationControlEventPostedMask
                 == allApplicationControlEventsPostedMask
-            && applicationMainMenuTrackingCancelCount == 1
+            && applicationMainMenuTrackingCancelCount <= 1
             && applicationEventFetchPeriodicPulseIsInactiveAndBalanced()
             && applicationStopCallbackSucceeded
             && applicationJuceHandoffProbeStartCount == 1

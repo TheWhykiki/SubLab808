@@ -14,6 +14,12 @@ public:
         failed,
         jucePeriodicWakeAcquired
     };
+    enum class ApplicationMenuTrackingCancellationResult
+    {
+        notNeeded,
+        cancelled,
+        failed
+    };
     // A successful callback must both submit JUCE's NSApplication stop request
     // and acquire the periodic wake which JUCE's macOS implementation creates.
     using ApplicationStopCallback = ApplicationStopResult (*)() noexcept;
@@ -24,9 +30,11 @@ public:
                                        ApplicationFetchBoundCallback,
                                        void* applicationFetchBoundContext);
     [[nodiscard]] static bool applicationIsRunning() noexcept;
-    // Test-app shutdown only: dismiss any transient main-menu tracking once,
-    // then return to AppKit so a later outer fetch can prove the event boundary.
-    [[nodiscard]] static bool cancelApplicationMenuTrackingForShutdown() noexcept;
+    // Test-app shutdown only: if the current instrumented fetch proves that
+    // AppKit is inside a nested tracking-mode loop, dismiss main-menu tracking
+    // at most once and return so a later outer fetch can prove the boundary.
+    [[nodiscard]] static ApplicationMenuTrackingCancellationResult
+        cancelApplicationMenuTrackingForShutdownIfNeeded() noexcept;
     // Private START/BARRIER/SETTLE/STOP events prove distinct dispatches through
     // the real NSApplication event loop. An eligible depth-one fetch is returned
     // with BARRIER. Other active fetch stacks may receive bounded, mode-matched,

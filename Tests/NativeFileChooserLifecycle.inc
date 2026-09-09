@@ -209,6 +209,8 @@ public:
         require(failure.empty(), "native chooser final audit requires a successful lifecycle");
         require(shutdownStarted && current == nullptr && caseIndex == cases.size(),
                 "native chooser reached run-loop return from the completed shutdown state");
+        require(! applicationMenuTrackingCancellationInProgress,
+                "native chooser returned from any test-app menu-tracking cancellation");
         require(NativeFilePanel::applicationStopEventWasHandled(),
                 "native chooser stop event ran exactly once in a valid clean context");
         auditRetiredCases();
@@ -289,6 +291,10 @@ private:
 
     void timerCallback() override
     {
+        // AppKit may synchronously re-enter the message loop while ending menu
+        // tracking. Do not even run idempotent audits until that call returns.
+        if (applicationMenuTrackingCancellationInProgress)
+            return;
         try
         {
             if (! applicationLoopStarted)
@@ -715,10 +721,9 @@ private:
         if (shutdownStarted) return;
         shutdownStarted = true;
         completed = true;
-        // No coordinator callback may re-enter while AppKit synchronously ends
-        // menu tracking. The independent watchdog also covers cancellation and
-        // stack unwind, not only the later BARRIER/SETTLE/STOP exchange.
-        stopTimer();
+        // Establish the next phase and watchdog before a delayed AppKit
+        // tracking loop can appear. Cancellation is performed only on a later
+        // turn which actually observes that nested tracking context.
         enter(Phase::awaitApplicationStopReady, 5000.0);
         if (! armNativeApplicationReturnWatchdog())
         {
@@ -728,19 +733,6 @@ private:
         }
         std::fputs("NATIVE_APP_LOOP_RETURN_WATCHDOG_ARMED\n", stderr);
         std::fflush(stderr);
-        // The test process can still be inside an AppKit-created main-menu
-        // tracking session after every product-owned modal has retired. End
-        // that public tracking session exactly once, then leave this callback;
-        // only a later timer turn may prove a depth-zero/depth-one fetch.
-        if (! NativeFilePanel::cancelApplicationMenuTrackingForShutdown())
-        {
-            std::fputs("NATIVE_APP_LOOP_MENU_TRACKING_CANCEL_REQUEST_FAILED\n", stderr);
-            std::fflush(stderr);
-            std::terminate();
-        }
-        nativeApplicationShutdownStage.store(
-            NativeApplicationShutdownStage::menuTrackingCancelled,
-            std::memory_order_release);
         std::fputs("NATIVE_APP_LOOP_STOP_READY_BEGIN\n", stderr);
         std::fflush(stderr);
         // Stable readiness is established on clean main-thread timer turns.
@@ -748,6 +740,38 @@ private:
         // remains active until BARRIER is posted, allowing another complete
         // non-bindable fetch stack to be released if AppKit creates one first.
         startTimer(10);
+    }
+
+    bool cancelNestedApplicationMenuTrackingIfNeeded() noexcept
+    {
+        // cancelTrackingWithoutAnimation may synchronously notify AppKit
+        // observers. Keep a reentrant coordinator turn inert until it returns.
+        if (applicationMenuTrackingCancellationInProgress)
+            return true;
+        applicationMenuTrackingCancellationInProgress = true;
+        const auto result =
+            NativeFilePanel::cancelApplicationMenuTrackingForShutdownIfNeeded();
+        applicationMenuTrackingCancellationInProgress = false;
+
+        using Result = NativeFilePanel::ApplicationMenuTrackingCancellationResult;
+        if (result == Result::failed)
+        {
+            std::fputs("NATIVE_APP_LOOP_MENU_TRACKING_CANCEL_REQUEST_FAILED\n", stderr);
+            std::fflush(stderr);
+            std::terminate();
+        }
+        if (result != Result::cancelled)
+            return false;
+
+        if (! nativeApplicationSettleDispatchRequested)
+            nativeApplicationShutdownStage.store(
+                NativeApplicationShutdownStage::menuTrackingCancelled,
+                std::memory_order_release);
+        fenceTurns = 0;
+        // Reset the still-registered timer so readiness is reconsidered only
+        // on a later turn, after AppKit has had a chance to unwind the stack.
+        startTimer(10);
+        return true;
     }
 
     [[noreturn]] void shutdownTimeout(const char* stage) const noexcept
@@ -767,6 +791,8 @@ private:
 
     void awaitApplicationStopReady()
     {
+        if (cancelNestedApplicationMenuTrackingIfNeeded())
+            return;
         if (! NativeFilePanel::applicationIsReadyForSettleEvent())
         {
             fenceTurns = 0;
@@ -798,6 +824,8 @@ private:
 
     void awaitApplicationReturn() noexcept
     {
+        if (cancelNestedApplicationMenuTrackingIfNeeded())
+            return;
         if (! NativeFilePanel::driveApplicationEventFetchReturnRequest())
         {
             NativeFilePanel::logApplicationSettleReadiness();
@@ -924,6 +952,7 @@ private:
     bool completed = false;
     bool applicationLoopStarted = false;
     bool shutdownStarted = false;
+    bool applicationMenuTrackingCancellationInProgress = false;
     std::string failure;
 };
 
