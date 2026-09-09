@@ -17,7 +17,8 @@ public:
     enum class ApplicationMenuTrackingCancellationResult
     {
         notNeeded,
-        cancelled,
+        waitingForSafeRequest,
+        requestPosted,
         failed
     };
     // A successful callback must both submit JUCE's NSApplication stop request
@@ -30,11 +31,17 @@ public:
                                        ApplicationFetchBoundCallback,
                                        void* applicationFetchBoundContext);
     [[nodiscard]] static bool applicationIsRunning() noexcept;
-    // Test-app shutdown only: if the current instrumented fetch proves that
-    // AppKit is inside a nested tracking-mode loop, dismiss main-menu tracking
-    // at most once and return so a later outer fetch can prove the boundary.
+    // Test-app only: a public NSMenu begin notification must first identify the
+    // exact application main menu. A generation-bound one-shot is then queued
+    // in tracking mode; the caller waits for the matching end notification and
+    // a later outer fetch instead of cancelling re-entrantly from its timer.
     [[nodiscard]] static ApplicationMenuTrackingCancellationResult
-        cancelApplicationMenuTrackingForShutdownIfNeeded() noexcept;
+        requestApplicationMenuTrackingCancellationIfNeeded() noexcept;
+    [[nodiscard]] static bool applicationMenuTrackingCancellationIsInProgress() noexcept;
+    static void disableApplicationMenuTrackingCancellation() noexcept;
+    // A destructive test-harness transition may proceed only outside nested
+    // AppKit fetches and after all observed main-menu tracking has ended.
+    [[nodiscard]] static bool applicationIsAtSafeLifetimeBoundary() noexcept;
     // Private START/BARRIER/SETTLE/STOP events prove distinct dispatches through
     // the real NSApplication event loop. An eligible depth-one fetch is returned
     // with BARRIER. Other active fetch stacks may receive bounded, mode-matched,

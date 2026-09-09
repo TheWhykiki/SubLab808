@@ -65,7 +65,7 @@ enum class NativeApplicationShutdownStage
 {
     idle,
     watchdogArmed,
-    menuTrackingCancelled,
+    menuTrackingCancelRequested,
     fetchReturnRequested,
     stopAccepted,
     loopReturned
@@ -81,8 +81,8 @@ const char* shutdownStageName(NativeApplicationShutdownStage stage) noexcept
     {
         case NativeApplicationShutdownStage::idle: return "idle";
         case NativeApplicationShutdownStage::watchdogArmed: return "watchdog-armed";
-        case NativeApplicationShutdownStage::menuTrackingCancelled:
-            return "menu-tracking-cancelled";
+        case NativeApplicationShutdownStage::menuTrackingCancelRequested:
+            return "menu-tracking-cancel-requested";
         case NativeApplicationShutdownStage::fetchReturnRequested: return "fetch-return-requested";
         case NativeApplicationShutdownStage::stopAccepted: return "stop-accepted";
         case NativeApplicationShutdownStage::loopReturned: return "loop-returned";
@@ -102,10 +102,12 @@ void nativeApplicationReturnWatchdog(void*) noexcept
 
 bool armNativeApplicationReturnWatchdog() noexcept
 {
+    if (nativeApplicationReturnWatchdogArmed.load(std::memory_order_acquire))
+        return true;
     bool expected = false;
     if (! nativeApplicationReturnWatchdogArmed.compare_exchange_strong(
             expected, true, std::memory_order_acq_rel))
-        return false;
+        return expected;
     nativeApplicationShutdownStage.store(NativeApplicationShutdownStage::watchdogArmed,
                                          std::memory_order_release);
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
@@ -209,7 +211,7 @@ public:
         require(failure.empty(), "native chooser final audit requires a successful lifecycle");
         require(shutdownStarted && current == nullptr && caseIndex == cases.size(),
                 "native chooser reached run-loop return from the completed shutdown state");
-        require(! applicationMenuTrackingCancellationInProgress,
+        require(! NativeFilePanel::applicationMenuTrackingCancellationIsInProgress(),
                 "native chooser returned from any test-app menu-tracking cancellation");
         require(NativeFilePanel::applicationStopEventWasHandled(),
                 "native chooser stop event ran exactly once in a valid clean context");
@@ -236,8 +238,6 @@ private:
         awaitToggleOff,
         destroyCase,
         betweenCases,
-        failureDestroy,
-        failureAwaitRetired,
         failureDrain,
         awaitApplicationStopReady,
         awaitApplicationReturn
@@ -291,10 +291,33 @@ private:
 
     void timerCallback() override
     {
-        // AppKit may synchronously re-enter the message loop while ending menu
-        // tracking. Do not even run idempotent audits until that call returns.
-        if (applicationMenuTrackingCancellationInProgress)
+        // A nested AppKit loop may re-enter JUCE's timer dispatcher while an
+        // older coordinator frame is suspended. No lifecycle operation is
+        // safe until that older frame has returned.
+        if (NativeFilePanel::applicationMenuTrackingCancellationIsInProgress())
             return;
+        if (timerCallbackInProgress)
+        {
+            // A menu loop can suspend the outer coordinator frame yet continue
+            // dispatching timer messages. Reentrant turns may only queue the
+            // independently revalidated cancellation block; they must not
+            // advance or destroy lifecycle state.
+            if (failure.empty() && ! nativeApplicationSettleDispatchRequested)
+            {
+                const auto result =
+                    NativeFilePanel::requestApplicationMenuTrackingCancellationIfNeeded();
+                if (result
+                    == NativeFilePanel::ApplicationMenuTrackingCancellationResult::failed)
+                {
+                    std::fputs("NATIVE_APP_LOOP_MAIN_MENU_CANCEL_REQUEST_FAILED_REENTRANT\n",
+                               stderr);
+                    std::fflush(stderr);
+                    std::terminate();
+                }
+            }
+            return;
+        }
+        const juce::ScopedValueSetter<bool> callbackGuard(timerCallbackInProgress, true);
         try
         {
             if (! applicationLoopStarted)
@@ -315,9 +338,13 @@ private:
                 // Reserve room below CTest's 60/480-second process watchdogs
                 // for bounded failure cleanup plus the three shutdown stages.
                 runDeadline = now() + (cases.size() == 1 ? 32000.0 : 435000.0);
-                enter(Phase::createCase);
+                enter(Phase::createCase, 10000.0);
                 std::fputs("NATIVE_APP_LOOP_ACTIVE dispatch=1 running=1\n", stderr);
             }
+            if (failure.empty()
+                && ! nativeApplicationSettleDispatchRequested
+                && quiesceApplicationMainMenuTrackingIfNeeded())
+                return;
             if (failure.empty())
             {
                 auditRetiredCases();
@@ -365,8 +392,6 @@ private:
             case Phase::awaitToggleOff: awaitToggleOff(); return;
             case Phase::destroyCase: destroyCase(); return;
             case Phase::betweenCases: betweenCases(); return;
-            case Phase::failureDestroy: failureDestroy(); return;
-            case Phase::failureAwaitRetired: failureAwaitRetired(); return;
             case Phase::failureDrain: failureDrain(); return;
             case Phase::awaitApplicationStopReady: awaitApplicationStopReady(); return;
             case Phase::awaitApplicationReturn: awaitApplicationReturn(); return;
@@ -394,8 +419,6 @@ private:
             case Phase::awaitToggleOff: return "awaitToggleOff";
             case Phase::destroyCase: return "destroyCase";
             case Phase::betweenCases: return "betweenCases";
-            case Phase::failureDestroy: return "failureDestroy";
-            case Phase::failureAwaitRetired: return "failureAwaitRetired";
             case Phase::failureDrain: return "failureDrain";
             case Phase::awaitApplicationStopReady: return "awaitApplicationStopReady";
             case Phase::awaitApplicationReturn: return "awaitApplicationReturn";
@@ -405,6 +428,8 @@ private:
 
     void createCase()
     {
+        if (! waitUntil(NativeFilePanel::applicationIsAtSafeLifetimeBoundary(),
+                        "NATIVE_PANEL_SEQUENCE_TIMEOUT: new case did not reach an outer AppKit fetch boundary")) return;
         require(current == nullptr && caseIndex < cases.size(), "native chooser case index is valid");
         require(juce::Component::getNumCurrentlyModalComponents() == 0,
                 "native chooser case starts without a JUCE modal");
@@ -435,8 +460,6 @@ private:
     void awaitHostActive()
     {
         auto& state = *current;
-        juce::Process::makeForegroundProcess();
-        state.owner->window->toFront(true);
         if (! waitUntil(juce::Process::isForegroundProcess() && state.owner->window->isActiveWindow(),
                         "NATIVE_PANEL_SETUP_TIMEOUT: the test process/window did not become active")) return;
 
@@ -549,13 +572,15 @@ private:
                 "native completion observer could not mark safe owner retirement");
         require(! NativeFilePanel::hasActiveCompletionSession(),
                 "native completion remained active after owner retirement");
-        enter(Phase::retirementFence);
+        enter(Phase::retirementFence, 10000.0);
     }
 
     void retirementFence()
     {
         // JUCE's SafePointer-bearing native owner is gone. Keep returning to the
         // real app loop; any later AppKit entry must return before the next turn.
+        if (! waitUntil(NativeFilePanel::applicationIsAtSafeLifetimeBoundary(),
+                        "NATIVE_PANEL_REOPEN_TIMEOUT: replacement editor did not reach an outer AppKit fetch boundary")) return;
         if (++fenceTurns < 3) return;
         auto& state = *current;
         require(state.nativeModal == nullptr && ! state.panel->isAlive()
@@ -575,8 +600,6 @@ private:
     void awaitReopenedHost()
     {
         auto& state = *current;
-        juce::Process::makeForegroundProcess();
-        state.owner->window->toFront(true);
         if (! waitUntil(state.owner->editor != nullptr && state.owner->editor->isShowing()
                             && state.owner->window->isActiveWindow(),
                         "NATIVE_PANEL_REOPEN_TIMEOUT: replacement editor did not become active")) return;
@@ -655,11 +678,13 @@ private:
         state.filesBefore->unchanged(state.testCase.root);
         require(! state.output.exists(), "cancelled export never creates its target");
         state.postInteractionState = std::make_unique<LifecycleSnapshot>(*state.processor);
-        enter(Phase::destroyCase);
+        enter(Phase::destroyCase, 10000.0);
     }
 
     void destroyCase()
     {
+        if (! waitUntil(NativeFilePanel::applicationIsAtSafeLifetimeBoundary(),
+                        "NATIVE_PANEL_TEARDOWN_TIMEOUT: reopened editor did not reach an outer AppKit fetch boundary")) return;
         require(current != nullptr && current->postInteractionState != nullptr,
                 "native chooser case has a final audit snapshot before retirement");
         current->postInteractionState->unchanged(*current->processor);
@@ -686,6 +711,8 @@ private:
         const bool clean = globalStateIsClean();
         if (! waitUntil(clean,
                         "NATIVE_PANEL_TEARDOWN_TIMEOUT: case destruction left native or JUCE modal state")) return;
+        if (! waitUntil(NativeFilePanel::applicationIsAtSafeLifetimeBoundary(),
+                        "NATIVE_PANEL_SEQUENCE_TIMEOUT: retired case did not reach an outer AppKit fetch boundary")) return;
         if (++fenceTurns < 3) return;
         auditRetiredCases();
         lastLateCompletionEntries = retiredCases.back()->panel->lateCompletionEntryCount();
@@ -696,7 +723,7 @@ private:
         ++caseIndex;
         if (caseIndex < cases.size())
         {
-            enter(Phase::createCase);
+            enter(Phase::createCase, 10000.0);
             return;
         }
 
@@ -742,35 +769,32 @@ private:
         startTimer(10);
     }
 
-    bool cancelNestedApplicationMenuTrackingIfNeeded() noexcept
+    bool quiesceApplicationMainMenuTrackingIfNeeded()
     {
-        // cancelTrackingWithoutAnimation may synchronously notify AppKit
-        // observers. Keep a reentrant coordinator turn inert until it returns.
-        if (applicationMenuTrackingCancellationInProgress)
-            return true;
-        applicationMenuTrackingCancellationInProgress = true;
         const auto result =
-            NativeFilePanel::cancelApplicationMenuTrackingForShutdownIfNeeded();
-        applicationMenuTrackingCancellationInProgress = false;
+            NativeFilePanel::requestApplicationMenuTrackingCancellationIfNeeded();
 
         using Result = NativeFilePanel::ApplicationMenuTrackingCancellationResult;
         if (result == Result::failed)
+            throw std::runtime_error(
+                "NATIVE_APP_LOOP_MAIN_MENU_CANCEL_REQUEST_FAILED");
+        if (result == Result::notNeeded)
         {
-            std::fputs("NATIVE_APP_LOOP_MENU_TRACKING_CANCEL_REQUEST_FAILED\n", stderr);
-            std::fflush(stderr);
-            std::terminate();
-        }
-        if (result != Result::cancelled)
+            applicationMenuTrackingDeadline = 0.0;
             return false;
+        }
 
-        if (! nativeApplicationSettleDispatchRequested)
+        if (applicationMenuTrackingDeadline <= 0.0)
+            applicationMenuTrackingDeadline = now() + 2000.0;
+        if (now() >= applicationMenuTrackingDeadline)
+            throw std::runtime_error(
+                "NATIVE_APP_LOOP_MAIN_MENU_TRACKING_TIMEOUT: confirmed main-menu session did not end");
+        if (result == Result::requestPosted
+            && shutdownStarted && ! nativeApplicationSettleDispatchRequested)
             nativeApplicationShutdownStage.store(
-                NativeApplicationShutdownStage::menuTrackingCancelled,
+                NativeApplicationShutdownStage::menuTrackingCancelRequested,
                 std::memory_order_release);
         fenceTurns = 0;
-        // Reset the still-registered timer so readiness is reconsidered only
-        // on a later turn, after AppKit has had a chance to unwind the stack.
-        startTimer(10);
         return true;
     }
 
@@ -791,8 +815,6 @@ private:
 
     void awaitApplicationStopReady()
     {
-        if (cancelNestedApplicationMenuTrackingIfNeeded())
-            return;
         if (! NativeFilePanel::applicationIsReadyForSettleEvent())
         {
             fenceTurns = 0;
@@ -824,8 +846,6 @@ private:
 
     void awaitApplicationReturn() noexcept
     {
-        if (cancelNestedApplicationMenuTrackingIfNeeded())
-            return;
         if (! NativeFilePanel::driveApplicationEventFetchReturnRequest())
         {
             NativeFilePanel::logApplicationSettleReadiness();
@@ -837,6 +857,13 @@ private:
 
     void failDuringShutdown(const char* message) noexcept
     {
+        NativeFilePanel::disableApplicationMenuTrackingCancellation();
+        if (! armNativeApplicationReturnWatchdog())
+        {
+            std::fputs("NATIVE_APP_LOOP_RETURN_WATCHDOG_ARM_FAILED\n", stderr);
+            std::fflush(stderr);
+            std::terminate();
+        }
         if (failure.empty())
         {
             failure = message;
@@ -851,6 +878,16 @@ private:
 
     void fail(const char* message) noexcept
     {
+        NativeFilePanel::disableApplicationMenuTrackingCancellation();
+        // A timer callback cannot protect its own failure cleanup if AppKit
+        // immediately enters another nested loop. Arm an independent queue
+        // before attempting any UI action; normal shutdown reuses this guard.
+        if (! armNativeApplicationReturnWatchdog())
+        {
+            std::fputs("NATIVE_APP_LOOP_RETURN_WATCHDOG_ARM_FAILED\n", stderr);
+            std::fflush(stderr);
+            std::terminate();
+        }
         try
         {
             if (! failure.empty())
@@ -864,16 +901,17 @@ private:
             std::fprintf(stderr, "FAIL: %s\n", failure.c_str());
             std::fflush(stderr);
             stopTimer();
-            if (current != nullptr)
+            if (current != nullptr && current->owner != nullptr)
             {
-                if (current->reopenedDialog != nullptr) current->reopenedDialog->exitModalState(0);
-                if (current->nativeModal != nullptr) current->nativeModal->exitModalState(0);
-                if (current->managementMenu != nullptr) current->managementMenu->exitModalState(0);
+                // Close through the same ancestor-hide path as a real host.
+                // Directly exiting JUCE's native modal would bypass its
+                // FileChooser owner and can double-release the modal wrapper.
+                current->owner->apply(OwnerAction::hideAncestor);
             }
-            // Destruction runs only after returning to the top-level application
-            // loop, never re-entrantly in the callback that detected the failure.
-            enter(current != nullptr ? Phase::failureDestroy : Phase::failureAwaitRetired,
-                  current != nullptr ? 0.0 : 3000.0);
+            // Keep every editor, panel wrapper and timer owner alive until the
+            // real application loop has returned. Nested timer turns are not a
+            // lifetime fence and must never trigger failure-path destruction.
+            enter(Phase::failureDrain, 3000.0);
             startTimer(10);
         }
         catch (...)
@@ -884,61 +922,32 @@ private:
         }
     }
 
-    void failureDestroy()
-    {
-        if (++fenceTurns < 2) return;
-        if (current == nullptr)
-        {
-            enter(Phase::failureAwaitRetired, 3000.0);
-            return;
-        }
-        failureNativeModal = current->nativeModal;
-        failurePanel = std::move(current->panel);
-        current.reset();
-        enter(Phase::failureAwaitRetired, 3000.0);
-    }
-
-    void failureAwaitRetired()
-    {
-        bool panelClean = failurePanel == nullptr && failureNativeModal == nullptr;
-        if (failurePanel != nullptr
-            && failureNativeModal == nullptr
-            && ! failurePanel->isVisible()
-            && ! failurePanel->hasDelegate()
-            && ! failurePanel->isAlive()
-            && failurePanel->completionIsQuiescent())
-            panelClean = failurePanel->markSafeOwnerRetired();
-        const bool globallyClean = globalStateIsClean();
-        if (panelClean && globallyClean)
-        {
-            failurePanel.reset();
-            enter(Phase::failureDrain, 100.0);
-            return;
-        }
-        if (now() < deadline) return;
-
-        std::fprintf(stderr,
-                     "FAILURE_CLEANUP_TIMEOUT: modal=%d visiblePanels=%d activeCompletion=%d completionQuiescent=%d lateCompletions=%zu\n",
-                     juce::Component::getNumCurrentlyModalComponents(), NativeFilePanel::visibleCount(),
-                     NativeFilePanel::hasActiveCompletionSession(),
-                     failurePanel == nullptr || failurePanel->completionIsQuiescent(),
-                     NativeFilePanel::totalLateCompletionEntryCount());
-        std::fflush(stderr);
-        failurePanel.reset();
-        enter(Phase::failureDrain, 100.0);
-    }
-
     void failureDrain()
     {
+        const auto clean = globalStateIsClean();
+        const auto outerBoundary =
+            NativeFilePanel::applicationIsAtSafeLifetimeBoundary();
+        if (clean && outerBoundary)
+        {
+            if (++fenceTurns < 3) return;
+            beginApplicationStopHandshake();
+            return;
+        }
+        fenceTurns = 0;
         if (now() < deadline) return;
-        beginApplicationStopHandshake();
+        NativeFilePanel::logApplicationSettleReadiness();
+        std::fprintf(stderr,
+                     "FAILURE_CLEANUP_TIMEOUT: modal=%d visiblePanels=%d activeCompletion=%d outerBoundary=%d lateCompletions=%zu\n",
+                     juce::Component::getNumCurrentlyModalComponents(), NativeFilePanel::visibleCount(),
+                     NativeFilePanel::hasActiveCompletionSession(), outerBoundary ? 1 : 0,
+                     NativeFilePanel::totalLateCompletionEntryCount());
+        std::fflush(stderr);
+        std::terminate();
     }
 
     std::vector<NativeChooserCase> cases;
     std::unique_ptr<NativeChooserCaseState> current;
     std::vector<std::unique_ptr<NativeChooserCaseState>> retiredCases;
-    std::unique_ptr<NativeFilePanel> failurePanel;
-    juce::Component::SafePointer<juce::Component> failureNativeModal;
     size_t caseIndex = 0;
     Phase phase = Phase::createCase;
     double deadline = 0.0;
@@ -952,7 +961,8 @@ private:
     bool completed = false;
     bool applicationLoopStarted = false;
     bool shutdownStarted = false;
-    bool applicationMenuTrackingCancellationInProgress = false;
+    bool timerCallbackInProgress = false;
+    double applicationMenuTrackingDeadline = 0.0;
     std::string failure;
 };
 

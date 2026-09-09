@@ -1,6 +1,7 @@
 #include "NativeFilePanel.h"
 #include "MacModulePin.h"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -35,6 +36,11 @@
 - (instancetype)initWithObservation:(WhyKikiNativePanelSessionObservation*)state;
 - (void)completionWillEnter;
 - (void)completionDidReturn;
+@end
+
+@interface WhyKikiApplicationMenuTrackingObservation : NSObject
+- (void)menuDidBeginTracking:(NSNotification*)notification;
+- (void)menuDidEndTracking:(NSNotification*)notification;
 @end
 
 // The coordinator runs from JUCE's main-thread run-loop source, which can fire
@@ -129,7 +135,29 @@ static NSUInteger applicationSettleEventDequeueCount = 0;
 static NSUInteger applicationStopEventDequeueCount = 0;
 static NSInteger applicationControlEventNonce = 0;
 static NSUInteger applicationControlEventPostedMask = 0;
+static WhyKikiApplicationMenuTrackingObservation*
+    applicationMenuTrackingObserver = nil;
+static NSMenu* applicationActiveMainMenuTrackingRoot = nil;
+static NSUInteger applicationMainMenuTrackingDepth = 0;
+static NSUInteger applicationMainMenuTrackingBeginCount = 0;
+static NSUInteger applicationMainMenuTrackingEndCount = 0;
+static NSUInteger applicationMainMenuTrackingSessionCount = 0;
+static NSUInteger applicationMainMenuTrackingCancellationRequestCount = 0;
 static NSUInteger applicationMainMenuTrackingCancelCount = 0;
+static NSUInteger applicationMainMenuTrackingCancellationSkipCount = 0;
+static NSUInteger applicationMainMenuTrackingCancellationExceptionCount = 0;
+static NSUInteger applicationMainMenuTrackingCancellationRequestedSession = 0;
+static NSUInteger applicationMainMenuTrackingCancellationCalledSession = 0;
+static NSUInteger applicationMainMenuTrackingCancellationPendingRequest = 0;
+static NSUInteger applicationMainMenuTrackingAwaitingOuterBoundarySession = 0;
+static NSUInteger applicationMainMenuTrackingObservationGeneration = 0;
+static std::uint64_t applicationMainMenuTrackingSessionWatchdogSequence = 0;
+static std::uint64_t applicationMainMenuTrackingPendingSessionWatchdogTicket = 0;
+static std::atomic<std::uint64_t>
+    applicationMainMenuTrackingActiveSessionWatchdogTicket { 0 };
+static bool applicationMainMenuTrackingObservationInvalid = false;
+static bool applicationMainMenuTrackingCancellationAllowed = false;
+static bool applicationMainMenuTrackingCancellationInProgress = false;
 
 static constexpr short applicationControlEventSubtype = 0x574b;
 static constexpr NSInteger applicationStartEventCode = 1;
@@ -140,6 +168,8 @@ static constexpr NSUInteger allApplicationControlEventsPostedMask = 0x0f;
 static constexpr NSUInteger maximumApplicationEventFetchPeriodicPulseAttempts = 512;
 static constexpr NSUInteger maximumApplicationEventFetchRequestTransitions = 4096;
 static constexpr NSUInteger maximumApplicationEventFetchAttemptsWithoutDepthProgress = 32;
+static constexpr NSUInteger maximumApplicationMainMenuTrackingCancellationRequests = 32;
+static constexpr NSUInteger maximumApplicationMainMenuTrackingCancellationCalls = 1;
 static constexpr NSTimeInterval applicationEventFetchPeriodicPulsePeriod = 0.1;
 static constexpr auto applicationEventFetchPeriodicPulseRetryCooldown =
     std::chrono::milliseconds { 100 };
@@ -234,6 +264,132 @@ static bool currentRunLoopModeMatchesApplicationEventFetch(
     const auto matches = CFEqual(currentMode, (CFStringRef) applicationEventFetchMode);
     CFRelease(currentMode);
     return matches;
+}
+
+static bool applicationEventFetchIsAtSafeOuterBoundary() noexcept
+{
+    auto* runLoop = CFRunLoopGetCurrent();
+    const auto betweenFetches = applicationEventFetchDepth == 0
+        && applicationEventFetchActiveInvocation == 0
+        && ! applicationEventFetchContextRecorded;
+    const auto activeOuterFetch = currentApplicationEventFetchCanBindBarrier()
+        && runLoop != nullptr
+        && runLoop == CFRunLoopGetMain()
+        && currentRunLoopModeMatchesApplicationEventFetch(runLoop);
+    return betweenFetches || activeOuterFetch;
+}
+
+static bool applicationMainMenuTrackingStateIsConsistent() noexcept
+{
+    const auto unresolvedRequests =
+        applicationMainMenuTrackingCancellationPendingRequest != 0
+            && ! applicationMainMenuTrackingCancellationInProgress ? 1u : 0u;
+    return ! applicationMainMenuTrackingObservationInvalid
+        && applicationMainMenuTrackingBeginCount >= applicationMainMenuTrackingEndCount
+        && applicationMainMenuTrackingBeginCount - applicationMainMenuTrackingEndCount
+            == applicationMainMenuTrackingDepth
+        && (applicationMainMenuTrackingDepth == 0)
+            == (applicationActiveMainMenuTrackingRoot == nil)
+        && applicationMainMenuTrackingSessionCount
+            <= applicationMainMenuTrackingBeginCount
+        && applicationMainMenuTrackingCancellationRequestCount
+            <= maximumApplicationMainMenuTrackingCancellationRequests
+        && applicationMainMenuTrackingCancelCount
+            <= maximumApplicationMainMenuTrackingCancellationCalls
+        && applicationMainMenuTrackingCancellationRequestCount
+            == applicationMainMenuTrackingCancelCount
+                + applicationMainMenuTrackingCancellationSkipCount
+                + unresolvedRequests
+        && applicationMainMenuTrackingCancellationExceptionCount
+            <= applicationMainMenuTrackingCancelCount
+        && applicationMainMenuTrackingCancellationRequestedSession
+            <= applicationMainMenuTrackingSessionCount
+        && applicationMainMenuTrackingCancellationCalledSession
+            <= applicationMainMenuTrackingCancellationRequestedSession
+        && applicationMainMenuTrackingAwaitingOuterBoundarySession
+            <= applicationMainMenuTrackingSessionCount
+        && (applicationMainMenuTrackingAwaitingOuterBoundarySession == 0)
+            == (applicationMainMenuTrackingPendingSessionWatchdogTicket == 0)
+        && applicationMainMenuTrackingActiveSessionWatchdogTicket.load(
+                std::memory_order_acquire)
+            == applicationMainMenuTrackingPendingSessionWatchdogTicket
+        && (! applicationMainMenuTrackingCancellationInProgress
+            || (applicationMainMenuTrackingCancellationPendingRequest != 0
+                && applicationMainMenuTrackingCancellationCalledSession
+                    == applicationMainMenuTrackingSessionCount));
+}
+
+static bool applicationMainMenuTrackingIsQuiescent() noexcept
+{
+    return applicationMainMenuTrackingStateIsConsistent()
+        && applicationMainMenuTrackingDepth == 0
+        && applicationMainMenuTrackingCancellationPendingRequest == 0
+        && applicationMainMenuTrackingAwaitingOuterBoundarySession == 0
+        && ! applicationMainMenuTrackingCancellationInProgress;
+}
+
+static bool retireCompletedMainMenuTrackingAtOuterBoundary() noexcept
+{
+    if (applicationMainMenuTrackingAwaitingOuterBoundarySession == 0)
+        return true;
+    if (applicationMainMenuTrackingDepth != 0
+        || applicationMainMenuTrackingCancellationPendingRequest != 0
+        || ! applicationEventFetchIsAtSafeOuterBoundary())
+        return false;
+
+    std::fprintf(stderr,
+                 "NATIVE_APP_LOOP_MAIN_MENU_OUTER_BOUNDARY session=%lu depth=%lu invocation=%lu\n",
+                 static_cast<unsigned long>(
+                     applicationMainMenuTrackingAwaitingOuterBoundarySession),
+                 static_cast<unsigned long>(applicationEventFetchDepth),
+                 static_cast<unsigned long>(applicationEventFetchActiveInvocation));
+    std::fflush(stderr);
+    applicationMainMenuTrackingAwaitingOuterBoundarySession = 0;
+    const auto ticket = applicationMainMenuTrackingPendingSessionWatchdogTicket;
+    auto expected = ticket;
+    (void) applicationMainMenuTrackingActiveSessionWatchdogTicket
+        .compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
+    applicationMainMenuTrackingPendingSessionWatchdogTicket = 0;
+    return true;
+}
+
+static void resolveApplicationMainMenuTrackingSessionWatchdog() noexcept
+{
+    const auto ticket = applicationMainMenuTrackingPendingSessionWatchdogTicket;
+    if (ticket == 0)
+        return;
+    auto expected = ticket;
+    (void) applicationMainMenuTrackingActiveSessionWatchdogTicket
+        .compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
+    applicationMainMenuTrackingPendingSessionWatchdogTicket = 0;
+}
+
+static bool armApplicationMainMenuTrackingSessionWatchdog(NSUInteger session) noexcept
+{
+    if (applicationMainMenuTrackingPendingSessionWatchdogTicket != 0
+        || applicationMainMenuTrackingActiveSessionWatchdogTicket.load(
+               std::memory_order_acquire) != 0)
+        return false;
+    if (++applicationMainMenuTrackingSessionWatchdogSequence == 0)
+        ++applicationMainMenuTrackingSessionWatchdogSequence;
+    const auto ticket = applicationMainMenuTrackingSessionWatchdogSequence;
+    applicationMainMenuTrackingPendingSessionWatchdogTicket = ticket;
+    applicationMainMenuTrackingActiveSessionWatchdogTicket.store(
+        ticket, std::memory_order_release);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0),
+                   ^{
+        if (applicationMainMenuTrackingActiveSessionWatchdogTicket.load(
+                std::memory_order_acquire) != ticket)
+            return;
+        std::fprintf(stderr,
+                     "NATIVE_APP_LOOP_MAIN_MENU_SESSION_TIMEOUT session=%lu ticket=%llu\n",
+                     static_cast<unsigned long>(session),
+                     static_cast<unsigned long long>(ticket));
+        std::fflush(stderr);
+        std::terminate();
+    });
+    return true;
 }
 
 static const char* applicationEventFetchReturnPathName() noexcept
@@ -1138,6 +1294,115 @@ static bool proveApplicationPeriodicSlotForJuceHandoff() noexcept
 }
 @end
 
+@implementation WhyKikiApplicationMenuTrackingObservation
+- (void)menuDidBeginTracking:(NSNotification*)notification
+{
+    auto* menu = (NSMenu*) [notification object];
+    if (menu == nil || menu != [NSApp mainMenu])
+        return;
+
+    if (![NSThread isMainThread]
+        || (applicationMainMenuTrackingDepth != 0
+            && applicationActiveMainMenuTrackingRoot != menu))
+    {
+        applicationMainMenuTrackingObservationInvalid = true;
+        std::fputs("NATIVE_APP_LOOP_MAIN_MENU_TRACKING_BEGIN_INVALID\n", stderr);
+        std::fflush(stderr);
+        return;
+    }
+
+    if (applicationMainMenuTrackingDepth == 0)
+    {
+        applicationActiveMainMenuTrackingRoot = [menu retain];
+        ++applicationMainMenuTrackingSessionCount;
+        applicationMainMenuTrackingAwaitingOuterBoundarySession =
+            applicationMainMenuTrackingSessionCount;
+        if (! armApplicationMainMenuTrackingSessionWatchdog(
+                applicationMainMenuTrackingSessionCount))
+        {
+            applicationMainMenuTrackingObservationInvalid = true;
+            std::fputs("NATIVE_APP_LOOP_MAIN_MENU_SESSION_WATCHDOG_ARM_FAILED\n",
+                       stderr);
+            std::fflush(stderr);
+            std::terminate();
+        }
+    }
+    ++applicationMainMenuTrackingDepth;
+    ++applicationMainMenuTrackingBeginCount;
+    std::fprintf(stderr,
+                 "NATIVE_APP_LOOP_MAIN_MENU_TRACKING_BEGIN session=%lu depth=%lu begins=%lu ends=%lu\n",
+                 static_cast<unsigned long>(applicationMainMenuTrackingSessionCount),
+                 static_cast<unsigned long>(applicationMainMenuTrackingDepth),
+                 static_cast<unsigned long>(applicationMainMenuTrackingBeginCount),
+                 static_cast<unsigned long>(applicationMainMenuTrackingEndCount));
+    std::fflush(stderr);
+    // Queue before the tracking loop can suspend the coordinator's outer
+    // callback. The one-shot itself runs later in tracking mode and revalidates
+    // every piece of evidence before touching the menu.
+    if (! applicationMainMenuTrackingCancellationAllowed)
+    {
+        std::fputs("NATIVE_APP_LOOP_MAIN_MENU_CANCEL_SKIPPED reason=disabled\n", stderr);
+        std::fflush(stderr);
+        return;
+    }
+    const auto result = NativeFilePanel::requestApplicationMenuTrackingCancellationIfNeeded();
+    if (result == NativeFilePanel::ApplicationMenuTrackingCancellationResult::failed)
+    {
+        applicationMainMenuTrackingObservationInvalid = true;
+        std::fputs("NATIVE_APP_LOOP_MAIN_MENU_CANCEL_REQUEST_FAILED_BEGIN\n", stderr);
+        std::fflush(stderr);
+        std::terminate();
+    }
+}
+
+- (void)menuDidEndTracking:(NSNotification*)notification
+{
+    auto* menu = (NSMenu*) [notification object];
+    if (menu == nil)
+        return;
+    if (applicationActiveMainMenuTrackingRoot == nil)
+    {
+        if (menu != [NSApp mainMenu])
+            return;
+    }
+    else if (menu != applicationActiveMainMenuTrackingRoot)
+        return;
+
+    if (![NSThread isMainThread]
+        || applicationMainMenuTrackingDepth == 0
+        || menu != applicationActiveMainMenuTrackingRoot)
+    {
+        applicationMainMenuTrackingObservationInvalid = true;
+        std::fputs("NATIVE_APP_LOOP_MAIN_MENU_TRACKING_END_INVALID\n", stderr);
+        std::fflush(stderr);
+        return;
+    }
+
+    --applicationMainMenuTrackingDepth;
+    ++applicationMainMenuTrackingEndCount;
+    if (applicationMainMenuTrackingDepth == 0)
+    {
+        if (applicationMainMenuTrackingCancellationPendingRequest != 0
+            && ! applicationMainMenuTrackingCancellationInProgress)
+        {
+            ++applicationMainMenuTrackingCancellationSkipCount;
+            applicationMainMenuTrackingCancellationPendingRequest = 0;
+            std::fputs("NATIVE_APP_LOOP_MAIN_MENU_CANCEL_SKIPPED reason=ended-before-request\n",
+                       stderr);
+        }
+        [applicationActiveMainMenuTrackingRoot release];
+        applicationActiveMainMenuTrackingRoot = nil;
+    }
+    std::fprintf(stderr,
+                 "NATIVE_APP_LOOP_MAIN_MENU_TRACKING_END session=%lu depth=%lu begins=%lu ends=%lu\n",
+                 static_cast<unsigned long>(applicationMainMenuTrackingSessionCount),
+                 static_cast<unsigned long>(applicationMainMenuTrackingDepth),
+                 static_cast<unsigned long>(applicationMainMenuTrackingBeginCount),
+                 static_cast<unsigned long>(applicationMainMenuTrackingEndCount));
+    std::fflush(stderr);
+}
+@end
+
 namespace
 {
 using CompletionHandler = void (^)(NSModalResponse);
@@ -1523,8 +1788,8 @@ void NativeFilePanel::prepareTestApplication(
             throw std::runtime_error("NATIVE_PANEL_SETUP: instrumented test application is not installed");
         if ([NSApp isRunning])
             throw std::runtime_error("NATIVE_PANEL_SETUP: event monitor must be installed before the app loop");
-        if (applicationEventMonitor != nil)
-            throw std::runtime_error("NATIVE_PANEL_SETUP: application event monitor is already active");
+        if (applicationEventMonitor != nil || applicationMenuTrackingObserver != nil)
+            throw std::runtime_error("NATIVE_PANEL_SETUP: application observers are already active");
         if (applicationControlEventNonce != 0
             || applicationControlEventPostedMask != 0)
             throw std::runtime_error("NATIVE_PANEL_SETUP: control-event token state was not retired");
@@ -1659,7 +1924,39 @@ void NativeFilePanel::prepareTestApplication(
         applicationStopEventDequeueCount = 0;
         applicationControlEventNonce = createApplicationControlEventNonce();
         applicationControlEventPostedMask = 0;
+        [applicationActiveMainMenuTrackingRoot release];
+        applicationActiveMainMenuTrackingRoot = nil;
+        applicationMainMenuTrackingDepth = 0;
+        applicationMainMenuTrackingBeginCount = 0;
+        applicationMainMenuTrackingEndCount = 0;
+        applicationMainMenuTrackingSessionCount = 0;
+        applicationMainMenuTrackingCancellationRequestCount = 0;
         applicationMainMenuTrackingCancelCount = 0;
+        applicationMainMenuTrackingCancellationSkipCount = 0;
+        applicationMainMenuTrackingCancellationExceptionCount = 0;
+        applicationMainMenuTrackingCancellationRequestedSession = 0;
+        applicationMainMenuTrackingCancellationCalledSession = 0;
+        applicationMainMenuTrackingCancellationPendingRequest = 0;
+        applicationMainMenuTrackingAwaitingOuterBoundarySession = 0;
+        if (++applicationMainMenuTrackingObservationGeneration == 0)
+            ++applicationMainMenuTrackingObservationGeneration;
+        applicationMainMenuTrackingObservationInvalid = false;
+        applicationMainMenuTrackingCancellationAllowed = true;
+        applicationMainMenuTrackingCancellationInProgress = false;
+
+        applicationMenuTrackingObserver =
+            [[WhyKikiApplicationMenuTrackingObservation alloc] init];
+        if (applicationMenuTrackingObserver == nil)
+            throw std::runtime_error("NATIVE_PANEL_SETUP: cannot create menu tracking observer");
+        auto* notificationCenter = [NSNotificationCenter defaultCenter];
+        [notificationCenter addObserver:applicationMenuTrackingObserver
+                               selector:@selector(menuDidBeginTracking:)
+                                   name:NSMenuDidBeginTrackingNotification
+                                 object:nil];
+        [notificationCenter addObserver:applicationMenuTrackingObserver
+                               selector:@selector(menuDidEndTracking:)
+                                   name:NSMenuDidEndTrackingNotification
+                                 object:nil];
         applicationEventMonitor = [NSEvent
             addLocalMonitorForEventsMatchingMask:NSEventMaskApplicationDefined
                                        handler:^NSEvent* (NSEvent* event)
@@ -1723,6 +2020,8 @@ void NativeFilePanel::prepareTestApplication(
                                                    [NSApp modalWindow] == nil;
                                                applicationSettleEventHandlerDepth =
                                                    handlerDepth;
+                                               const auto menuBoundaryReady =
+                                                   retireCompletedMainMenuTrackingAtOuterBoundary();
                                                std::fprintf(stderr,
                                                             "NATIVE_APP_LOOP_SETTLE_HANDLED count=%lu running=%d postedFromReady=%d currentEvent=%d modalWindow=%d handlerDepth=%lu dequeueDepth=%lu dequeues=%lu\n",
                                                             static_cast<unsigned long>(applicationSettleEventCount),
@@ -1734,7 +2033,8 @@ void NativeFilePanel::prepareTestApplication(
                                                             static_cast<unsigned long>(applicationSettleEventDequeueDepth),
                                                             static_cast<unsigned long>(applicationSettleEventDequeueCount));
                                                std::fflush(stderr);
-                                               if (! NativeFilePanel::applicationSettleEventWasHandled())
+                                               if (! menuBoundaryReady
+                                                   || ! NativeFilePanel::applicationSettleEventWasHandled())
                                                {
                                                    std::fputs("NATIVE_APP_LOOP_SETTLE_INVALID\n", stderr);
                                                    std::fflush(stderr);
@@ -1764,8 +2064,11 @@ void NativeFilePanel::prepareTestApplication(
                                                    [NSApp modalWindow] == nil;
                                                applicationStopEventHandlerDepth =
                                                    handlerDepth;
+                                               const auto menuBoundaryReady =
+                                                   retireCompletedMainMenuTrackingAtOuterBoundary();
                                                const auto stopCallbackIsReady =
-                                                   applicationStopEventCount == 1
+                                                   menuBoundaryReady
+                                                   && applicationStopEventCount == 1
                                                    && NativeFilePanel::applicationSettleEventWasHandled()
                                                    && running
                                                    && applicationStopEventPostedFromReadyContext
@@ -1807,6 +2110,11 @@ void NativeFilePanel::prepareTestApplication(
                                        }];
         if (applicationEventMonitor == nil)
         {
+            applicationMainMenuTrackingCancellationAllowed = false;
+            ++applicationMainMenuTrackingObservationGeneration;
+            [notificationCenter removeObserver:applicationMenuTrackingObserver];
+            [applicationMenuTrackingObserver release];
+            applicationMenuTrackingObserver = nil;
             applicationStopCallback = nullptr;
             applicationFetchBoundCallback = nullptr;
             applicationFetchBoundContext = nullptr;
@@ -1824,59 +2132,164 @@ bool NativeFilePanel::applicationIsRunning() noexcept
     }
 }
 NativeFilePanel::ApplicationMenuTrackingCancellationResult
-NativeFilePanel::cancelApplicationMenuTrackingForShutdownIfNeeded() noexcept
+NativeFilePanel::requestApplicationMenuTrackingCancellationIfNeeded() noexcept
 {
     @autoreleasepool
     {
-        auto* runLoop = CFRunLoopGetCurrent();
-        const auto nestedTrackingFetch = isRunnableApplicationEventContext()
-            && applicationStartEventWasHandled()
-            && applicationEventFetchDepth > 1
-            && currentApplicationEventFetchHasBoundContext()
-            && [applicationEventFetchMode isEqualToString:NSEventTrackingRunLoopMode]
-            && runLoop != nullptr
-            && runLoop == CFRunLoopGetMain()
-            && currentRunLoopModeMatchesApplicationEventFetch(runLoop);
-        if (! nestedTrackingFetch || applicationMainMenuTrackingCancelCount == 1)
+        if (![NSThread isMainThread]
+            || applicationMenuTrackingObserver == nil
+            || ! applicationMainMenuTrackingStateIsConsistent()
+            || applicationMainMenuTrackingCancellationExceptionCount != 0)
+            return ApplicationMenuTrackingCancellationResult::failed;
+        if (applicationMainMenuTrackingDepth == 0
+            && applicationMainMenuTrackingCancellationPendingRequest == 0)
+        {
+            if (! retireCompletedMainMenuTrackingAtOuterBoundary())
+                return ApplicationMenuTrackingCancellationResult::waitingForSafeRequest;
             return ApplicationMenuTrackingCancellationResult::notNeeded;
-        if (applicationMainMenuTrackingCancelCount != 0
+        }
+        if (! applicationMainMenuTrackingCancellationAllowed
+            || (applicationMainMenuTrackingCancelCount
+                    == maximumApplicationMainMenuTrackingCancellationCalls
+                && applicationMainMenuTrackingCancellationCalledSession
+                    != applicationMainMenuTrackingSessionCount))
+            return ApplicationMenuTrackingCancellationResult::failed;
+        if (applicationMainMenuTrackingCancellationPendingRequest != 0
+            || applicationMainMenuTrackingCancellationCalledSession
+                == applicationMainMenuTrackingSessionCount)
+            return ApplicationMenuTrackingCancellationResult::waitingForSafeRequest;
+
+        if (applicationEventFetchReturnRequested
             || applicationFetchBarrierEventPosted
             || applicationSettleEventPosted
             || applicationStopEventPosted
-            || ! applicationEventFetchPeriodicPulseStateIsConsistent())
+            || ! applicationStartEventWasHandled()
+            || ! applicationEventFetchPeriodicPulseIsInactiveAndBalanced())
+            return ApplicationMenuTrackingCancellationResult::waitingForSafeRequest;
+        if (applicationMainMenuTrackingCancellationRequestCount
+            == maximumApplicationMainMenuTrackingCancellationRequests)
             return ApplicationMenuTrackingCancellationResult::failed;
 
-        auto* mainMenu = [NSApp mainMenu];
-        if (mainMenu == nil)
-            return ApplicationMenuTrackingCancellationResult::failed;
+        const auto generation = applicationMainMenuTrackingObservationGeneration;
+        const auto session = applicationMainMenuTrackingSessionCount;
+        const auto request = ++applicationMainMenuTrackingCancellationRequestCount;
+        auto* const trackedMenu = applicationActiveMainMenuTrackingRoot;
+        applicationMainMenuTrackingCancellationRequestedSession = session;
+        applicationMainMenuTrackingCancellationPendingRequest = request;
 
-        ++applicationMainMenuTrackingCancelCount;
-        @try
-        {
-            // A remote AppKit view can begin NSMenuBarTrackingSession while the
-            // test window becomes key. Public NSMenu cancellation is the only
-            // action here: the callback must return before fetch readiness is
-            // reconsidered, so this cannot manufacture an event-loop boundary.
-            [mainMenu cancelTrackingWithoutAnimation];
-        }
-        @catch (NSException* exception)
-        {
-            const auto* name = [[exception name] UTF8String];
+        CFRunLoopPerformBlock(CFRunLoopGetMain(),
+                              (CFStringRef) NSEventTrackingRunLoopMode,
+                              ^{
+            if (generation != applicationMainMenuTrackingObservationGeneration
+                || request != applicationMainMenuTrackingCancellationPendingRequest)
+                return;
+
+            auto* currentRunLoop = CFRunLoopGetCurrent();
+            const auto sameObservedSession =
+                applicationMainMenuTrackingCancellationAllowed
+                && applicationMenuTrackingObserver != nil
+                && applicationMainMenuTrackingStateIsConsistent()
+                && session == applicationMainMenuTrackingSessionCount
+                && applicationMainMenuTrackingDepth > 0
+                && trackedMenu != nil
+                && trackedMenu == applicationActiveMainMenuTrackingRoot
+                && trackedMenu == [NSApp mainMenu];
+            const auto stillInProvedTrackingFetch =
+                applicationStartEventWasHandled()
+                && isRunnableApplicationEventContext()
+                && applicationEventFetchDepth > 1
+                && currentApplicationEventFetchHasBoundContext()
+                && [applicationEventFetchMode isEqualToString:NSEventTrackingRunLoopMode]
+                && currentRunLoop != nullptr
+                && currentRunLoop == CFRunLoopGetMain()
+                && currentRunLoopModeMatchesApplicationEventFetch(currentRunLoop);
+            const auto controlPathStillSafe =
+                ! applicationEventFetchReturnRequested
+                && ! applicationFetchBarrierEventPosted
+                && ! applicationSettleEventPosted
+                && ! applicationStopEventPosted
+                && applicationEventFetchPeriodicPulseIsInactiveAndBalanced();
+            if (! sameObservedSession || ! stillInProvedTrackingFetch
+                || ! controlPathStillSafe)
+            {
+                ++applicationMainMenuTrackingCancellationSkipCount;
+                applicationMainMenuTrackingCancellationPendingRequest = 0;
+                std::fprintf(stderr,
+                             "NATIVE_APP_LOOP_MAIN_MENU_CANCEL_SKIPPED request=%lu session=%lu reason=revalidation\n",
+                             static_cast<unsigned long>(request),
+                             static_cast<unsigned long>(session));
+                std::fflush(stderr);
+                return;
+            }
+
+            applicationMainMenuTrackingCancellationInProgress = true;
+            applicationMainMenuTrackingCancellationCalledSession = session;
+            ++applicationMainMenuTrackingCancelCount;
+            @try
+            {
+                // Run as its own tracking-mode block. Ending the session from
+                // the coordinator timer itself can unwind suspended JUCE timer
+                // frames before that callback has returned.
+                [trackedMenu cancelTrackingWithoutAnimation];
+            }
+            @catch (NSException* exception)
+            {
+                ++applicationMainMenuTrackingCancellationExceptionCount;
+                const auto* name = [[exception name] UTF8String];
+                std::fprintf(stderr,
+                             "NATIVE_APP_LOOP_MAIN_MENU_CANCEL_FAILED name=%s\n",
+                             name != nullptr ? name : "<unavailable>");
+            }
+            applicationMainMenuTrackingCancellationInProgress = false;
+            applicationMainMenuTrackingCancellationPendingRequest = 0;
             std::fprintf(stderr,
-                         "NATIVE_APP_LOOP_MENU_TRACKING_CANCEL_FAILED name=%s\n",
-                         name != nullptr ? name : "<unavailable>");
+                         "NATIVE_APP_LOOP_MAIN_MENU_CANCEL_CALLED request=%lu session=%lu calls=%lu depth=%lu invocation=%lu requestActive=%d\n",
+                         static_cast<unsigned long>(request),
+                         static_cast<unsigned long>(session),
+                         static_cast<unsigned long>(applicationMainMenuTrackingCancelCount),
+                         static_cast<unsigned long>(applicationEventFetchDepth),
+                         static_cast<unsigned long>(applicationEventFetchActiveInvocation),
+                         applicationEventFetchReturnRequested ? 1 : 0);
             std::fflush(stderr);
-            return ApplicationMenuTrackingCancellationResult::failed;
-        }
-
+        });
+        CFRunLoopWakeUp(CFRunLoopGetMain());
         std::fprintf(stderr,
-                     "NATIVE_APP_LOOP_MENU_TRACKING_CANCELLED count=%lu activeFetchDepth=%lu invocation=%lu request=%d\n",
-                     static_cast<unsigned long>(applicationMainMenuTrackingCancelCount),
+                     "NATIVE_APP_LOOP_MAIN_MENU_CANCEL_POSTED request=%lu session=%lu depth=%lu invocation=%lu\n",
+                     static_cast<unsigned long>(request),
+                     static_cast<unsigned long>(session),
                      static_cast<unsigned long>(applicationEventFetchDepth),
-                     static_cast<unsigned long>(applicationEventFetchActiveInvocation),
-                     applicationEventFetchReturnRequested ? 1 : 0);
+                     static_cast<unsigned long>(applicationEventFetchActiveInvocation));
         std::fflush(stderr);
-        return ApplicationMenuTrackingCancellationResult::cancelled;
+        return ApplicationMenuTrackingCancellationResult::requestPosted;
+    }
+}
+bool NativeFilePanel::applicationMenuTrackingCancellationIsInProgress() noexcept
+{
+    return applicationMainMenuTrackingCancellationInProgress;
+}
+void NativeFilePanel::disableApplicationMenuTrackingCancellation() noexcept
+{
+    if ([NSThread isMainThread])
+        applicationMainMenuTrackingCancellationAllowed = false;
+}
+bool NativeFilePanel::applicationIsAtSafeLifetimeBoundary() noexcept
+{
+    @autoreleasepool
+    {
+        if (![NSThread isMainThread]
+            || ! applicationStartEventWasHandled()
+            || ! applicationMainMenuTrackingStateIsConsistent()
+            || ! applicationEventFetchPeriodicPulseIsInactiveAndBalanced()
+            || applicationEventFetchReturnRequested
+            || applicationFetchBarrierEventPosted
+            || applicationSettleEventPosted
+            || applicationStopEventPosted
+            || ! applicationEventFetchIsAtSafeOuterBoundary()
+            || ! isRunnableApplicationEventContext())
+            return false;
+
+        return retireCompletedMainMenuTrackingAtOuterBoundary()
+            && applicationMainMenuTrackingIsQuiescent();
     }
 }
 bool NativeFilePanel::postApplicationStartEvent() noexcept
@@ -1924,7 +2337,8 @@ bool NativeFilePanel::applicationIsReadyForSettleEvent() noexcept
             && ! applicationStopEventPosted
             && applicationStopEventCount == 0
             && ! applicationEventFetchReturnRequested
-            && applicationMainMenuTrackingCancelCount <= 1
+            && applicationMainMenuTrackingIsQuiescent()
+            && applicationMainMenuTrackingCancellationExceptionCount == 0
             && (betweenFetches || activeOuterFetch)
             && isRunnableApplicationEventContext();
     }
@@ -2207,14 +2621,24 @@ void NativeFilePanel::logApplicationSettleReadiness() noexcept
                 - applicationEventFetchRequestReturnBase
             : 0;
         std::fprintf(stderr,
-                     "NATIVE_APP_LOOP_SETTLE_READINESS depth=%lu activeInvocation=%lu context=%d mask=0x%llx dequeue=%d mode=%d menuTrackingCancels=%lu request=%d path=%s pulseState=%u pulseInitialDepth=%lu pulseTargetDepth=%lu pulseTargetInvocation=%lu pulseAttempts=%lu pulseStarts=%lu pulseStartFailures=%lu pulseStops=%lu pulsePassiveResolutions=%lu pulseSlotProbeResolutions=%lu pulseResolutions=%lu pulseTargetReturns=%lu pulseDeeperReturns=%lu pulsePeriodicReturns=%lu slotProofPending=%d ledger=%d requestInitialDepth=%lu requestMinimumDepth=%lu requestEntries=%lu requestReturns=%lu sameDepthReentries=%lu noDepthProgress=%lu claims=%lu wakeDriverStops=%lu start=%d running=%d modalWindow=%d\n",
+                     "NATIVE_APP_LOOP_SETTLE_READINESS depth=%lu activeInvocation=%lu context=%d mask=0x%llx dequeue=%d mode=%d menuTrackingDepth=%lu menuTrackingBegins=%lu menuTrackingEnds=%lu menuTrackingSessions=%lu menuCancelRequests=%lu menuCancelCalls=%lu menuCancelSkips=%lu menuCancelExceptions=%lu menuCancelPending=%lu menuAwaitingOuterSession=%lu request=%d path=%s pulseState=%u pulseInitialDepth=%lu pulseTargetDepth=%lu pulseTargetInvocation=%lu pulseAttempts=%lu pulseStarts=%lu pulseStartFailures=%lu pulseStops=%lu pulsePassiveResolutions=%lu pulseSlotProbeResolutions=%lu pulseResolutions=%lu pulseTargetReturns=%lu pulseDeeperReturns=%lu pulsePeriodicReturns=%lu slotProofPending=%d ledger=%d requestInitialDepth=%lu requestMinimumDepth=%lu requestEntries=%lu requestReturns=%lu sameDepthReentries=%lu noDepthProgress=%lu claims=%lu wakeDriverStops=%lu start=%d running=%d modalWindow=%d\n",
                      static_cast<unsigned long>(applicationEventFetchDepth),
                      static_cast<unsigned long>(applicationEventFetchActiveInvocation),
                      applicationEventFetchContextRecorded ? 1 : 0,
                      static_cast<unsigned long long>(applicationEventFetchMask),
                      applicationEventFetchDequeues ? 1 : 0,
                      applicationEventFetchModeSupplied ? 1 : 0,
+                     static_cast<unsigned long>(applicationMainMenuTrackingDepth),
+                     static_cast<unsigned long>(applicationMainMenuTrackingBeginCount),
+                     static_cast<unsigned long>(applicationMainMenuTrackingEndCount),
+                     static_cast<unsigned long>(applicationMainMenuTrackingSessionCount),
+                     static_cast<unsigned long>(applicationMainMenuTrackingCancellationRequestCount),
                      static_cast<unsigned long>(applicationMainMenuTrackingCancelCount),
+                     static_cast<unsigned long>(applicationMainMenuTrackingCancellationSkipCount),
+                     static_cast<unsigned long>(applicationMainMenuTrackingCancellationExceptionCount),
+                     static_cast<unsigned long>(applicationMainMenuTrackingCancellationPendingRequest),
+                     static_cast<unsigned long>(
+                         applicationMainMenuTrackingAwaitingOuterBoundarySession),
                      applicationEventFetchReturnRequested ? 1 : 0,
                      applicationEventFetchReturnPathName(),
                      static_cast<unsigned>(applicationEventFetchPeriodicPulseState),
@@ -2291,6 +2715,8 @@ bool NativeFilePanel::applicationIsReadyForStopEvent() noexcept
     @autoreleasepool
     {
         return applicationSettleEventWasHandled()
+            && applicationMainMenuTrackingIsQuiescent()
+            && applicationMainMenuTrackingCancellationExceptionCount == 0
             && applicationEventFetchPeriodicPulseIsInactiveAndBalanced()
             && ! applicationStopEventPosted
             && applicationStopEventCount == 0
@@ -2332,7 +2758,8 @@ bool NativeFilePanel::applicationStopEventWasHandled() noexcept
             && applicationStopEventDequeueInvocation > applicationSettleEventDequeueInvocation
             && applicationControlEventPostedMask
                 == allApplicationControlEventsPostedMask
-            && applicationMainMenuTrackingCancelCount <= 1
+            && applicationMainMenuTrackingIsQuiescent()
+            && applicationMainMenuTrackingCancellationExceptionCount == 0
             && applicationEventFetchPeriodicPulseIsInactiveAndBalanced()
             && applicationStopCallbackSucceeded
             && applicationJuceHandoffProbeStartCount == 1
@@ -2347,6 +2774,12 @@ void NativeFilePanel::finishTestApplication() noexcept
     {
         if (![NSThread isMainThread])
             return;
+        // Invalidate queued tracking-mode blocks before releasing their
+        // observer-owned evidence. A stale block can then only return.
+        applicationMainMenuTrackingCancellationAllowed = false;
+        resolveApplicationMainMenuTrackingSessionWatchdog();
+        if (++applicationMainMenuTrackingObservationGeneration == 0)
+            ++applicationMainMenuTrackingObservationGeneration;
         applicationEventFetchReturnRequested = false;
         applicationStopCallback = nullptr;
         applicationFetchBoundCallback = nullptr;
@@ -2395,9 +2828,34 @@ void NativeFilePanel::finishTestApplication() noexcept
             [NSEvent removeMonitor:applicationEventMonitor];
             applicationEventMonitor = nil;
         }
+        if (applicationMenuTrackingObserver != nil)
+        {
+            [[NSNotificationCenter defaultCenter]
+                removeObserver:applicationMenuTrackingObserver];
+            [applicationMenuTrackingObserver release];
+            applicationMenuTrackingObserver = nil;
+        }
+        [applicationActiveMainMenuTrackingRoot release];
+        applicationActiveMainMenuTrackingRoot = nil;
         applicationControlEventNonce = 0;
         applicationControlEventPostedMask = 0;
+        applicationMainMenuTrackingDepth = 0;
+        applicationMainMenuTrackingBeginCount = 0;
+        applicationMainMenuTrackingEndCount = 0;
+        applicationMainMenuTrackingSessionCount = 0;
+        applicationMainMenuTrackingCancellationRequestCount = 0;
         applicationMainMenuTrackingCancelCount = 0;
+        applicationMainMenuTrackingCancellationSkipCount = 0;
+        applicationMainMenuTrackingCancellationExceptionCount = 0;
+        applicationMainMenuTrackingCancellationRequestedSession = 0;
+        applicationMainMenuTrackingCancellationCalledSession = 0;
+        applicationMainMenuTrackingCancellationPendingRequest = 0;
+        applicationMainMenuTrackingAwaitingOuterBoundarySession = 0;
+        applicationMainMenuTrackingPendingSessionWatchdogTicket = 0;
+        applicationMainMenuTrackingActiveSessionWatchdogTicket.store(
+            0, std::memory_order_release);
+        applicationMainMenuTrackingObservationInvalid = false;
+        applicationMainMenuTrackingCancellationInProgress = false;
         applicationEventFetchPeriodicPulseRetryNotBefore =
             std::chrono::steady_clock::time_point {};
         applicationEventFetchPeriodicPulseRetryDeadlineRecorded = false;

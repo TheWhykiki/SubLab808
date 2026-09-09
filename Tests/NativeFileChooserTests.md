@@ -77,18 +77,24 @@ It never calls `CFRunLoopRunInMode`, directly invokes `sendEvent:`, or enters a 
 JUCE dispatch loop. Because `NSApplication.stop` called from a timer does not stop the
 main loop, the final clean case boundary first enters its shutdown phase and arms an
 independent five-second watchdog. AppKit can create a nested menu-bar tracking session
-later, while its remote view makes the synthetic host window key; a queued event cannot
-end that session. If a coordinator turn proves both a nested instrumented fetch and the
-exact `NSEventTrackingRunLoopMode`, the test app calls the public
-`NSMenu.cancelTrackingWithoutAnimation` API at most once on its main menu. Clean
-depth-zero and outer depth-one fetches do not cancel a menu. A separate in-progress
-gate makes any synchronous reentrant timer turn inert, and the callback then returns so
-AppKit can unwind. The same detection remains active after the shutdown request to
-close a late tracking-session race. Readiness otherwise requires either no active
-event fetch or a valid outermost depth-one fetch, followed by three consecutive timer
-turns while `NSApplication` is running without an AppKit modal window. A blocking
-cancel, a tracking stack that does not unwind, or a later event-loop return failure
-stays fail-closed. This
+while its remote view makes the synthetic host window key; a queued event cannot end
+that session. Public begin/end notifications identify the exact application main-menu
+root and establish a session ledger. After START, a generation- and session-bound
+one-shot runs separately in `NSEventTrackingRunLoopMode`; immediately before calling
+the public `NSMenu.cancelTrackingWithoutAnimation` API it re-proves the exact retained
+menu, a nested instrumented fetch, its bound tracking mode, balanced periodic ownership,
+and the absence of any shutdown control request. A skipped proof may retry, but at most
+32 requests and one actual cancellation are allowed. Every observed session has one
+independent three-second atomic-ticket watchdog, covering a block that never runs, a
+call that never returns, a missing end notification, and failure to reach a later outer
+fetch boundary. Reentrant timer turns may only queue this one-shot and never advance or
+destroy coordinator state. After the matching end notification, a later outer fetch
+must be observed before any lifetime transition. Once BARRIER is requested, that return
+protocol has priority and menu cancellation is forbidden. Readiness otherwise requires
+either no active event fetch or a valid outermost depth-one fetch, followed by three
+consecutive timer turns while `NSApplication` is running without an AppKit modal window.
+A blocked cancellation, a tracking stack that does not unwind, or a later event-loop
+return failure stays fail-closed. This
 test-process-only cleanup is never linked into a plugin target and cannot cancel a
 Cubase or Reaper host menu. JUCE may deliver those timer messages
 from any common run-loop mode, so posting does not depend on AppKit's transient
@@ -139,7 +145,8 @@ timer before the bound fetch enters AppKit, preventing coordinator messages from
 entering the BARRIER/SETTLE/STOP sequence. Invocation IDs prove the
 BARRIER/SETTLE/STOP separation. Each event records its dequeue and handler depth; the
 handler depth must be lower, proving that the exact fetch returned before AppKit
-dispatched it. The harness never changes `NSApplication`'s running flag, rewrites a
+dispatched it. Apart from waking the separately queued menu-session one-shot, the
+shutdown-return protocol never changes `NSApplication`'s running flag, rewrites a
 fetch deadline or mask, retrieves an event, calls `CFRunLoopWakeUp`, or dispatches an
 event itself. The local monitor must observe both BARRIER and SETTLE while the
 application is running without a modal window. Only then does the SETTLE handler post
@@ -209,8 +216,10 @@ two controls are omitted under sanitizers because an instrumented DSO may be mad
 non-unloadable by the sanitizer runtime, which would invalidate the oracle.
 
 START has a five-second dispatch deadline. After START, the coordinator has an absolute
-32-second isolated / 435-second sequential functional deadline. Even the maximum bounded
-failure cleanup plus the single five-second shutdown watchdog
+32-second isolated / 435-second sequential functional deadline. Every observed menu
+session has a three-second watchdog, and failure cleanup arms the same
+idempotent five-second return watchdog used by normal shutdown before touching UI state.
+Even the maximum bounded cleanup
 stays below CTest's 60-second / 480-second process watchdog with reserve. CTest remains the
 fallback for a callback that blocks before shutdown begins.
 
