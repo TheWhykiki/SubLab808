@@ -95,15 +95,19 @@ main-run-loop mode, the harness starts one short, fetch-bound public AppKit peri
 stream after one positive-period delay, leaving already-ready AppKit work ahead of
 the wake. Ownership is recorded before the start call. A successful start is stopped
 immediately when its target fetch returns for any reason or when the first deeper
-fetch returns a Periodic event. If AppKit reports that the thread already has a
-periodic stream, the harness observes the same physical return boundary passively and
+fetch returns a Periodic event. Either return records a monotonic earliest retry
+100 ms later, so an already-ready event cannot immediately reacquire the
+thread-global slot. An already-eligible depth-one fetch can bind BARRIER immediately
+because it needs no new periodic ownership. If AppKit reports that the thread already
+has a periodic stream, the harness observes the same physical return boundary
+passively and
 never calls `stopPeriodicEvents` for that foreign stream. BARRIER remains forbidden
 until a later main-thread turn synchronously acquires and immediately stops its own
 zero-delay, zero-delivery probe without a run-loop yield, proving that the
-thread-global Periodic slot is free. A failed
-probe returns to passive observation. A later 10 ms turn can bind a fresh observation
-to the restored current invocation; same-depth reentry is legal and receives a new
-invocation token.
+thread-global Periodic slot is free. This zero-yield slot probe does not wait for the
+real-pulse retry deadline. A failed probe returns to passive observation. A later
+10 ms turn can bind a fresh observation to the restored current invocation;
+same-depth reentry is legal and receives a new invocation token.
 
 Neither an owned nor a foreign Periodic event is the shutdown oracle. The request
 ledger requires `initial depth + entries == returns + current depth`, counts

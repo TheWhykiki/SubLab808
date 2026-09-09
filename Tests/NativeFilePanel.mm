@@ -1,6 +1,7 @@
 #include "NativeFilePanel.h"
 #include "MacModulePin.h"
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
@@ -102,6 +103,9 @@ static NSUInteger applicationEventFetchRequestAttemptsWithoutDepthProgress = 0;
 static bool applicationEventFetchRequestLedgerRecorded = false;
 static bool applicationEventFetchPeriodicSlotMustBeProvedFree = false;
 static bool applicationEventFetchPeriodicPulseIsSlotProbe = false;
+static std::chrono::steady_clock::time_point
+    applicationEventFetchPeriodicPulseRetryNotBefore {};
+static bool applicationEventFetchPeriodicPulseRetryDeadlineRecorded = false;
 static NSUInteger applicationJuceHandoffProbeStartCount = 0;
 static NSUInteger applicationJuceHandoffProbeStopCount = 0;
 static NSUInteger applicationJuceHandoffProbeFailureCount = 0;
@@ -136,6 +140,8 @@ static constexpr NSUInteger maximumApplicationEventFetchPeriodicPulseAttempts = 
 static constexpr NSUInteger maximumApplicationEventFetchRequestTransitions = 4096;
 static constexpr NSUInteger maximumApplicationEventFetchAttemptsWithoutDepthProgress = 32;
 static constexpr NSTimeInterval applicationEventFetchPeriodicPulsePeriod = 0.1;
+static constexpr auto applicationEventFetchPeriodicPulseRetryCooldown =
+    std::chrono::milliseconds { 100 };
 
 static NSUInteger applicationControlEventPostedBit(NSInteger code) noexcept
 {
@@ -436,6 +442,24 @@ enum class ApplicationEventFetchPeriodicPulseResolutionReason : unsigned char
     finishCleanup
 };
 
+static bool applicationEventFetchPeriodicPulseRetryIsDeferred() noexcept
+{
+    return applicationEventFetchPeriodicPulseRetryDeadlineRecorded
+        && std::chrono::steady_clock::now()
+            < applicationEventFetchPeriodicPulseRetryNotBefore;
+}
+
+static void deferApplicationEventFetchPeriodicPulseRetry() noexcept
+{
+    const auto retryNotBefore =
+        std::chrono::steady_clock::now()
+        + applicationEventFetchPeriodicPulseRetryCooldown;
+    if (! applicationEventFetchPeriodicPulseRetryDeadlineRecorded
+        || applicationEventFetchPeriodicPulseRetryNotBefore < retryNotBefore)
+        applicationEventFetchPeriodicPulseRetryNotBefore = retryNotBefore;
+    applicationEventFetchPeriodicPulseRetryDeadlineRecorded = true;
+}
+
 static void logFirstApplicationEventFetchPeriodicPulseStack() noexcept
 {
     @autoreleasepool
@@ -562,9 +586,13 @@ static bool stopOwnedApplicationEventFetchPeriodicPulse(
         || reason == ApplicationEventFetchPeriodicPulseResolutionReason::slotAvailabilityProbe)
         applicationEventFetchReturnPath =
             ApplicationEventFetchReturnPath::nextEligibleAfterPeriodicPulse;
+    if (reason == ApplicationEventFetchPeriodicPulseResolutionReason::targetReturn
+        || reason
+            == ApplicationEventFetchPeriodicPulseResolutionReason::deeperPeriodicReturn)
+        deferApplicationEventFetchPeriodicPulseRetry();
 
     std::fprintf(stderr,
-                 "NATIVE_APP_LOOP_FETCH_PULSE_STOPPED reason=%u targetDepth=%lu targetInvocation=%lu returnDepth=%lu returnInvocation=%lu eventType=%ld starts=%lu stops=%lu\n",
+                 "NATIVE_APP_LOOP_FETCH_PULSE_STOPPED reason=%u targetDepth=%lu targetInvocation=%lu returnDepth=%lu returnInvocation=%lu eventType=%ld starts=%lu stops=%lu retryDeferred=%d\n",
                  static_cast<unsigned>(reason),
                  static_cast<unsigned long>(targetDepth),
                  static_cast<unsigned long>(targetInvocation),
@@ -572,7 +600,8 @@ static bool stopOwnedApplicationEventFetchPeriodicPulse(
                  static_cast<unsigned long>(returningInvocation),
                  event != nil ? static_cast<long>([event type]) : -1L,
                  static_cast<unsigned long>(applicationEventFetchPeriodicPulseStartCount),
-                 static_cast<unsigned long>(applicationEventFetchPeriodicPulseStopCount));
+                 static_cast<unsigned long>(applicationEventFetchPeriodicPulseStopCount),
+                 applicationEventFetchPeriodicPulseRetryIsDeferred() ? 1 : 0);
     std::fflush(stderr);
     return applicationEventFetchPeriodicPulseStateIsConsistent();
 }
@@ -644,11 +673,14 @@ static bool resolvePassiveApplicationEventFetchPeriodicPulse(
             == ApplicationEventFetchPeriodicPulseResolutionReason::deeperPeriodicReturn;
     applicationEventFetchPeriodicSlotMustBeProvedFree = mustProveSlotFree;
     if (mustProveSlotFree)
+    {
         applicationEventFetchReturnPath =
             ApplicationEventFetchReturnPath::nextEligibleAfterPeriodicPulse;
+        deferApplicationEventFetchPeriodicPulseRetry();
+    }
 
     std::fprintf(stderr,
-                 "NATIVE_APP_LOOP_FETCH_PASSIVE_RESOLVED reason=%u targetDepth=%lu targetInvocation=%lu returnDepth=%lu returnInvocation=%lu eventType=%ld passiveResolutions=%lu\n",
+                 "NATIVE_APP_LOOP_FETCH_PASSIVE_RESOLVED reason=%u targetDepth=%lu targetInvocation=%lu returnDepth=%lu returnInvocation=%lu eventType=%ld passiveResolutions=%lu retryDeferred=%d\n",
                  static_cast<unsigned>(reason),
                  static_cast<unsigned long>(targetDepth),
                  static_cast<unsigned long>(targetInvocation),
@@ -656,7 +688,8 @@ static bool resolvePassiveApplicationEventFetchPeriodicPulse(
                  static_cast<unsigned long>(returningInvocation),
                  event != nil ? static_cast<long>([event type]) : -1L,
                  static_cast<unsigned long>(
-                     applicationEventFetchPeriodicPulsePassiveResolutionCount));
+                     applicationEventFetchPeriodicPulsePassiveResolutionCount),
+                 applicationEventFetchPeriodicPulseRetryIsDeferred() ? 1 : 0);
     std::fflush(stderr);
     return applicationEventFetchPeriodicPulseStateIsConsistent();
 }
@@ -1600,6 +1633,9 @@ void NativeFilePanel::prepareTestApplication(
         applicationEventFetchRequestLedgerRecorded = false;
         applicationEventFetchPeriodicSlotMustBeProvedFree = false;
         applicationEventFetchPeriodicPulseIsSlotProbe = false;
+        applicationEventFetchPeriodicPulseRetryNotBefore =
+            std::chrono::steady_clock::time_point {};
+        applicationEventFetchPeriodicPulseRetryDeadlineRecorded = false;
         applicationJuceHandoffProbeStartCount = 0;
         applicationJuceHandoffProbeStopCount = 0;
         applicationJuceHandoffProbeFailureCount = 0;
@@ -2086,7 +2122,15 @@ bool NativeFilePanel::driveApplicationEventFetchReturnRequest() noexcept
         }
 
         if (currentApplicationEventFetchCanUsePeriodicPulse())
+        {
+            // A previous real pulse may have returned an event that was already
+            // queued before its delayed first delivery. Let AppKit consume that
+            // backlog for one monotonic interval after the observed return.
+            // Slot probes and a balanced depth-one BARRIER stay immediate.
+            if (applicationEventFetchPeriodicPulseRetryIsDeferred())
+                return true;
             return beginApplicationEventFetchPeriodicPulse(false);
+        }
         return true;
     }
 }
@@ -2295,6 +2339,9 @@ void NativeFilePanel::finishTestApplication() noexcept
         }
         applicationControlEventNonce = 0;
         applicationControlEventPostedMask = 0;
+        applicationEventFetchPeriodicPulseRetryNotBefore =
+            std::chrono::steady_clock::time_point {};
+        applicationEventFetchPeriodicPulseRetryDeadlineRecorded = false;
     }
 }
 void NativeFilePanel::disableAutomaticWindowAnimations(void* nativeView)
