@@ -81,54 +81,63 @@ from any common run-loop mode, so posting does not depend on AppKit's transient
 `currentMode`; all four marked control events remain the supported
 ApplicationDefined type. Their private subtype, per-run random nonce and event code
 survive any AppKit event copy and are validated before the local monitor consumes one; each
-must be dequeued exactly once through the public AppKit fetch. On that final ready turn the coordinator arms
-an independent GCD watchdog and creates one shutdown request before SETTLE exists.
-The bounded 10 ms source remains active only until BARRIER is successfully queued.
-If the current AppKit fetch is an eligible outermost depth-one fetch,
-the harness posts one private prioritized BARRIER event and calls public `CFRunLoopStop`
-once on the current main run loop;
-the exact BARRIER return subsequently validates that binding at runtime. AppKit may
-nest tracking fetches or use a fetch which deliberately excludes ApplicationDefined events. In that
-case the harness does not synthesize a reserved system event or broaden the supplied
-mask. It requests that the current CoreFoundation run-loop activation stop. After
-the exact fetch's `super nextEventMatchingMask:...` returns and the override restores
-its parent context, the harness requests the next stop, repeating until the active
-fetch stack is empty. Strictly decreasing depths and matching invocation tokens
-validate the observed AppKit unwind. One or more bounded physical stop attempts are
-permitted for the same unchanged invocation before its single logical return; every
-attempt requires the current CoreFoundation mode to equal that exact fetch's supplied
-mode. The harness does not infer a one-to-one identity between AppKit fetches and
-CoreFoundation activations. If another active fetch stack forms before an eligible
-outer fetch appears, a later timer turn begins another independently tokened episode.
-Episode/attempt caps and the five-second watchdog bound this wake process and fail
-closed if an eligible outer fetch never emerges. The first fresh depth-one fetch whose supplied
-mask, mode and dequeue flag can retrieve BARRIER claims the pending request and posts
-BARRIER before entering AppKit. In every path that
-exact public fetch must dequeue and return BARRIER once. Only in its return path does the
-test application post one private prioritized SETTLE event. AppKit then dispatches
-BARRIER before a later public fetch can dequeue SETTLE in a non-null supplied mode.
+must be dequeued exactly once through the public AppKit fetch. On that final ready turn
+the coordinator arms an independent GCD watchdog and creates one shutdown request
+before SETTLE exists. The bounded 10 ms source remains active only until BARRIER is
+successfully queued.
+
+If the current AppKit fetch is an eligible outermost depth-one fetch, the harness
+binds and posts one private prioritized BARRIER event directly. AppKit may instead
+be blocked in nested tracking fetches, or in an outer fetch which deliberately
+excludes ApplicationDefined events. When that exact supplied mask accepts
+`NSEventTypePeriodic`, dequeue is enabled, and its supplied mode equals the current
+main-run-loop mode, the harness starts one short, fetch-bound public AppKit periodic
+stream. Ownership is recorded before the start call. A successful start is stopped
+immediately when its target fetch returns for any reason or when the first deeper
+fetch returns a Periodic event. If AppKit reports that the thread already has a
+periodic stream, the harness observes the same physical return boundary passively and
+never calls `stopPeriodicEvents` for that foreign stream. BARRIER remains forbidden
+until a later main-thread turn successfully acquires and immediately stops its own
+zero-delivery probe, proving that the thread-global Periodic slot is free. A failed
+probe returns to passive observation. A later 10 ms turn can bind a fresh observation
+to the restored current invocation; same-depth reentry is legal and receives a new
+invocation token.
+
+Neither an owned nor a foreign Periodic event is the shutdown oracle. The request
+ledger requires `initial depth + entries == returns + current depth`, counts
+same-depth reentries, bounds both fetch transitions and pulse attempts, and permits
+at most 32 consecutive wake attempts without reaching a smaller fetch depth. Together
+with the five-second watchdog this fails closed if AppKit never exposes an eligible
+outer fetch or releases a foreign Periodic slot. Before BARRIER is posted, every owned
+test pulse must be stopped, no slot proof may remain pending, and the start/stop
+ownership counters must balance. The first eligible depth-one fetch then
+claims the pending request and posts BARRIER before entering AppKit. That exact public
+fetch must dequeue and return BARRIER once; only its return path may post SETTLE.
+
 Immediately after BARRIER is queued, a test callback synchronously stops the recurring
-timer before the bound fetch enters AppKit, preventing coordinator messages from entering
-the BARRIER/SETTLE/STOP sequence. Exact request, claim, episode and `CFRunLoopStop`
-counters distinguish the three paths, while invocation IDs prove
-the BARRIER/SETTLE/STOP separation. Each event also records its dequeue and handler
-depth; the handler depth must be lower, proving that the exact fetch which dequeued
-the event returned before AppKit dispatched it without requiring unrelated outer
-fetch frames to unwind. The
-harness does not change `NSApplication`'s running flag, retrieve an event, or dispatch one
-itself. The local monitor must observe both BARRIER and SETTLE while the application is
-running without a modal window. Only then does the SETTLE handler post prioritized STOP
-and return.
-Because there is no manual event pump, STOP can be retrieved only by a still later AppKit
-fetch and dispatched by a distinct `sendEvent:` call. Invocation IDs and its monitor validate the same
-dequeue and application context, then invokes JUCE's stop request exactly once from that
-real event-handler boundary. START, BARRIER, SETTLE and STOP must each be handled exactly once.
-No worker, `CFRunLoopWakeUp`, direct `nextEvent`/`sendEvent` call, deadline rewriting,
-or test-owned periodic stream participates in this proof.
-An atomic return acknowledgement lets the independent GCD watchdog require SETTLE delivery,
-STOP delivery and `[NSApp run]` return to complete within five seconds. JUCE's own macOS
-stop implementation may start a periodic event after calling `NSApplication.stop`; the
-harness retires that framework-owned stream after the loop returns. The coordinator
+timer before the bound fetch enters AppKit, preventing coordinator messages from
+entering the BARRIER/SETTLE/STOP sequence. Invocation IDs prove the
+BARRIER/SETTLE/STOP separation. Each event records its dequeue and handler depth; the
+handler depth must be lower, proving that the exact fetch returned before AppKit
+dispatched it. The harness never changes `NSApplication`'s running flag, rewrites a
+fetch deadline or mask, retrieves an event, calls `CFRunLoopWakeUp`, or dispatches an
+event itself. The local monitor must observe both BARRIER and SETTLE while the
+application is running without a modal window. Only then does the SETTLE handler post
+prioritized STOP and return.
+
+Because there is no manual event pump, STOP can be retrieved only by a still later
+AppKit fetch and dispatched by a distinct `sendEvent:` call. Invocation IDs and its
+monitor validate the dequeue and application context, then invoke JUCE's stop request
+exactly once from that real event-handler boundary. START, BARRIER, SETTLE and STOP
+must each be handled exactly once. Immediately before JUCE is called, a final owned
+start/stop probe rechecks the thread-global Periodic slot with no run-loop yield in
+between; a start exception leaves the foreign stream untouched and fails closed.
+An atomic return acknowledgement lets the
+independent GCD watchdog require SETTLE delivery, STOP delivery and `[NSApp run]`
+return within five seconds. The callback's typed success result explicitly transfers
+ownership of the periodic wake created by JUCE's macOS stop implementation; the
+harness retires that framework-owned stream exactly once after the loop returns. The
+coordinator
 destructor retains an idempotent timer stop. Final state/files/global-modal audits
 run immediately before the timer is retired and again after run-loop return, before the
 monitor is removed exactly once. It does not assume

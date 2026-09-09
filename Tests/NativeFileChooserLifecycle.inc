@@ -111,7 +111,7 @@ bool armNativeApplicationReturnWatchdog() noexcept
     return true;
 }
 
-bool stopJuceApplicationLoopFromEvent() noexcept
+NativeFilePanel::ApplicationStopResult stopJuceApplicationLoopFromEvent() noexcept
 {
     nativeApplicationWasRunningAtStop = NativeFilePanel::applicationIsRunning();
     std::fprintf(stderr, "NATIVE_APP_LOOP_STOP_BEGIN running=%d\n",
@@ -121,20 +121,22 @@ bool stopJuceApplicationLoopFromEvent() noexcept
     {
         std::fputs("NATIVE_APP_LOOP_STOP_FAILED: message manager missing\n", stderr);
         std::fflush(stderr);
-        return false;
+        return NativeFilePanel::ApplicationStopResult::failed;
     }
     if (messageManager->hasStopMessageBeenSent())
     {
         std::fputs("NATIVE_APP_LOOP_STOP_FAILED: stop was already requested\n", stderr);
         std::fflush(stderr);
-        return false;
+        return NativeFilePanel::ApplicationStopResult::failed;
     }
     messageManager->stopDispatchLoop();
     const auto accepted = messageManager->hasStopMessageBeenSent();
     if (accepted)
         nativeApplicationShutdownStage.store(NativeApplicationShutdownStage::stopAccepted,
                                              std::memory_order_release);
-    return accepted;
+    return accepted
+        ? NativeFilePanel::ApplicationStopResult::jucePeriodicWakeAcquired
+        : NativeFilePanel::ApplicationStopResult::failed;
 }
 
 class NativeChooserCoordinator final : private juce::Timer
@@ -758,8 +760,8 @@ private:
         std::fputs("NATIVE_APP_LOOP_RETURN_WATCHDOG_ARMED\n", stderr);
         std::fflush(stderr);
         // Queue BARRIER before SETTLE exists when the current depth-one fetch is
-        // eligible. Otherwise unwind each active fetch invocation before a
-        // fresh eligible depth-one fetch binds and returns BARRIER itself.
+        // eligible. Otherwise use bounded, fetch-bound periodic observations
+        // until a fresh eligible depth-one fetch binds and returns BARRIER.
         nativeApplicationSettleDispatchRequested =
             NativeFilePanel::requestApplicationEventFetchReturn();
         if (! nativeApplicationSettleDispatchRequested)

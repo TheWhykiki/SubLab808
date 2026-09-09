@@ -9,7 +9,14 @@
 class NativeFilePanel final
 {
 public:
-    using ApplicationStopCallback = bool (*)() noexcept;
+    enum class ApplicationStopResult
+    {
+        failed,
+        jucePeriodicWakeAcquired
+    };
+    // A successful callback must both submit JUCE's NSApplication stop request
+    // and acquire the periodic wake which JUCE's macOS implementation creates.
+    using ApplicationStopCallback = ApplicationStopResult (*)() noexcept;
     using ApplicationFetchBoundCallback = bool (*)(void*) noexcept;
     // Must run before ScopedJuceInitialiser_GUI creates NSApplication.
     static void installTestApplication();
@@ -19,17 +26,17 @@ public:
     [[nodiscard]] static bool applicationIsRunning() noexcept;
     // Private START/BARRIER/SETTLE/STOP events prove distinct dispatches through
     // the real NSApplication event loop. An eligible depth-one fetch is returned
-    // with BARRIER. Other active fetch stacks receive bounded, mode-matched stop
-    // attempts tied to observed invocation returns before a fresh eligible
-    // depth-one fetch claims BARRIER. Only that exact return path queues SETTLE.
+    // with BARRIER. Other active fetch stacks may receive bounded, mode-matched,
+    // test-owned periodic pulses, or passively observe an already-owned stream,
+    // tied to invocation returns. A successful owned slot probe is then required
+    // before an eligible depth-one fetch claims BARRIER. Only that exact return
+    // path queues SETTLE.
     // The test never pumps or sends an event.
     [[nodiscard]] static bool postApplicationStartEvent() noexcept;
     [[nodiscard]] static bool applicationStartEventWasHandled() noexcept;
     [[nodiscard]] static bool applicationIsReadyForSettleEvent() noexcept;
     [[nodiscard]] static bool postApplicationSettleEvent() noexcept;
     [[nodiscard]] static bool postBoundApplicationFetchBarrierEvent() noexcept;
-    [[nodiscard]] static bool continueApplicationEventFetchReturnRequest(
-        std::size_t exitingDepth, std::size_t exitingInvocation) noexcept;
     [[nodiscard]] static bool requestApplicationEventFetchReturn() noexcept;
     [[nodiscard]] static bool driveApplicationEventFetchReturnRequest() noexcept;
     static void logApplicationSettleReadiness() noexcept;

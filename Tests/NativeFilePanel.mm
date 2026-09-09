@@ -1,7 +1,9 @@
 #include "NativeFilePanel.h"
 #include "MacModulePin.h"
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <exception>
 #include <stdexcept>
 #include <stdlib.h>
 #import <AppKit/AppKit.h>
@@ -36,39 +38,73 @@
 
 // The coordinator runs from JUCE's main-thread run-loop source, which can fire
 // while AppKit is blocked inside nextEventMatchingMask:. postEvent: only queues
-// an event, so an eligible depth-one fetch gets a marked BARRIER before
-// CFRunLoopStop requests exit from the innermost run-loop activation. If the
-// active fetch stack is nested or its depth-one fetch excludes application-
-// defined events, a fail-closed stop-attempt cascade is tied to each observed
-// invocation return until the stack is empty. The next eligible depth-one fetch
-// then binds BARRIER before retrieval. Only that fetch may queue SETTLE.
+// an event. A depth-one fetch which accepts application-defined events binds
+// BARRIER directly. A different active fetch can instead receive a short,
+// test-owned periodic-event pulse when its supplied mask accepts that public
+// AppKit wake. The pulse is stopped on the first matching observed fetch return,
+// before a later eligible depth-one fetch may bind BARRIER. If the thread already
+// owns a periodic stream, the same return is observed passively and that foreign
+// stream is never stopped; BARRIER remains blocked until an immediate owned probe
+// proves the global slot free. Only the exact BARRIER return path may queue SETTLE.
 static NSUInteger applicationEventFetchDepth = 0;
 enum class ApplicationEventFetchReturnPath : unsigned char
 {
     none,
     nextEligible,
     activeEligible,
-    activeUnwind,
-    nextEligibleAfterUnwind
+    activePeriodicPulse,
+    nextEligibleAfterPeriodicPulse,
+    activeEligibleAfterPeriodicPulse
+};
+
+enum class ApplicationEventFetchPeriodicPulseState : unsigned char
+{
+    idle,
+    starting,
+    active,
+    passiveAfterStartFailure
 };
 
 static NSUInteger applicationEventFetchReturnRequestedDepth = 0;
-static NSUInteger applicationEventFetchReturnInitialDepth = 0;
-static NSUInteger applicationEventFetchReturnLastUnwindDepth = 0;
-static NSUInteger applicationEventFetchReturnUnwindInvocation = 0;
 static NSUInteger applicationEventFetchReturnRequestCount = 0;
 static NSUInteger applicationEventFetchReturnCount = 0;
 static NSUInteger applicationEventFetchReturnClaimCount = 0;
-static NSUInteger applicationEventFetchReturnUnwindReturnCount = 0;
-static NSUInteger applicationEventFetchRunLoopStopCount = 0;
-static NSUInteger applicationEventFetchReturnUnwindStopBase = 0;
-static NSUInteger applicationEventFetchReturnUnwindReturnBase = 0;
-static NSUInteger applicationEventFetchReturnUnwindInvocationStopBase = 0;
-static NSUInteger applicationEventFetchReturnUnwindEpisodeCount = 0;
 static NSUInteger applicationEventFetchWakeDriverStopCount = 0;
 static NSUInteger applicationEventFetchInvocationCount = 0;
 static NSUInteger applicationEventFetchActiveInvocation = 0;
 static NSUInteger applicationEventFetchReturnRequestedInvocation = 0;
+static ApplicationEventFetchPeriodicPulseState applicationEventFetchPeriodicPulseState =
+    ApplicationEventFetchPeriodicPulseState::idle;
+static NSUInteger applicationEventFetchPeriodicPulseTargetDepth = 0;
+static NSUInteger applicationEventFetchPeriodicPulseTargetInvocation = 0;
+static NSUInteger applicationEventFetchPeriodicPulseInitialDepth = 0;
+static NSUInteger applicationEventFetchPeriodicPulseAttemptCount = 0;
+static NSUInteger applicationEventFetchPeriodicPulseStartCount = 0;
+static NSUInteger applicationEventFetchPeriodicPulseStartFailureCount = 0;
+static NSUInteger applicationEventFetchPeriodicPulseStopCount = 0;
+static NSUInteger applicationEventFetchPeriodicPulsePassiveResolutionCount = 0;
+static NSUInteger applicationEventFetchPeriodicPulseResolutionCount = 0;
+static NSUInteger applicationEventFetchPeriodicPulseSlotProbeResolutionCount = 0;
+static NSUInteger applicationEventFetchPeriodicPulseTargetReturnCount = 0;
+static NSUInteger applicationEventFetchPeriodicPulseDeeperReturnCount = 0;
+static NSUInteger applicationEventFetchPeriodicPulsePeriodicReturnCount = 0;
+static NSUInteger applicationEventFetchPeriodicPulseExceptionalResolutionCount = 0;
+static NSUInteger applicationEventFetchPeriodicPulseFinishResolutionCount = 0;
+static NSUInteger applicationEventFetchCompletedInvocationCount = 0;
+static NSUInteger applicationEventFetchRequestInitialDepth = 0;
+static NSUInteger applicationEventFetchRequestEntryBase = 0;
+static NSUInteger applicationEventFetchRequestReturnBase = 0;
+static NSUInteger applicationEventFetchRequestLastCompletedDepth = 0;
+static NSUInteger applicationEventFetchRequestLastCompletedInvocation = 0;
+static NSUInteger applicationEventFetchRequestSameDepthReentryCount = 0;
+static NSUInteger applicationEventFetchRequestMinimumDepth = 0;
+static NSUInteger applicationEventFetchRequestAttemptsWithoutDepthProgress = 0;
+static bool applicationEventFetchRequestLedgerRecorded = false;
+static bool applicationEventFetchPeriodicSlotMustBeProvedFree = false;
+static bool applicationEventFetchPeriodicPulseIsSlotProbe = false;
+static NSUInteger applicationJuceHandoffProbeStartCount = 0;
+static NSUInteger applicationJuceHandoffProbeStopCount = 0;
+static NSUInteger applicationJuceHandoffProbeFailureCount = 0;
 static NSUInteger applicationFetchBarrierEventDequeueInvocation = 0;
 static NSUInteger applicationSettleEventDequeueInvocation = 0;
 static NSUInteger applicationStopEventDequeueInvocation = 0;
@@ -96,9 +132,10 @@ static constexpr NSInteger applicationFetchBarrierEventCode = 2;
 static constexpr NSInteger applicationSettleEventCode = 3;
 static constexpr NSInteger applicationStopEventCode = 4;
 static constexpr NSUInteger allApplicationControlEventsPostedMask = 0x0f;
-static constexpr NSUInteger maximumApplicationEventFetchUnwindEpisodes = 512;
-static constexpr NSUInteger maximumApplicationEventFetchStopAttempts = 1024;
-static constexpr NSUInteger maximumApplicationEventFetchStopAttemptsPerInvocation = 512;
+static constexpr NSUInteger maximumApplicationEventFetchPeriodicPulseAttempts = 512;
+static constexpr NSUInteger maximumApplicationEventFetchRequestTransitions = 4096;
+static constexpr NSUInteger maximumApplicationEventFetchAttemptsWithoutDepthProgress = 32;
+static constexpr NSTimeInterval applicationEventFetchPeriodicPulsePeriod = 0.1;
 
 static NSUInteger applicationControlEventPostedBit(NSInteger code) noexcept
 {
@@ -149,15 +186,34 @@ static bool isSameMarkedApplicationControlEvent(NSEvent* first,
         && [first data2] == [second data2];
 }
 
-static bool currentApplicationEventFetchIsEligible() noexcept
+static bool currentApplicationEventFetchHasBoundContext() noexcept
 {
     return applicationEventFetchDepth > 0
         && applicationEventFetchActiveInvocation != 0
         && applicationEventFetchDequeues
         && applicationEventFetchModeSupplied
         && applicationEventFetchMode != nil
-        && (applicationEventFetchMask & NSEventMaskApplicationDefined) != 0
         && applicationEventFetchContextRecorded;
+}
+
+static bool currentApplicationEventFetchIsEligible() noexcept
+{
+    return currentApplicationEventFetchHasBoundContext()
+        && (applicationEventFetchMask & NSEventMaskApplicationDefined) != 0;
+}
+
+static bool currentApplicationEventFetchCanBindBarrier() noexcept
+{
+    return applicationEventFetchDepth == 1
+        && currentApplicationEventFetchIsEligible();
+}
+
+static bool currentApplicationEventFetchCanUsePeriodicPulse() noexcept
+{
+    return applicationEventFetchDepth > 0
+        && ! currentApplicationEventFetchCanBindBarrier()
+        && currentApplicationEventFetchHasBoundContext()
+        && (applicationEventFetchMask & NSEventMaskPeriodic) != 0;
 }
 
 static bool currentRunLoopModeMatchesApplicationEventFetch(
@@ -180,58 +236,185 @@ static const char* applicationEventFetchReturnPathName() noexcept
         case ApplicationEventFetchReturnPath::none: return "none";
         case ApplicationEventFetchReturnPath::nextEligible: return "next-eligible";
         case ApplicationEventFetchReturnPath::activeEligible: return "active-eligible";
-        case ApplicationEventFetchReturnPath::activeUnwind: return "active-unwind";
-        case ApplicationEventFetchReturnPath::nextEligibleAfterUnwind:
-            return "next-eligible-after-unwind";
+        case ApplicationEventFetchReturnPath::activePeriodicPulse:
+            return "active-periodic-pulse";
+        case ApplicationEventFetchReturnPath::nextEligibleAfterPeriodicPulse:
+            return "next-eligible-after-periodic-pulse";
+        case ApplicationEventFetchReturnPath::activeEligibleAfterPeriodicPulse:
+            return "active-eligible-after-periodic-pulse";
     }
     return "invalid";
 }
 
-static bool applicationEventFetchCompletedUnwindEpisodesMatch() noexcept
+static bool applicationEventFetchPeriodicPulseStateIsConsistent() noexcept
 {
-    return applicationEventFetchReturnUnwindEpisodeCount > 0
-        && applicationEventFetchReturnInitialDepth > 0
-        && applicationEventFetchReturnLastUnwindDepth == 0
-        && applicationEventFetchReturnUnwindInvocation == 0
-        && applicationEventFetchRunLoopStopCount
-            >= applicationEventFetchReturnUnwindReturnCount
-        && applicationEventFetchRunLoopStopCount
-            >= applicationEventFetchReturnUnwindStopBase
-                + applicationEventFetchReturnInitialDepth
-        && applicationEventFetchReturnUnwindReturnCount
-            == applicationEventFetchReturnUnwindReturnBase
-                + applicationEventFetchReturnInitialDepth
-        && applicationEventFetchRunLoopStopCount
-            > applicationEventFetchReturnUnwindInvocationStopBase;
+    const auto completedResolutions =
+        applicationEventFetchPeriodicPulseTargetReturnCount
+        + applicationEventFetchPeriodicPulseDeeperReturnCount
+        + applicationEventFetchPeriodicPulseSlotProbeResolutionCount
+        + applicationEventFetchPeriodicPulseExceptionalResolutionCount
+        + applicationEventFetchPeriodicPulseFinishResolutionCount;
+    const auto common = applicationEventFetchPeriodicPulseAttemptCount
+            <= maximumApplicationEventFetchPeriodicPulseAttempts
+        && applicationEventFetchPeriodicPulseResolutionCount == completedResolutions
+        && applicationEventFetchPeriodicPulseResolutionCount
+            == applicationEventFetchPeriodicPulseStopCount
+                + applicationEventFetchPeriodicPulsePassiveResolutionCount
+        && applicationEventFetchPeriodicPulsePeriodicReturnCount
+            >= applicationEventFetchPeriodicPulseDeeperReturnCount
+        && applicationEventFetchPeriodicPulsePeriodicReturnCount
+            <= applicationEventFetchPeriodicPulseResolutionCount;
+    if (! common)
+        return false;
+
+    switch (applicationEventFetchPeriodicPulseState)
+    {
+        case ApplicationEventFetchPeriodicPulseState::idle:
+            return applicationEventFetchPeriodicPulseTargetDepth == 0
+                && applicationEventFetchPeriodicPulseTargetInvocation == 0
+                && ! applicationEventFetchPeriodicPulseIsSlotProbe
+                && applicationEventFetchPeriodicPulseAttemptCount
+                    == applicationEventFetchPeriodicPulseStartCount
+                        + applicationEventFetchPeriodicPulseStartFailureCount
+                && applicationEventFetchPeriodicPulseStartCount
+                    == applicationEventFetchPeriodicPulseStopCount
+                && applicationEventFetchPeriodicPulseStartFailureCount
+                    == applicationEventFetchPeriodicPulsePassiveResolutionCount;
+        case ApplicationEventFetchPeriodicPulseState::starting:
+            return applicationEventFetchPeriodicPulseTargetDepth > 0
+                && applicationEventFetchPeriodicPulseTargetInvocation > 0
+                && applicationEventFetchPeriodicPulseAttemptCount
+                    == applicationEventFetchPeriodicPulseStartCount
+                        + applicationEventFetchPeriodicPulseStartFailureCount + 1
+                && applicationEventFetchPeriodicPulseStartCount
+                    == applicationEventFetchPeriodicPulseStopCount
+                && applicationEventFetchPeriodicPulseStartFailureCount
+                    == applicationEventFetchPeriodicPulsePassiveResolutionCount
+                && applicationEventFetchPeriodicSlotMustBeProvedFree
+                    == applicationEventFetchPeriodicPulseIsSlotProbe;
+        case ApplicationEventFetchPeriodicPulseState::active:
+            return applicationEventFetchPeriodicPulseTargetDepth > 0
+                && applicationEventFetchPeriodicPulseTargetInvocation > 0
+                && applicationEventFetchPeriodicPulseAttemptCount
+                    == applicationEventFetchPeriodicPulseStartCount
+                        + applicationEventFetchPeriodicPulseStartFailureCount
+                && applicationEventFetchPeriodicPulseStartCount
+                    == applicationEventFetchPeriodicPulseStopCount + 1
+                && applicationEventFetchPeriodicPulseStartFailureCount
+                    == applicationEventFetchPeriodicPulsePassiveResolutionCount
+                && applicationEventFetchPeriodicSlotMustBeProvedFree
+                    == applicationEventFetchPeriodicPulseIsSlotProbe;
+        case ApplicationEventFetchPeriodicPulseState::passiveAfterStartFailure:
+            return applicationEventFetchPeriodicPulseTargetDepth > 0
+                && applicationEventFetchPeriodicPulseTargetInvocation > 0
+                && applicationEventFetchPeriodicPulseAttemptCount
+                    == applicationEventFetchPeriodicPulseStartCount
+                        + applicationEventFetchPeriodicPulseStartFailureCount
+                && applicationEventFetchPeriodicPulseStartCount
+                    == applicationEventFetchPeriodicPulseStopCount
+                && applicationEventFetchPeriodicPulseStartFailureCount
+                    == applicationEventFetchPeriodicPulsePassiveResolutionCount + 1
+                && applicationEventFetchPeriodicSlotMustBeProvedFree;
+    }
+    return false;
+}
+
+static bool applicationEventFetchPeriodicPulseIsInactiveAndBalanced() noexcept
+{
+    return applicationEventFetchPeriodicPulseStateIsConsistent()
+        && applicationEventFetchPeriodicPulseState
+            == ApplicationEventFetchPeriodicPulseState::idle
+        && applicationEventFetchPeriodicPulseTargetDepth == 0
+        && applicationEventFetchPeriodicPulseTargetInvocation == 0
+        && ! applicationEventFetchPeriodicSlotMustBeProvedFree
+        && ! applicationEventFetchPeriodicPulseIsSlotProbe
+        && applicationEventFetchPeriodicPulseStartCount
+            == applicationEventFetchPeriodicPulseStopCount;
+}
+
+static bool applicationEventFetchHasNoPeriodicPulseHistory() noexcept
+{
+    return applicationEventFetchPeriodicPulseIsInactiveAndBalanced()
+        && applicationEventFetchPeriodicPulseInitialDepth == 0
+        && applicationEventFetchPeriodicPulseAttemptCount == 0
+        && applicationEventFetchPeriodicPulseStartCount == 0
+        && applicationEventFetchPeriodicPulseStartFailureCount == 0
+        && applicationEventFetchPeriodicPulsePassiveResolutionCount == 0
+        && applicationEventFetchPeriodicPulseResolutionCount == 0
+        && applicationEventFetchPeriodicPulseSlotProbeResolutionCount == 0
+        && applicationEventFetchPeriodicPulseTargetReturnCount == 0
+        && applicationEventFetchPeriodicPulseDeeperReturnCount == 0
+        && applicationEventFetchPeriodicPulsePeriodicReturnCount == 0
+        && applicationEventFetchPeriodicPulseExceptionalResolutionCount == 0
+        && applicationEventFetchPeriodicPulseFinishResolutionCount == 0;
+}
+
+static bool applicationEventFetchCompletedPeriodicPulseHistoryMatches() noexcept
+{
+    return applicationEventFetchPeriodicPulseIsInactiveAndBalanced()
+        && applicationEventFetchPeriodicPulseInitialDepth > 0
+        && applicationEventFetchPeriodicPulseAttemptCount > 0
+        && applicationEventFetchPeriodicPulseAttemptCount
+            == applicationEventFetchPeriodicPulseStartCount
+                + applicationEventFetchPeriodicPulseStartFailureCount
+        && applicationEventFetchPeriodicPulseStartFailureCount
+            == applicationEventFetchPeriodicPulsePassiveResolutionCount
+        && applicationEventFetchPeriodicPulseResolutionCount
+            == applicationEventFetchPeriodicPulseStopCount
+                + applicationEventFetchPeriodicPulsePassiveResolutionCount
+        && applicationEventFetchPeriodicPulseResolutionCount > 0
+        && applicationEventFetchPeriodicPulseExceptionalResolutionCount == 0
+        && applicationEventFetchPeriodicPulseFinishResolutionCount == 0;
+}
+
+static bool applicationEventFetchRequestLedgerIsConsistent() noexcept
+{
+    if (! applicationEventFetchRequestLedgerRecorded)
+        return true;
+    if (applicationEventFetchInvocationCount < applicationEventFetchRequestEntryBase
+        || applicationEventFetchCompletedInvocationCount
+            < applicationEventFetchRequestReturnBase)
+        return false;
+
+    const auto entries = applicationEventFetchInvocationCount
+        - applicationEventFetchRequestEntryBase;
+    const auto returns = applicationEventFetchCompletedInvocationCount
+        - applicationEventFetchRequestReturnBase;
+    return entries <= maximumApplicationEventFetchRequestTransitions
+        && returns <= maximumApplicationEventFetchRequestTransitions
+        && applicationEventFetchRequestMinimumDepth
+            <= applicationEventFetchRequestInitialDepth
+        && applicationEventFetchRequestMinimumDepth <= applicationEventFetchDepth
+        && applicationEventFetchRequestSameDepthReentryCount
+            <= maximumApplicationEventFetchRequestTransitions
+        && applicationEventFetchRequestAttemptsWithoutDepthProgress
+            <= maximumApplicationEventFetchAttemptsWithoutDepthProgress
+        && applicationEventFetchRequestInitialDepth + entries
+            == returns + applicationEventFetchDepth;
 }
 
 static bool applicationEventFetchBindingMatchesRequestPath() noexcept
 {
-    const auto noUnwindEpisode = applicationEventFetchReturnInitialDepth == 0
-        && applicationEventFetchReturnLastUnwindDepth == 0
-        && applicationEventFetchReturnUnwindInvocation == 0
-        && applicationEventFetchReturnUnwindReturnCount == 0
-        && applicationEventFetchRunLoopStopCount == 0
-        && applicationEventFetchReturnUnwindStopBase == 0
-        && applicationEventFetchReturnUnwindReturnBase == 0
-        && applicationEventFetchReturnUnwindInvocationStopBase == 0
-        && applicationEventFetchReturnUnwindEpisodeCount == 0;
     const auto commonBinding = applicationEventFetchReturnRequestedDepth == 1
-        && applicationEventFetchWakeDriverStopCount == 0;
+        && applicationEventFetchReturnRequestedInvocation != 0
+        && applicationEventFetchRequestLedgerRecorded
+        && applicationEventFetchRequestLedgerIsConsistent();
     switch (applicationEventFetchReturnPath)
     {
         case ApplicationEventFetchReturnPath::nextEligible:
-            return commonBinding && noUnwindEpisode
+            return commonBinding && applicationEventFetchHasNoPeriodicPulseHistory()
                 && applicationEventFetchReturnClaimCount == 1;
         case ApplicationEventFetchReturnPath::activeEligible:
-            return commonBinding && noUnwindEpisode
+            return commonBinding && applicationEventFetchHasNoPeriodicPulseHistory()
                 && applicationEventFetchReturnClaimCount == 0;
-        case ApplicationEventFetchReturnPath::nextEligibleAfterUnwind:
-            return commonBinding
-                && applicationEventFetchCompletedUnwindEpisodesMatch()
+        case ApplicationEventFetchReturnPath::nextEligibleAfterPeriodicPulse:
+            return commonBinding && applicationEventFetchCompletedPeriodicPulseHistoryMatches()
                 && applicationEventFetchReturnClaimCount == 1;
+        case ApplicationEventFetchReturnPath::activeEligibleAfterPeriodicPulse:
+            return commonBinding && applicationEventFetchCompletedPeriodicPulseHistoryMatches()
+                && applicationEventFetchReturnClaimCount == 0;
         case ApplicationEventFetchReturnPath::none:
-        case ApplicationEventFetchReturnPath::activeUnwind:
+        case ApplicationEventFetchReturnPath::activePeriodicPulse:
             return false;
     }
     return false;
@@ -239,42 +422,456 @@ static bool applicationEventFetchBindingMatchesRequestPath() noexcept
 
 static bool applicationEventFetchBoundaryWasProved() noexcept
 {
-    const auto wakeDriverWasStopped = applicationEventFetchWakeDriverStopCount == 1;
-    switch (applicationEventFetchReturnPath)
+    return applicationEventFetchWakeDriverStopCount == 1
+        && applicationEventFetchPeriodicPulseIsInactiveAndBalanced()
+        && applicationEventFetchBindingMatchesRequestPath();
+}
+
+enum class ApplicationEventFetchPeriodicPulseResolutionReason : unsigned char
+{
+    targetReturn,
+    deeperPeriodicReturn,
+    slotAvailabilityProbe,
+    exceptionalFetchExit,
+    finishCleanup
+};
+
+static void logFirstApplicationEventFetchPeriodicPulseStack() noexcept
+{
+    @autoreleasepool
     {
-        case ApplicationEventFetchReturnPath::nextEligible:
-            return wakeDriverWasStopped
-                && applicationEventFetchReturnInitialDepth == 0
-                && applicationEventFetchReturnLastUnwindDepth == 0
-                && applicationEventFetchReturnUnwindInvocation == 0
-                && applicationEventFetchReturnUnwindReturnCount == 0
-                && applicationEventFetchRunLoopStopCount == 0
-                && applicationEventFetchReturnUnwindStopBase == 0
-                && applicationEventFetchReturnUnwindReturnBase == 0
-                && applicationEventFetchReturnUnwindInvocationStopBase == 0
-                && applicationEventFetchReturnUnwindEpisodeCount == 0
-                && applicationEventFetchReturnClaimCount == 1;
-        case ApplicationEventFetchReturnPath::activeEligible:
-            return wakeDriverWasStopped
-                && applicationEventFetchReturnInitialDepth == 0
-                && applicationEventFetchReturnLastUnwindDepth == 0
-                && applicationEventFetchReturnUnwindInvocation == 0
-                && applicationEventFetchReturnUnwindReturnCount == 0
-                && applicationEventFetchRunLoopStopCount == 1
-                && applicationEventFetchReturnUnwindStopBase == 0
-                && applicationEventFetchReturnUnwindReturnBase == 0
-                && applicationEventFetchReturnUnwindInvocationStopBase == 0
-                && applicationEventFetchReturnUnwindEpisodeCount == 0
-                && applicationEventFetchReturnClaimCount == 0;
-        case ApplicationEventFetchReturnPath::nextEligibleAfterUnwind:
-            return wakeDriverWasStopped
-                && applicationEventFetchCompletedUnwindEpisodesMatch()
-                && applicationEventFetchReturnClaimCount == 1;
-        case ApplicationEventFetchReturnPath::none:
-        case ApplicationEventFetchReturnPath::activeUnwind:
-            return false;
+        @try
+        {
+            auto* symbols = [NSThread callStackSymbols];
+            const auto available = [symbols count];
+            const auto count = std::min<NSUInteger>(available, 48);
+            std::fprintf(stderr,
+                         "NATIVE_APP_LOOP_FETCH_PULSE_STACK_BEGIN frames=%lu available=%lu\n",
+                         static_cast<unsigned long>(count),
+                         static_cast<unsigned long>(available));
+            for (NSUInteger index = 0; index < count; ++index)
+            {
+                auto* symbol = [symbols objectAtIndex:index];
+                const auto* text = [symbol UTF8String];
+                std::fprintf(stderr,
+                             "NATIVE_APP_LOOP_FETCH_PULSE_STACK frame=%lu %s\n",
+                             static_cast<unsigned long>(index),
+                             text != nullptr ? text : "<unavailable>");
+            }
+            std::fputs("NATIVE_APP_LOOP_FETCH_PULSE_STACK_END\n", stderr);
+            std::fflush(stderr);
+        }
+        @catch (NSException* exception)
+        {
+            const auto* name = [[exception name] UTF8String];
+            const auto* reason = [[exception reason] UTF8String];
+            std::fprintf(stderr,
+                         "NATIVE_APP_LOOP_FETCH_PULSE_STACK_FAILED name=%s reason=%s\n",
+                         name != nullptr ? name : "<unavailable>",
+                         reason != nullptr ? reason : "<unavailable>");
+            std::fflush(stderr);
+        }
     }
-    return false;
+}
+
+static bool stopOwnedApplicationEventFetchPeriodicPulse(
+    ApplicationEventFetchPeriodicPulseResolutionReason reason,
+    NSUInteger returningDepth,
+    NSUInteger returningInvocation,
+    NSEvent* event) noexcept
+{
+    if (![NSThread isMainThread]
+        || applicationEventFetchPeriodicPulseState
+            != ApplicationEventFetchPeriodicPulseState::active
+        || ! applicationEventFetchPeriodicPulseStateIsConsistent())
+        return false;
+
+    const auto targetDepth = applicationEventFetchPeriodicPulseTargetDepth;
+    const auto targetInvocation = applicationEventFetchPeriodicPulseTargetInvocation;
+    const auto targetReturned = returningDepth == targetDepth
+        && returningInvocation == targetInvocation;
+    const auto deeperPeriodicReturned = event != nil
+        && [event type] == NSEventTypePeriodic
+        && returningDepth > targetDepth;
+    if (reason == ApplicationEventFetchPeriodicPulseResolutionReason::targetReturn
+        && ! targetReturned)
+        return false;
+    if (reason == ApplicationEventFetchPeriodicPulseResolutionReason::deeperPeriodicReturn
+        && ! deeperPeriodicReturned)
+        return false;
+    if (reason == ApplicationEventFetchPeriodicPulseResolutionReason::slotAvailabilityProbe
+        && (! applicationEventFetchPeriodicPulseIsSlotProbe
+            || returningDepth != 0 || returningInvocation != 0 || event != nil))
+        return false;
+    if ((reason == ApplicationEventFetchPeriodicPulseResolutionReason::targetReturn
+            || reason
+                == ApplicationEventFetchPeriodicPulseResolutionReason::deeperPeriodicReturn)
+        && applicationEventFetchPeriodicPulseIsSlotProbe)
+        return false;
+    if ((reason == ApplicationEventFetchPeriodicPulseResolutionReason::exceptionalFetchExit
+            || reason == ApplicationEventFetchPeriodicPulseResolutionReason::finishCleanup)
+        && (returningDepth != 0 || returningInvocation != 0 || event != nil))
+        return false;
+
+    @try
+    {
+        [NSEvent stopPeriodicEvents];
+    }
+    @catch (NSException* exception)
+    {
+        const auto* name = [[exception name] UTF8String];
+        const auto* detail = [[exception reason] UTF8String];
+        std::fprintf(stderr,
+                     "NATIVE_APP_LOOP_FETCH_PULSE_STOP_FAILED name=%s reason=%s\n",
+                     name != nullptr ? name : "<unavailable>",
+                     detail != nullptr ? detail : "<unavailable>");
+        std::fflush(stderr);
+        return false;
+    }
+
+    ++applicationEventFetchPeriodicPulseStopCount;
+    ++applicationEventFetchPeriodicPulseResolutionCount;
+    if (event != nil && [event type] == NSEventTypePeriodic)
+        ++applicationEventFetchPeriodicPulsePeriodicReturnCount;
+    switch (reason)
+    {
+        case ApplicationEventFetchPeriodicPulseResolutionReason::targetReturn:
+            ++applicationEventFetchPeriodicPulseTargetReturnCount;
+            break;
+        case ApplicationEventFetchPeriodicPulseResolutionReason::deeperPeriodicReturn:
+            ++applicationEventFetchPeriodicPulseDeeperReturnCount;
+            break;
+        case ApplicationEventFetchPeriodicPulseResolutionReason::slotAvailabilityProbe:
+            ++applicationEventFetchPeriodicPulseSlotProbeResolutionCount;
+            break;
+        case ApplicationEventFetchPeriodicPulseResolutionReason::exceptionalFetchExit:
+            ++applicationEventFetchPeriodicPulseExceptionalResolutionCount;
+            break;
+        case ApplicationEventFetchPeriodicPulseResolutionReason::finishCleanup:
+            ++applicationEventFetchPeriodicPulseFinishResolutionCount;
+            break;
+    }
+    applicationEventFetchPeriodicPulseState =
+        ApplicationEventFetchPeriodicPulseState::idle;
+    applicationEventFetchPeriodicPulseTargetDepth = 0;
+    applicationEventFetchPeriodicPulseTargetInvocation = 0;
+    applicationEventFetchPeriodicPulseIsSlotProbe = false;
+    applicationEventFetchPeriodicSlotMustBeProvedFree = false;
+    if (reason == ApplicationEventFetchPeriodicPulseResolutionReason::targetReturn
+        || reason == ApplicationEventFetchPeriodicPulseResolutionReason::deeperPeriodicReturn
+        || reason == ApplicationEventFetchPeriodicPulseResolutionReason::slotAvailabilityProbe)
+        applicationEventFetchReturnPath =
+            ApplicationEventFetchReturnPath::nextEligibleAfterPeriodicPulse;
+
+    std::fprintf(stderr,
+                 "NATIVE_APP_LOOP_FETCH_PULSE_STOPPED reason=%u targetDepth=%lu targetInvocation=%lu returnDepth=%lu returnInvocation=%lu eventType=%ld starts=%lu stops=%lu\n",
+                 static_cast<unsigned>(reason),
+                 static_cast<unsigned long>(targetDepth),
+                 static_cast<unsigned long>(targetInvocation),
+                 static_cast<unsigned long>(returningDepth),
+                 static_cast<unsigned long>(returningInvocation),
+                 event != nil ? static_cast<long>([event type]) : -1L,
+                 static_cast<unsigned long>(applicationEventFetchPeriodicPulseStartCount),
+                 static_cast<unsigned long>(applicationEventFetchPeriodicPulseStopCount));
+    std::fflush(stderr);
+    return applicationEventFetchPeriodicPulseStateIsConsistent();
+}
+
+static bool resolvePassiveApplicationEventFetchPeriodicPulse(
+    ApplicationEventFetchPeriodicPulseResolutionReason reason,
+    NSUInteger returningDepth,
+    NSUInteger returningInvocation,
+    NSEvent* event) noexcept
+{
+    if (![NSThread isMainThread]
+        || applicationEventFetchPeriodicPulseState
+            != ApplicationEventFetchPeriodicPulseState::passiveAfterStartFailure
+        || ! applicationEventFetchPeriodicPulseStateIsConsistent())
+        return false;
+
+    const auto targetDepth = applicationEventFetchPeriodicPulseTargetDepth;
+    const auto targetInvocation = applicationEventFetchPeriodicPulseTargetInvocation;
+    const auto targetReturned = returningDepth == targetDepth
+        && returningInvocation == targetInvocation;
+    const auto deeperPeriodicReturned = event != nil
+        && [event type] == NSEventTypePeriodic
+        && returningDepth > targetDepth;
+    if (reason == ApplicationEventFetchPeriodicPulseResolutionReason::targetReturn
+        && ! targetReturned)
+        return false;
+    if (reason
+            == ApplicationEventFetchPeriodicPulseResolutionReason::deeperPeriodicReturn
+        && ! deeperPeriodicReturned)
+        return false;
+    if (reason == ApplicationEventFetchPeriodicPulseResolutionReason::slotAvailabilityProbe)
+        return false;
+    if ((reason
+            == ApplicationEventFetchPeriodicPulseResolutionReason::exceptionalFetchExit
+            || reason
+                == ApplicationEventFetchPeriodicPulseResolutionReason::finishCleanup)
+        && (returningDepth != 0 || returningInvocation != 0 || event != nil))
+        return false;
+
+    ++applicationEventFetchPeriodicPulsePassiveResolutionCount;
+    ++applicationEventFetchPeriodicPulseResolutionCount;
+    if (event != nil && [event type] == NSEventTypePeriodic)
+        ++applicationEventFetchPeriodicPulsePeriodicReturnCount;
+    switch (reason)
+    {
+        case ApplicationEventFetchPeriodicPulseResolutionReason::targetReturn:
+            ++applicationEventFetchPeriodicPulseTargetReturnCount;
+            break;
+        case ApplicationEventFetchPeriodicPulseResolutionReason::deeperPeriodicReturn:
+            ++applicationEventFetchPeriodicPulseDeeperReturnCount;
+            break;
+        case ApplicationEventFetchPeriodicPulseResolutionReason::slotAvailabilityProbe:
+            return false;
+        case ApplicationEventFetchPeriodicPulseResolutionReason::exceptionalFetchExit:
+            ++applicationEventFetchPeriodicPulseExceptionalResolutionCount;
+            break;
+        case ApplicationEventFetchPeriodicPulseResolutionReason::finishCleanup:
+            ++applicationEventFetchPeriodicPulseFinishResolutionCount;
+            break;
+    }
+    applicationEventFetchPeriodicPulseState =
+        ApplicationEventFetchPeriodicPulseState::idle;
+    applicationEventFetchPeriodicPulseTargetDepth = 0;
+    applicationEventFetchPeriodicPulseTargetInvocation = 0;
+    applicationEventFetchPeriodicPulseIsSlotProbe = false;
+    const auto mustProveSlotFree =
+        reason == ApplicationEventFetchPeriodicPulseResolutionReason::targetReturn
+        || reason
+            == ApplicationEventFetchPeriodicPulseResolutionReason::deeperPeriodicReturn;
+    applicationEventFetchPeriodicSlotMustBeProvedFree = mustProveSlotFree;
+    if (mustProveSlotFree)
+        applicationEventFetchReturnPath =
+            ApplicationEventFetchReturnPath::nextEligibleAfterPeriodicPulse;
+
+    std::fprintf(stderr,
+                 "NATIVE_APP_LOOP_FETCH_PASSIVE_RESOLVED reason=%u targetDepth=%lu targetInvocation=%lu returnDepth=%lu returnInvocation=%lu eventType=%ld passiveResolutions=%lu\n",
+                 static_cast<unsigned>(reason),
+                 static_cast<unsigned long>(targetDepth),
+                 static_cast<unsigned long>(targetInvocation),
+                 static_cast<unsigned long>(returningDepth),
+                 static_cast<unsigned long>(returningInvocation),
+                 event != nil ? static_cast<long>([event type]) : -1L,
+                 static_cast<unsigned long>(
+                     applicationEventFetchPeriodicPulsePassiveResolutionCount));
+    std::fflush(stderr);
+    return applicationEventFetchPeriodicPulseStateIsConsistent();
+}
+
+static bool observeApplicationEventFetchPeriodicPulseReturn(
+    NSEvent* event, NSUInteger fetchDepth, NSUInteger fetchInvocation) noexcept
+{
+    if (! applicationEventFetchPeriodicPulseStateIsConsistent())
+        return false;
+    const auto ownsPulse = applicationEventFetchPeriodicPulseState
+        == ApplicationEventFetchPeriodicPulseState::active;
+    const auto observesAfterStartFailure = applicationEventFetchPeriodicPulseState
+        == ApplicationEventFetchPeriodicPulseState::passiveAfterStartFailure;
+    if (! ownsPulse && ! observesAfterStartFailure)
+        return true;
+
+    if (fetchDepth == applicationEventFetchPeriodicPulseTargetDepth
+        && fetchInvocation == applicationEventFetchPeriodicPulseTargetInvocation)
+        return ownsPulse
+            ? stopOwnedApplicationEventFetchPeriodicPulse(
+                ApplicationEventFetchPeriodicPulseResolutionReason::targetReturn,
+                fetchDepth, fetchInvocation, event)
+            : resolvePassiveApplicationEventFetchPeriodicPulse(
+                ApplicationEventFetchPeriodicPulseResolutionReason::targetReturn,
+                fetchDepth, fetchInvocation, event);
+
+    if (event != nil && [event type] == NSEventTypePeriodic
+        && fetchDepth > applicationEventFetchPeriodicPulseTargetDepth)
+        return ownsPulse
+            ? stopOwnedApplicationEventFetchPeriodicPulse(
+                ApplicationEventFetchPeriodicPulseResolutionReason::deeperPeriodicReturn,
+                fetchDepth, fetchInvocation, event)
+            : resolvePassiveApplicationEventFetchPeriodicPulse(
+                ApplicationEventFetchPeriodicPulseResolutionReason::deeperPeriodicReturn,
+                fetchDepth, fetchInvocation, event);
+
+    return true;
+}
+
+static bool beginApplicationEventFetchPeriodicPulse(bool immediateSlotProbe) noexcept
+{
+    const auto waitsForEligibleFetch =
+        applicationEventFetchReturnPath == ApplicationEventFetchReturnPath::nextEligible
+        || applicationEventFetchReturnPath
+            == ApplicationEventFetchReturnPath::nextEligibleAfterPeriodicPulse;
+    if (![NSThread isMainThread]
+        || ! waitsForEligibleFetch
+        || ! applicationEventFetchReturnRequested
+        || applicationEventFetchReturnRequestCount != 1
+        || applicationEventFetchReturnCount != 0
+        || applicationEventFetchReturnClaimCount != 0
+        || applicationEventFetchReturnRequestedDepth != 0
+        || applicationEventFetchReturnRequestedInvocation != 0
+        || applicationEventFetchWakeDriverStopCount != 0
+        || (applicationControlEventPostedMask
+            & applicationControlEventPostedBit(applicationFetchBarrierEventCode)) != 0
+        || applicationFetchBarrierEventDequeueCount != 0
+        || (immediateSlotProbe
+            ? ! currentApplicationEventFetchHasBoundContext()
+            : ! currentApplicationEventFetchCanUsePeriodicPulse())
+        || immediateSlotProbe
+            != applicationEventFetchPeriodicSlotMustBeProvedFree
+        || ! applicationEventFetchRequestLedgerIsConsistent()
+        || ! applicationEventFetchPeriodicPulseStateIsConsistent()
+        || applicationEventFetchPeriodicPulseState
+            != ApplicationEventFetchPeriodicPulseState::idle
+        || applicationEventFetchPeriodicPulseAttemptCount
+            >= maximumApplicationEventFetchPeriodicPulseAttempts
+        || applicationEventFetchRequestAttemptsWithoutDepthProgress
+            >= maximumApplicationEventFetchAttemptsWithoutDepthProgress)
+        return false;
+
+    auto* runLoop = CFRunLoopGetCurrent();
+    if (runLoop == nullptr || runLoop != CFRunLoopGetMain()
+        || ! currentRunLoopModeMatchesApplicationEventFetch(runLoop))
+        return false;
+
+    if (applicationEventFetchPeriodicPulseAttemptCount == 0)
+        applicationEventFetchPeriodicPulseInitialDepth = applicationEventFetchDepth;
+    ++applicationEventFetchRequestAttemptsWithoutDepthProgress;
+    applicationEventFetchPeriodicPulseTargetDepth = applicationEventFetchDepth;
+    applicationEventFetchPeriodicPulseTargetInvocation =
+        applicationEventFetchActiveInvocation;
+    applicationEventFetchPeriodicPulseState =
+        ApplicationEventFetchPeriodicPulseState::starting;
+    applicationEventFetchPeriodicPulseIsSlotProbe = immediateSlotProbe;
+    ++applicationEventFetchPeriodicPulseAttemptCount;
+    if (! applicationEventFetchPeriodicPulseStateIsConsistent())
+        return false;
+
+    @try
+    {
+        [NSEvent startPeriodicEventsAfterDelay:0.0
+                                    withPeriod:applicationEventFetchPeriodicPulsePeriod];
+    }
+    @catch (NSException* exception)
+    {
+        ++applicationEventFetchPeriodicPulseStartFailureCount;
+        const auto canObserveWithoutOwnership =
+            [[exception name] isEqualToString:NSInternalInconsistencyException];
+        const auto* name = [[exception name] UTF8String];
+        const auto* reason = [[exception reason] UTF8String];
+        std::fprintf(stderr,
+                     "NATIVE_APP_LOOP_FETCH_PULSE_START_FAILED name=%s reason=%s attempts=%lu passive=%d\n",
+                     name != nullptr ? name : "<unavailable>",
+                     reason != nullptr ? reason : "<unavailable>",
+                     static_cast<unsigned long>(applicationEventFetchPeriodicPulseAttemptCount),
+                     canObserveWithoutOwnership ? 1 : 0);
+        std::fflush(stderr);
+        // A failed start may identify a periodic source owned by AppKit or
+        // another component. Observe physical returns without ever stopping it.
+        if (canObserveWithoutOwnership)
+        {
+            applicationEventFetchPeriodicSlotMustBeProvedFree = true;
+            applicationEventFetchPeriodicPulseState =
+                ApplicationEventFetchPeriodicPulseState::passiveAfterStartFailure;
+            applicationEventFetchReturnPath =
+                ApplicationEventFetchReturnPath::activePeriodicPulse;
+            return applicationEventFetchPeriodicPulseStateIsConsistent();
+        }
+
+        // Any different exception is a fail-closed attempt, not evidence of a
+        // foreign stream. Resolve it without calling the global stop API.
+        ++applicationEventFetchPeriodicPulsePassiveResolutionCount;
+        ++applicationEventFetchPeriodicPulseResolutionCount;
+        ++applicationEventFetchPeriodicPulseExceptionalResolutionCount;
+        applicationEventFetchPeriodicPulseState =
+            ApplicationEventFetchPeriodicPulseState::idle;
+        applicationEventFetchPeriodicPulseTargetDepth = 0;
+        applicationEventFetchPeriodicPulseTargetInvocation = 0;
+        applicationEventFetchPeriodicPulseIsSlotProbe = false;
+        applicationEventFetchPeriodicSlotMustBeProvedFree = false;
+        return false;
+    }
+
+    ++applicationEventFetchPeriodicPulseStartCount;
+    applicationEventFetchPeriodicPulseState =
+        ApplicationEventFetchPeriodicPulseState::active;
+    applicationEventFetchReturnPath =
+        ApplicationEventFetchReturnPath::activePeriodicPulse;
+    std::fprintf(stderr,
+                 "NATIVE_APP_LOOP_FETCH_PULSE_STARTED attempt=%lu start=%lu depth=%lu invocation=%lu mode=%s mask=0x%llx dequeue=%d slotProbe=%d noDepthProgress=%lu\n",
+                 static_cast<unsigned long>(applicationEventFetchPeriodicPulseAttemptCount),
+                 static_cast<unsigned long>(applicationEventFetchPeriodicPulseStartCount),
+                 static_cast<unsigned long>(applicationEventFetchPeriodicPulseTargetDepth),
+                 static_cast<unsigned long>(applicationEventFetchPeriodicPulseTargetInvocation),
+                 [applicationEventFetchMode UTF8String] != nullptr
+                     ? [applicationEventFetchMode UTF8String] : "<unavailable>",
+                 static_cast<unsigned long long>(applicationEventFetchMask),
+                 applicationEventFetchDequeues ? 1 : 0,
+                 immediateSlotProbe ? 1 : 0,
+                 static_cast<unsigned long>(
+                     applicationEventFetchRequestAttemptsWithoutDepthProgress));
+    std::fflush(stderr);
+    if (applicationEventFetchPeriodicPulseStartCount == 1)
+        logFirstApplicationEventFetchPeriodicPulseStack();
+    if (immediateSlotProbe)
+        return stopOwnedApplicationEventFetchPeriodicPulse(
+            ApplicationEventFetchPeriodicPulseResolutionReason::slotAvailabilityProbe,
+            0, 0, nil);
+    return applicationEventFetchPeriodicPulseStateIsConsistent();
+}
+
+static bool proveApplicationPeriodicSlotForJuceHandoff() noexcept
+{
+    if (![NSThread isMainThread]
+        || NSApp == nil
+        || ! [NSApp isRunning]
+        || ! applicationEventFetchPeriodicPulseIsInactiveAndBalanced()
+        || applicationJuceHandoffProbeStartCount != 0
+        || applicationJuceHandoffProbeStopCount != 0
+        || applicationJuceHandoffProbeFailureCount != 0)
+        return false;
+
+    @try
+    {
+        [NSEvent startPeriodicEventsAfterDelay:0.0
+                                    withPeriod:applicationEventFetchPeriodicPulsePeriod];
+    }
+    @catch (NSException* exception)
+    {
+        ++applicationJuceHandoffProbeFailureCount;
+        const auto* name = [[exception name] UTF8String];
+        const auto* reason = [[exception reason] UTF8String];
+        std::fprintf(stderr,
+                     "NATIVE_APP_LOOP_JUCE_HANDOFF_PROBE_START_FAILED name=%s reason=%s\n",
+                     name != nullptr ? name : "<unavailable>",
+                     reason != nullptr ? reason : "<unavailable>");
+        std::fflush(stderr);
+        // A thrown start did not grant ownership; never stop a foreign stream.
+        return false;
+    }
+
+    ++applicationJuceHandoffProbeStartCount;
+    @try
+    {
+        [NSEvent stopPeriodicEvents];
+    }
+    @catch (NSException* exception)
+    {
+        const auto* name = [[exception name] UTF8String];
+        const auto* reason = [[exception reason] UTF8String];
+        std::fprintf(stderr,
+                     "NATIVE_APP_LOOP_JUCE_HANDOFF_PROBE_STOP_FAILED name=%s reason=%s\n",
+                     name != nullptr ? name : "<unavailable>",
+                     reason != nullptr ? reason : "<unavailable>");
+        std::fflush(stderr);
+        std::terminate();
+    }
+    ++applicationJuceHandoffProbeStopCount;
+    std::fputs("NATIVE_APP_LOOP_JUCE_HANDOFF_PROBE_PASSED\n", stderr);
+    std::fflush(stderr);
+    return applicationJuceHandoffProbeStartCount == 1
+        && applicationJuceHandoffProbeStopCount == 1
+        && applicationJuceHandoffProbeFailureCount == 0;
 }
 
 @interface WhyKikiPresetTestApplication : NSApplication
@@ -307,11 +904,14 @@ static bool applicationEventFetchBoundaryWasProved() noexcept
         applicationEventFetchModeSupplied = mode != nil;
         applicationEventFetchContextRecorded = true;
 
-        if (applicationEventFetchReturnPath
-                == ApplicationEventFetchReturnPath::activeUnwind
-            && fetchDepth > applicationEventFetchReturnLastUnwindDepth)
+        if (applicationEventFetchRequestLedgerRecorded
+            && applicationEventFetchRequestLastCompletedDepth == fetchDepth
+            && applicationEventFetchRequestLastCompletedInvocation != 0
+            && applicationEventFetchRequestLastCompletedInvocation != fetchInvocation)
+            ++applicationEventFetchRequestSameDepthReentryCount;
+        if (! applicationEventFetchRequestLedgerIsConsistent())
         {
-            std::fputs("NATIVE_APP_LOOP_FETCH_UNWIND_REENTRY\n", stderr);
+            std::fputs("NATIVE_APP_LOOP_FETCH_LEDGER_INVALID_ON_ENTRY\n", stderr);
             std::fflush(stderr);
             std::terminate();
         }
@@ -335,11 +935,12 @@ static bool applicationEventFetchBoundaryWasProved() noexcept
             && (applicationEventFetchReturnPath
                     == ApplicationEventFetchReturnPath::nextEligible
                 || applicationEventFetchReturnPath
-                    == ApplicationEventFetchReturnPath::nextEligibleAfterUnwind)
+                    == ApplicationEventFetchReturnPath::nextEligibleAfterPeriodicPulse)
             && fetchDepth == 1
             && dequeue == YES
             && mode != nil
-            && (mask & NSEventMaskApplicationDefined) != 0)
+            && (mask & NSEventMaskApplicationDefined) != 0
+            && applicationEventFetchPeriodicPulseIsInactiveAndBalanced())
         {
             applicationEventFetchReturnRequestedDepth = fetchDepth;
             applicationEventFetchReturnRequestedInvocation = fetchInvocation;
@@ -363,6 +964,14 @@ static bool applicationEventFetchBoundaryWasProved() noexcept
                                   untilDate:expiration
                                      inMode:mode
                                     dequeue:dequeue];
+
+        if (! observeApplicationEventFetchPeriodicPulseReturn(
+                event, fetchDepth, fetchInvocation))
+        {
+            std::fputs("NATIVE_APP_LOOP_FETCH_PULSE_RETURN_INVALID\n", stderr);
+            std::fflush(stderr);
+            std::terminate();
+        }
 
         const bool markedControlEvent = dequeue
             && mode != nil
@@ -443,6 +1052,15 @@ static bool applicationEventFetchBoundaryWasProved() noexcept
     }
     @finally
     {
+        if (completedNormally)
+        {
+            ++applicationEventFetchCompletedInvocationCount;
+            if (applicationEventFetchRequestLedgerRecorded)
+            {
+                applicationEventFetchRequestLastCompletedDepth = fetchDepth;
+                applicationEventFetchRequestLastCompletedInvocation = fetchInvocation;
+            }
+        }
         --applicationEventFetchDepth;
         applicationEventFetchActiveInvocation = previousActiveInvocation;
         applicationEventFetchMask = previousMask;
@@ -450,18 +1068,32 @@ static bool applicationEventFetchBoundaryWasProved() noexcept
         applicationEventFetchDequeues = previousDequeues;
         applicationEventFetchModeSupplied = previousModeSupplied;
         applicationEventFetchContextRecorded = previousContextRecorded;
+        if (completedNormally && applicationEventFetchRequestLedgerRecorded
+            && applicationEventFetchDepth < applicationEventFetchRequestMinimumDepth)
+        {
+            applicationEventFetchRequestMinimumDepth = applicationEventFetchDepth;
+            applicationEventFetchRequestAttemptsWithoutDepthProgress = 0;
+        }
         if (! completedNormally
             && applicationEventFetchReturnPath != ApplicationEventFetchReturnPath::none)
         {
+            if (applicationEventFetchPeriodicPulseState
+                == ApplicationEventFetchPeriodicPulseState::active)
+                (void) stopOwnedApplicationEventFetchPeriodicPulse(
+                    ApplicationEventFetchPeriodicPulseResolutionReason::exceptionalFetchExit,
+                    0, 0, nil);
+            else if (applicationEventFetchPeriodicPulseState
+                     == ApplicationEventFetchPeriodicPulseState::passiveAfterStartFailure)
+                (void) resolvePassiveApplicationEventFetchPeriodicPulse(
+                    ApplicationEventFetchPeriodicPulseResolutionReason::exceptionalFetchExit,
+                    0, 0, nil);
             std::fputs("NATIVE_APP_LOOP_FETCH_EXCEPTION_DURING_RETURN_REQUEST\n", stderr);
             std::fflush(stderr);
             std::terminate();
         }
-        if (completedNormally
-            && ! NativeFilePanel::continueApplicationEventFetchReturnRequest(
-                fetchDepth, fetchInvocation))
+        if (! applicationEventFetchRequestLedgerIsConsistent())
         {
-            std::fputs("NATIVE_APP_LOOP_FETCH_UNWIND_FAILED\n", stderr);
+            std::fputs("NATIVE_APP_LOOP_FETCH_LEDGER_INVALID_ON_RETURN\n", stderr);
             std::fflush(stderr);
             std::terminate();
         }
@@ -503,6 +1135,7 @@ bool applicationStopEventWasCurrentEvent = false;
 bool applicationStopEventHandledWithoutModalWindow = false;
 NSUInteger applicationStopEventHandlerDepth = 0;
 bool applicationStopCallbackSucceeded = false;
+bool applicationJucePeriodicWakeOwned = false;
 bool applicationStartEventPosted = false;
 bool applicationFetchBarrierEventPosted = false;
 bool applicationSettleEventPosted = false;
@@ -560,121 +1193,6 @@ bool stopApplicationEventFetchWakeDriver() noexcept
     std::fputs("NATIVE_APP_LOOP_FETCH_WAKE_DRIVER_STOPPED\n", stderr);
     std::fflush(stderr);
     return true;
-}
-
-bool stopCurrentApplicationEventFetchUnwindInvocation() noexcept
-{
-    if (![NSThread isMainThread]
-        || applicationEventFetchReturnPath != ApplicationEventFetchReturnPath::activeUnwind
-        || ! applicationEventFetchReturnRequested
-        || applicationEventFetchReturnRequestedDepth != 0
-        || applicationEventFetchReturnRequestedInvocation != 0
-        || applicationEventFetchReturnInitialDepth == 0
-        || applicationEventFetchReturnLastUnwindDepth == 0
-        || applicationEventFetchDepth != applicationEventFetchReturnLastUnwindDepth
-        || applicationEventFetchActiveInvocation
-            != applicationEventFetchReturnUnwindInvocation
-        || ! applicationEventFetchModeSupplied
-        || applicationEventFetchMode == nil
-        || ! applicationEventFetchContextRecorded
-        || applicationEventFetchRunLoopStopCount
-            < applicationEventFetchReturnUnwindInvocationStopBase
-        || applicationEventFetchRunLoopStopCount
-            >= maximumApplicationEventFetchStopAttempts
-        || applicationEventFetchRunLoopStopCount
-                - applicationEventFetchReturnUnwindInvocationStopBase
-            >= maximumApplicationEventFetchStopAttemptsPerInvocation)
-        return false;
-
-    auto* runLoop = CFRunLoopGetCurrent();
-    if (runLoop == nullptr || runLoop != CFRunLoopGetMain()
-        || ! currentRunLoopModeMatchesApplicationEventFetch(runLoop))
-        return false;
-
-    ++applicationEventFetchRunLoopStopCount;
-    std::fprintf(stderr,
-                 "NATIVE_APP_LOOP_FETCH_UNWIND_STOP episode=%lu depth=%lu invocation=%lu invocationAttempt=%lu totalAttempts=%lu returns=%lu\n",
-                 static_cast<unsigned long>(applicationEventFetchReturnUnwindEpisodeCount),
-                 static_cast<unsigned long>(applicationEventFetchDepth),
-                 static_cast<unsigned long>(applicationEventFetchReturnUnwindInvocation),
-                 static_cast<unsigned long>(applicationEventFetchRunLoopStopCount
-                     - applicationEventFetchReturnUnwindInvocationStopBase),
-                 static_cast<unsigned long>(applicationEventFetchRunLoopStopCount),
-                 static_cast<unsigned long>(applicationEventFetchReturnUnwindReturnCount));
-    std::fflush(stderr);
-    CFRunLoopStop(runLoop);
-    return true;
-}
-
-bool beginApplicationEventFetchUnwindEpisode() noexcept
-{
-    const auto waitsForEligibleFetch =
-        applicationEventFetchReturnPath == ApplicationEventFetchReturnPath::nextEligible
-        || applicationEventFetchReturnPath
-            == ApplicationEventFetchReturnPath::nextEligibleAfterUnwind;
-    const auto hasNoPriorEpisode =
-        applicationEventFetchReturnPath == ApplicationEventFetchReturnPath::nextEligible
-        && applicationEventFetchReturnInitialDepth == 0
-        && applicationEventFetchReturnLastUnwindDepth == 0
-        && applicationEventFetchReturnUnwindInvocation == 0
-        && applicationEventFetchReturnUnwindReturnCount == 0
-        && applicationEventFetchRunLoopStopCount == 0
-        && applicationEventFetchReturnUnwindStopBase == 0
-        && applicationEventFetchReturnUnwindReturnBase == 0
-        && applicationEventFetchReturnUnwindInvocationStopBase == 0
-        && applicationEventFetchReturnUnwindEpisodeCount == 0;
-    const auto priorEpisodesCompleted =
-        applicationEventFetchReturnPath
-            == ApplicationEventFetchReturnPath::nextEligibleAfterUnwind
-        && applicationEventFetchCompletedUnwindEpisodesMatch();
-    if (![NSThread isMainThread]
-        || ! waitsForEligibleFetch
-        || (! hasNoPriorEpisode && ! priorEpisodesCompleted)
-        || ! applicationEventFetchReturnRequested
-        || applicationEventFetchReturnRequestCount != 1
-        || applicationEventFetchReturnCount != 0
-        || applicationEventFetchReturnClaimCount != 0
-        || applicationEventFetchReturnRequestedDepth != 0
-        || applicationEventFetchReturnRequestedInvocation != 0
-        || applicationEventFetchDepth == 0
-        || applicationEventFetchActiveInvocation == 0
-        || ! applicationEventFetchModeSupplied
-        || applicationEventFetchMode == nil
-        || ! applicationEventFetchContextRecorded
-        || applicationEventFetchWakeDriverStopCount != 0
-        || applicationFetchBarrierEventPosted
-        || applicationFetchBarrierEventCount != 0
-        || applicationFetchBarrierEventDequeueCount != 0
-        || applicationEventFetchReturnUnwindEpisodeCount
-            >= maximumApplicationEventFetchUnwindEpisodes)
-        return false;
-
-    auto* runLoop = CFRunLoopGetCurrent();
-    if (runLoop == nullptr || runLoop != CFRunLoopGetMain()
-        || ! currentRunLoopModeMatchesApplicationEventFetch(runLoop))
-        return false;
-
-    applicationEventFetchReturnInitialDepth = applicationEventFetchDepth;
-    applicationEventFetchReturnLastUnwindDepth = applicationEventFetchDepth;
-    applicationEventFetchReturnUnwindInvocation =
-        applicationEventFetchActiveInvocation;
-    applicationEventFetchReturnUnwindStopBase =
-        applicationEventFetchRunLoopStopCount;
-    applicationEventFetchReturnUnwindReturnBase =
-        applicationEventFetchReturnUnwindReturnCount;
-    applicationEventFetchReturnUnwindInvocationStopBase =
-        applicationEventFetchRunLoopStopCount;
-    ++applicationEventFetchReturnUnwindEpisodeCount;
-    applicationEventFetchReturnPath = ApplicationEventFetchReturnPath::activeUnwind;
-    std::fprintf(stderr,
-                 "NATIVE_APP_LOOP_FETCH_UNWIND_EPISODE_STARTED episode=%lu depth=%lu invocation=%lu attemptBase=%lu returnBase=%lu\n",
-                 static_cast<unsigned long>(applicationEventFetchReturnUnwindEpisodeCount),
-                 static_cast<unsigned long>(applicationEventFetchDepth),
-                 static_cast<unsigned long>(applicationEventFetchReturnUnwindInvocation),
-                 static_cast<unsigned long>(applicationEventFetchReturnUnwindStopBase),
-                 static_cast<unsigned long>(applicationEventFetchReturnUnwindReturnBase));
-    std::fflush(stderr);
-    return stopCurrentApplicationEventFetchUnwindInvocation();
 }
 
 bool resolvedExactlyOnce(const WhyKikiNativePanelSessionObservation* state)
@@ -974,6 +1492,8 @@ void NativeFilePanel::prepareTestApplication(
         if (applicationControlEventNonce != 0
             || applicationControlEventPostedMask != 0)
             throw std::runtime_error("NATIVE_PANEL_SETUP: control-event token state was not retired");
+        if (! applicationEventFetchPeriodicPulseIsInactiveAndBalanced())
+            throw std::runtime_error("NATIVE_PANEL_SETUP: periodic-pulse ownership was not retired");
 
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         if ([NSApp activationPolicy] != NSApplicationActivationPolicyRegular)
@@ -1035,28 +1555,52 @@ void NativeFilePanel::prepareTestApplication(
         applicationStopEventHandledWithoutModalWindow = false;
         applicationStopEventHandlerDepth = 0;
         applicationStopCallbackSucceeded = false;
+        applicationJucePeriodicWakeOwned = false;
         applicationStartEventPosted = false;
         applicationFetchBarrierEventPosted = false;
         applicationSettleEventPosted = false;
         applicationStopEventPosted = false;
         applicationEventFetchDepth = 0;
         applicationEventFetchReturnRequestedDepth = 0;
-        applicationEventFetchReturnInitialDepth = 0;
-        applicationEventFetchReturnLastUnwindDepth = 0;
-        applicationEventFetchReturnUnwindInvocation = 0;
         applicationEventFetchReturnRequestCount = 0;
         applicationEventFetchReturnCount = 0;
         applicationEventFetchReturnClaimCount = 0;
-        applicationEventFetchReturnUnwindReturnCount = 0;
-        applicationEventFetchRunLoopStopCount = 0;
-        applicationEventFetchReturnUnwindStopBase = 0;
-        applicationEventFetchReturnUnwindReturnBase = 0;
-        applicationEventFetchReturnUnwindInvocationStopBase = 0;
-        applicationEventFetchReturnUnwindEpisodeCount = 0;
         applicationEventFetchWakeDriverStopCount = 0;
         applicationEventFetchInvocationCount = 0;
         applicationEventFetchActiveInvocation = 0;
         applicationEventFetchReturnRequestedInvocation = 0;
+        applicationEventFetchPeriodicPulseState =
+            ApplicationEventFetchPeriodicPulseState::idle;
+        applicationEventFetchPeriodicPulseTargetDepth = 0;
+        applicationEventFetchPeriodicPulseTargetInvocation = 0;
+        applicationEventFetchPeriodicPulseInitialDepth = 0;
+        applicationEventFetchPeriodicPulseAttemptCount = 0;
+        applicationEventFetchPeriodicPulseStartCount = 0;
+        applicationEventFetchPeriodicPulseStartFailureCount = 0;
+        applicationEventFetchPeriodicPulseStopCount = 0;
+        applicationEventFetchPeriodicPulsePassiveResolutionCount = 0;
+        applicationEventFetchPeriodicPulseResolutionCount = 0;
+        applicationEventFetchPeriodicPulseSlotProbeResolutionCount = 0;
+        applicationEventFetchPeriodicPulseTargetReturnCount = 0;
+        applicationEventFetchPeriodicPulseDeeperReturnCount = 0;
+        applicationEventFetchPeriodicPulsePeriodicReturnCount = 0;
+        applicationEventFetchPeriodicPulseExceptionalResolutionCount = 0;
+        applicationEventFetchPeriodicPulseFinishResolutionCount = 0;
+        applicationEventFetchCompletedInvocationCount = 0;
+        applicationEventFetchRequestInitialDepth = 0;
+        applicationEventFetchRequestEntryBase = 0;
+        applicationEventFetchRequestReturnBase = 0;
+        applicationEventFetchRequestLastCompletedDepth = 0;
+        applicationEventFetchRequestLastCompletedInvocation = 0;
+        applicationEventFetchRequestSameDepthReentryCount = 0;
+        applicationEventFetchRequestMinimumDepth = 0;
+        applicationEventFetchRequestAttemptsWithoutDepthProgress = 0;
+        applicationEventFetchRequestLedgerRecorded = false;
+        applicationEventFetchPeriodicSlotMustBeProvedFree = false;
+        applicationEventFetchPeriodicPulseIsSlotProbe = false;
+        applicationJuceHandoffProbeStartCount = 0;
+        applicationJuceHandoffProbeStopCount = 0;
+        applicationJuceHandoffProbeFailureCount = 0;
         applicationFetchBarrierEventDequeueInvocation = 0;
         applicationSettleEventDequeueInvocation = 0;
         applicationStopEventDequeueInvocation = 0;
@@ -1180,7 +1724,8 @@ void NativeFilePanel::prepareTestApplication(
                                                    [NSApp modalWindow] == nil;
                                                applicationStopEventHandlerDepth =
                                                    handlerDepth;
-                                               applicationStopCallbackSucceeded = applicationStopEventCount == 1
+                                               const auto stopCallbackIsReady =
+                                                   applicationStopEventCount == 1
                                                    && NativeFilePanel::applicationSettleEventWasHandled()
                                                    && running
                                                    && applicationStopEventPostedFromReadyContext
@@ -1191,8 +1736,19 @@ void NativeFilePanel::prepareTestApplication(
                                                        < applicationStopEventDequeueDepth
                                                    && applicationStopEventDequeueInvocation
                                                        > applicationSettleEventDequeueInvocation
-                                                   && applicationStopCallback != nullptr
-                                                   && applicationStopCallback();
+                                                   && applicationEventFetchPeriodicPulseIsInactiveAndBalanced()
+                                                   && ! applicationJucePeriodicWakeOwned
+                                                   && applicationStopCallback != nullptr;
+                                               applicationStopCallbackSucceeded = false;
+                                               if (stopCallbackIsReady
+                                                   && proveApplicationPeriodicSlotForJuceHandoff())
+                                               {
+                                                   applicationJucePeriodicWakeOwned =
+                                                       applicationStopCallback()
+                                                       == NativeFilePanel::ApplicationStopResult::jucePeriodicWakeAcquired;
+                                                   applicationStopCallbackSucceeded =
+                                                       applicationJucePeriodicWakeOwned;
+                                               }
                                                std::fprintf(stderr,
                                                             "NATIVE_APP_LOOP_STOP_HANDLED count=%lu running=%d postedFromReady=%d currentEvent=%d modalWindow=%d handlerDepth=%lu dequeueDepth=%lu dequeues=%lu callback=%d\n",
                                                             static_cast<unsigned long>(applicationStopEventCount),
@@ -1320,9 +1876,11 @@ bool NativeFilePanel::postBoundApplicationFetchBarrierEvent() noexcept
     {
         const auto boundEligibleFetch = [NSThread isMainThread]
             && applicationEventFetchBindingMatchesRequestPath()
+            && applicationEventFetchPeriodicPulseIsInactiveAndBalanced()
             && applicationEventFetchReturnRequested
             && applicationEventFetchReturnRequestCount == 1
             && applicationEventFetchReturnCount == 0
+            && applicationEventFetchWakeDriverStopCount == 0
             && applicationEventFetchReturnRequestedDepth != 0
             && applicationEventFetchReturnRequestedInvocation != 0
             && applicationEventFetchDepth
@@ -1348,77 +1906,6 @@ bool NativeFilePanel::postBoundApplicationFetchBarrierEvent() noexcept
         return applicationFetchBarrierEventPosted;
     }
 }
-bool NativeFilePanel::continueApplicationEventFetchReturnRequest(
-    std::size_t exitingDepthValue, std::size_t exitingInvocationValue) noexcept
-{
-    @autoreleasepool
-    {
-        if (applicationEventFetchReturnPath
-            != ApplicationEventFetchReturnPath::activeUnwind)
-            return true;
-        const auto exitingDepth = static_cast<NSUInteger>(exitingDepthValue);
-        const auto exitingInvocation = static_cast<NSUInteger>(exitingInvocationValue);
-        if (![NSThread isMainThread]
-            || ! applicationEventFetchReturnRequested
-            || applicationEventFetchReturnRequestedDepth != 0
-            || applicationEventFetchReturnRequestedInvocation != 0
-            || applicationEventFetchReturnInitialDepth == 0
-            || applicationEventFetchReturnLastUnwindDepth == 0
-            || applicationEventFetchReturnUnwindEpisodeCount == 0
-            || exitingDepth != applicationEventFetchReturnLastUnwindDepth
-            || exitingInvocation != applicationEventFetchReturnUnwindInvocation
-            || applicationEventFetchDepth + 1 != exitingDepth
-            || applicationEventFetchReturnInitialDepth < exitingDepth
-            || applicationEventFetchReturnUnwindReturnCount
-                != applicationEventFetchReturnUnwindReturnBase
-                    + applicationEventFetchReturnInitialDepth - exitingDepth
-            || applicationEventFetchRunLoopStopCount
-                < applicationEventFetchReturnUnwindStopBase
-                    + applicationEventFetchReturnInitialDepth - exitingDepth + 1
-            || applicationEventFetchRunLoopStopCount
-                <= applicationEventFetchReturnUnwindInvocationStopBase)
-            return false;
-
-        ++applicationEventFetchReturnUnwindReturnCount;
-        applicationEventFetchReturnLastUnwindDepth = applicationEventFetchDepth;
-        if (applicationEventFetchDepth == 0)
-        {
-            if (applicationEventFetchActiveInvocation != 0
-                || applicationEventFetchContextRecorded
-                || applicationEventFetchMode != nil
-                || applicationEventFetchRunLoopStopCount
-                    < applicationEventFetchReturnUnwindStopBase
-                        + applicationEventFetchReturnInitialDepth
-                || applicationEventFetchReturnUnwindReturnCount
-                    != applicationEventFetchReturnUnwindReturnBase
-                        + applicationEventFetchReturnInitialDepth)
-                return false;
-            applicationEventFetchReturnPath =
-                ApplicationEventFetchReturnPath::nextEligibleAfterUnwind;
-            applicationEventFetchReturnUnwindInvocation = 0;
-            std::fprintf(stderr,
-                         "NATIVE_APP_LOOP_FETCH_UNWOUND_TO_NEXT_ELIGIBLE episode=%lu exitingInvocation=%lu stops=%lu returns=%lu\n",
-                         static_cast<unsigned long>(applicationEventFetchReturnUnwindEpisodeCount),
-                         static_cast<unsigned long>(exitingInvocation),
-                         static_cast<unsigned long>(applicationEventFetchRunLoopStopCount),
-                         static_cast<unsigned long>(applicationEventFetchReturnUnwindReturnCount));
-            std::fflush(stderr);
-            return true;
-        }
-
-        if (applicationEventFetchActiveInvocation == 0
-            || applicationEventFetchActiveInvocation >= exitingInvocation
-            || ! applicationEventFetchModeSupplied
-            || applicationEventFetchMode == nil
-            || ! applicationEventFetchContextRecorded)
-            return false;
-        applicationEventFetchReturnUnwindInvocation =
-            applicationEventFetchActiveInvocation;
-        applicationEventFetchReturnUnwindInvocationStopBase =
-            applicationEventFetchRunLoopStopCount;
-        return stopCurrentApplicationEventFetchUnwindInvocation();
-    }
-}
 bool NativeFilePanel::requestApplicationEventFetchReturn() noexcept
 {
     @autoreleasepool
@@ -1429,22 +1916,16 @@ bool NativeFilePanel::requestApplicationEventFetchReturn() noexcept
             || applicationEventFetchReturnRequestCount != 0
             || applicationEventFetchReturnCount != 0
             || applicationEventFetchReturnClaimCount != 0
-            || applicationEventFetchReturnUnwindReturnCount != 0
-            || applicationEventFetchRunLoopStopCount != 0
-            || applicationEventFetchReturnInitialDepth != 0
-            || applicationEventFetchReturnLastUnwindDepth != 0
-            || applicationEventFetchReturnUnwindInvocation != 0
-            || applicationEventFetchReturnUnwindStopBase != 0
-            || applicationEventFetchReturnUnwindReturnBase != 0
-            || applicationEventFetchReturnUnwindInvocationStopBase != 0
-            || applicationEventFetchReturnUnwindEpisodeCount != 0
             || applicationEventFetchWakeDriverStopCount != 0
+            || applicationEventFetchReturnRequestedDepth != 0
+            || applicationEventFetchReturnRequestedInvocation != 0
+            || applicationEventFetchRequestLedgerRecorded
+            || ! applicationEventFetchHasNoPeriodicPulseHistory()
             || ! isRunnableApplicationEventContext())
             return false;
 
         const auto hasActiveFetch = applicationEventFetchDepth > 0;
-        const auto targetsCurrentFetch = applicationEventFetchDepth == 1
-            && currentApplicationEventFetchIsEligible();
+        const auto targetsCurrentFetch = currentApplicationEventFetchCanBindBarrier();
 
         auto* runLoop = CFRunLoopGetCurrent();
         if (runLoop == nullptr || runLoop != CFRunLoopGetMain())
@@ -1462,6 +1943,16 @@ bool NativeFilePanel::requestApplicationEventFetchReturn() noexcept
             }
         }
 
+        applicationEventFetchRequestInitialDepth = applicationEventFetchDepth;
+        applicationEventFetchRequestEntryBase = applicationEventFetchInvocationCount;
+        applicationEventFetchRequestReturnBase =
+            applicationEventFetchCompletedInvocationCount;
+        applicationEventFetchRequestLastCompletedDepth = 0;
+        applicationEventFetchRequestLastCompletedInvocation = 0;
+        applicationEventFetchRequestSameDepthReentryCount = 0;
+        applicationEventFetchRequestMinimumDepth = applicationEventFetchDepth;
+        applicationEventFetchRequestAttemptsWithoutDepthProgress = 0;
+        applicationEventFetchRequestLedgerRecorded = true;
         applicationEventFetchReturnRequested = true;
         applicationEventFetchReturnPath = targetsCurrentFetch
             ? ApplicationEventFetchReturnPath::activeEligible
@@ -1471,41 +1962,45 @@ bool NativeFilePanel::requestApplicationEventFetchReturn() noexcept
         applicationEventFetchReturnRequestedInvocation =
             targetsCurrentFetch ? applicationEventFetchActiveInvocation : 0;
         ++applicationEventFetchReturnRequestCount;
-        const auto pathStarted = targetsCurrentFetch
-            ? postBoundApplicationFetchBarrierEvent()
-            : ! hasActiveFetch || beginApplicationEventFetchUnwindEpisode();
+        auto pathStarted = true;
+        if (targetsCurrentFetch)
+            pathStarted = postBoundApplicationFetchBarrierEvent();
+        else if (hasActiveFetch && currentApplicationEventFetchCanUsePeriodicPulse())
+            pathStarted = beginApplicationEventFetchPeriodicPulse(false);
         if (! pathStarted)
         {
             applicationEventFetchReturnRequested = false;
             applicationEventFetchReturnPath = ApplicationEventFetchReturnPath::none;
             applicationEventFetchReturnRequestedDepth = 0;
-            applicationEventFetchReturnInitialDepth = 0;
-            applicationEventFetchReturnLastUnwindDepth = 0;
-            applicationEventFetchReturnUnwindInvocation = 0;
             applicationEventFetchReturnRequestedInvocation = 0;
             applicationEventFetchReturnRequestCount = 0;
             applicationEventFetchReturnClaimCount = 0;
-            applicationEventFetchReturnUnwindReturnCount = 0;
-            applicationEventFetchRunLoopStopCount = 0;
-            applicationEventFetchReturnUnwindStopBase = 0;
-            applicationEventFetchReturnUnwindReturnBase = 0;
-            applicationEventFetchReturnUnwindInvocationStopBase = 0;
-            applicationEventFetchReturnUnwindEpisodeCount = 0;
             applicationEventFetchWakeDriverStopCount = 0;
+            applicationEventFetchRequestInitialDepth = 0;
+            applicationEventFetchRequestEntryBase = 0;
+            applicationEventFetchRequestReturnBase = 0;
+            applicationEventFetchRequestLastCompletedDepth = 0;
+            applicationEventFetchRequestLastCompletedInvocation = 0;
+            applicationEventFetchRequestSameDepthReentryCount = 0;
+            applicationEventFetchRequestMinimumDepth = 0;
+            applicationEventFetchRequestAttemptsWithoutDepthProgress = 0;
+            applicationEventFetchRequestLedgerRecorded = false;
             if (mode != nullptr)
                 CFRelease(mode);
             return false;
         }
         const auto* modeName = mode != nullptr ? [(NSString*) mode UTF8String] : nullptr;
         std::fprintf(stderr,
-                     "NATIVE_APP_LOOP_FETCH_RETURN_REQUESTED path=%s initialDepth=%lu targetDepth=%lu invocation=%lu mode=%s mask=0x%llx dequeue=%d\n",
+                     "NATIVE_APP_LOOP_FETCH_RETURN_REQUESTED path=%s pulseInitialDepth=%lu targetDepth=%lu invocation=%lu mode=%s mask=0x%llx dequeue=%d pulseStarts=%lu pulseStops=%lu\n",
                      applicationEventFetchReturnPathName(),
-                     static_cast<unsigned long>(applicationEventFetchReturnInitialDepth),
+                     static_cast<unsigned long>(applicationEventFetchPeriodicPulseInitialDepth),
                      static_cast<unsigned long>(applicationEventFetchReturnRequestedDepth),
                      static_cast<unsigned long>(applicationEventFetchReturnRequestedInvocation),
                      modeName != nullptr ? modeName : "<between-fetches>",
                      static_cast<unsigned long long>(applicationEventFetchMask),
-                     applicationEventFetchDequeues ? 1 : 0);
+                     applicationEventFetchDequeues ? 1 : 0,
+                     static_cast<unsigned long>(applicationEventFetchPeriodicPulseStartCount),
+                     static_cast<unsigned long>(applicationEventFetchPeriodicPulseStopCount));
         std::fflush(stderr);
         if (targetsCurrentFetch)
         {
@@ -1514,18 +2009,6 @@ bool NativeFilePanel::requestApplicationEventFetchReturn() noexcept
         }
         if (mode != nullptr)
             CFRelease(mode);
-        if (targetsCurrentFetch)
-        {
-            ++applicationEventFetchRunLoopStopCount;
-            std::fprintf(stderr,
-                         "NATIVE_APP_LOOP_FETCH_RUN_LOOP_STOP path=%s depth=%lu invocation=%lu stops=%lu\n",
-                         applicationEventFetchReturnPathName(),
-                         static_cast<unsigned long>(applicationEventFetchDepth),
-                         static_cast<unsigned long>(applicationEventFetchActiveInvocation),
-                         static_cast<unsigned long>(applicationEventFetchRunLoopStopCount));
-            std::fflush(stderr);
-            CFRunLoopStop(runLoop);
-        }
         return true;
     }
 }
@@ -1538,49 +2021,91 @@ bool NativeFilePanel::driveApplicationEventFetchReturnRequest() noexcept
             || applicationEventFetchReturnRequestCount != 1
             || applicationEventFetchReturnCount != 0
             || applicationEventFetchWakeDriverStopCount != 0
+            || ! applicationEventFetchRequestLedgerRecorded
+            || ! applicationEventFetchRequestLedgerIsConsistent()
+            || ! applicationEventFetchPeriodicPulseStateIsConsistent()
             || ! isRunnableApplicationEventContext())
             return false;
 
-        if (applicationEventFetchReturnPath
-            == ApplicationEventFetchReturnPath::activeUnwind)
-        {
-            auto* runLoop = CFRunLoopGetCurrent();
-            if (runLoop == nullptr || runLoop != CFRunLoopGetMain())
-                return false;
-            if (! currentRunLoopModeMatchesApplicationEventFetch(runLoop))
-                return true;
-            return stopCurrentApplicationEventFetchUnwindInvocation();
-        }
+        if (applicationEventFetchPeriodicPulseState
+            == ApplicationEventFetchPeriodicPulseState::starting)
+            return false;
+        if (applicationEventFetchPeriodicPulseState
+                == ApplicationEventFetchPeriodicPulseState::active
+            || applicationEventFetchPeriodicPulseState
+                == ApplicationEventFetchPeriodicPulseState::passiveAfterStartFailure)
+            return true;
 
         if (applicationEventFetchReturnRequestedDepth != 0
-            || applicationEventFetchReturnRequestedInvocation != 0
-            || applicationEventFetchDepth == 0)
+            || applicationEventFetchReturnRequestedInvocation != 0)
             return true;
 
         const auto waitsForEligibleFetch =
             applicationEventFetchReturnPath
                 == ApplicationEventFetchReturnPath::nextEligible
             || applicationEventFetchReturnPath
-                == ApplicationEventFetchReturnPath::nextEligibleAfterUnwind;
-        if (! waitsForEligibleFetch
-            || (applicationEventFetchDepth == 1
-                && currentApplicationEventFetchIsEligible()))
+                == ApplicationEventFetchReturnPath::nextEligibleAfterPeriodicPulse;
+        if (! waitsForEligibleFetch)
             return false;
+        if (applicationEventFetchDepth == 0)
+            return true;
 
         auto* runLoop = CFRunLoopGetCurrent();
         if (runLoop == nullptr || runLoop != CFRunLoopGetMain())
             return false;
         if (! currentRunLoopModeMatchesApplicationEventFetch(runLoop))
             return true;
-        return beginApplicationEventFetchUnwindEpisode();
+
+        if (applicationEventFetchPeriodicSlotMustBeProvedFree)
+        {
+            if (! currentApplicationEventFetchHasBoundContext())
+                return true;
+            if (! beginApplicationEventFetchPeriodicPulse(true))
+                return false;
+            if (applicationEventFetchPeriodicPulseState
+                == ApplicationEventFetchPeriodicPulseState::passiveAfterStartFailure)
+                return true;
+        }
+
+        if (currentApplicationEventFetchCanBindBarrier())
+        {
+            applicationEventFetchReturnPath =
+                applicationEventFetchPeriodicPulseAttemptCount == 0
+                    ? ApplicationEventFetchReturnPath::activeEligible
+                    : ApplicationEventFetchReturnPath::activeEligibleAfterPeriodicPulse;
+            applicationEventFetchReturnRequestedDepth = applicationEventFetchDepth;
+            applicationEventFetchReturnRequestedInvocation =
+                applicationEventFetchActiveInvocation;
+            if (! postBoundApplicationFetchBarrierEvent())
+                return false;
+            std::fputs("NATIVE_APP_LOOP_FETCH_BARRIER_POSTED\n", stderr);
+            std::fflush(stderr);
+            return true;
+        }
+
+        if (currentApplicationEventFetchCanUsePeriodicPulse())
+            return beginApplicationEventFetchPeriodicPulse(false);
+        return true;
     }
 }
 void NativeFilePanel::logApplicationSettleReadiness() noexcept
 {
     @autoreleasepool
     {
+        const auto requestEntries = applicationEventFetchRequestLedgerRecorded
+                && applicationEventFetchInvocationCount
+                    >= applicationEventFetchRequestEntryBase
+            ? applicationEventFetchInvocationCount
+                - applicationEventFetchRequestEntryBase
+            : 0;
+        const auto requestReturns = applicationEventFetchRequestLedgerRecorded
+                && applicationEventFetchCompletedInvocationCount
+                    >= applicationEventFetchRequestReturnBase
+            ? applicationEventFetchCompletedInvocationCount
+                - applicationEventFetchRequestReturnBase
+            : 0;
         std::fprintf(stderr,
-                     "NATIVE_APP_LOOP_SETTLE_READINESS depth=%lu activeInvocation=%lu context=%d mask=0x%llx dequeue=%d mode=%d request=%d path=%s initialDepth=%lu lastUnwindDepth=%lu unwindInvocation=%lu episodes=%lu unwindStopBase=%lu unwindReturnBase=%lu invocationStopBase=%lu unwindReturns=%lu claims=%lu runLoopStops=%lu wakeDriverStops=%lu start=%d running=%d modalWindow=%d\n",
+                     "NATIVE_APP_LOOP_SETTLE_READINESS depth=%lu activeInvocation=%lu context=%d mask=0x%llx dequeue=%d mode=%d request=%d path=%s pulseState=%u pulseInitialDepth=%lu pulseTargetDepth=%lu pulseTargetInvocation=%lu pulseAttempts=%lu pulseStarts=%lu pulseStartFailures=%lu pulseStops=%lu pulsePassiveResolutions=%lu pulseSlotProbeResolutions=%lu pulseResolutions=%lu pulseTargetReturns=%lu pulseDeeperReturns=%lu pulsePeriodicReturns=%lu slotProofPending=%d ledger=%d requestInitialDepth=%lu requestMinimumDepth=%lu requestEntries=%lu requestReturns=%lu sameDepthReentries=%lu noDepthProgress=%lu claims=%lu wakeDriverStops=%lu start=%d running=%d modalWindow=%d\n",
                      static_cast<unsigned long>(applicationEventFetchDepth),
                      static_cast<unsigned long>(applicationEventFetchActiveInvocation),
                      applicationEventFetchContextRecorded ? 1 : 0,
@@ -1589,16 +2114,33 @@ void NativeFilePanel::logApplicationSettleReadiness() noexcept
                      applicationEventFetchModeSupplied ? 1 : 0,
                      applicationEventFetchReturnRequested ? 1 : 0,
                      applicationEventFetchReturnPathName(),
-                     static_cast<unsigned long>(applicationEventFetchReturnInitialDepth),
-                     static_cast<unsigned long>(applicationEventFetchReturnLastUnwindDepth),
-                     static_cast<unsigned long>(applicationEventFetchReturnUnwindInvocation),
-                     static_cast<unsigned long>(applicationEventFetchReturnUnwindEpisodeCount),
-                     static_cast<unsigned long>(applicationEventFetchReturnUnwindStopBase),
-                     static_cast<unsigned long>(applicationEventFetchReturnUnwindReturnBase),
-                     static_cast<unsigned long>(applicationEventFetchReturnUnwindInvocationStopBase),
-                     static_cast<unsigned long>(applicationEventFetchReturnUnwindReturnCount),
+                     static_cast<unsigned>(applicationEventFetchPeriodicPulseState),
+                     static_cast<unsigned long>(applicationEventFetchPeriodicPulseInitialDepth),
+                     static_cast<unsigned long>(applicationEventFetchPeriodicPulseTargetDepth),
+                     static_cast<unsigned long>(applicationEventFetchPeriodicPulseTargetInvocation),
+                     static_cast<unsigned long>(applicationEventFetchPeriodicPulseAttemptCount),
+                     static_cast<unsigned long>(applicationEventFetchPeriodicPulseStartCount),
+                     static_cast<unsigned long>(applicationEventFetchPeriodicPulseStartFailureCount),
+                     static_cast<unsigned long>(applicationEventFetchPeriodicPulseStopCount),
+                     static_cast<unsigned long>(
+                         applicationEventFetchPeriodicPulsePassiveResolutionCount),
+                     static_cast<unsigned long>(
+                         applicationEventFetchPeriodicPulseSlotProbeResolutionCount),
+                     static_cast<unsigned long>(applicationEventFetchPeriodicPulseResolutionCount),
+                     static_cast<unsigned long>(applicationEventFetchPeriodicPulseTargetReturnCount),
+                     static_cast<unsigned long>(applicationEventFetchPeriodicPulseDeeperReturnCount),
+                     static_cast<unsigned long>(applicationEventFetchPeriodicPulsePeriodicReturnCount),
+                     applicationEventFetchPeriodicSlotMustBeProvedFree ? 1 : 0,
+                     applicationEventFetchRequestLedgerRecorded ? 1 : 0,
+                     static_cast<unsigned long>(applicationEventFetchRequestInitialDepth),
+                     static_cast<unsigned long>(applicationEventFetchRequestMinimumDepth),
+                     static_cast<unsigned long>(requestEntries),
+                     static_cast<unsigned long>(requestReturns),
+                     static_cast<unsigned long>(
+                         applicationEventFetchRequestSameDepthReentryCount),
+                     static_cast<unsigned long>(
+                         applicationEventFetchRequestAttemptsWithoutDepthProgress),
                      static_cast<unsigned long>(applicationEventFetchReturnClaimCount),
-                     static_cast<unsigned long>(applicationEventFetchRunLoopStopCount),
                      static_cast<unsigned long>(applicationEventFetchWakeDriverStopCount),
                      applicationStartEventWasHandled() ? 1 : 0,
                      [NSApp isRunning] ? 1 : 0,
@@ -1646,6 +2188,7 @@ bool NativeFilePanel::applicationIsReadyForStopEvent() noexcept
     @autoreleasepool
     {
         return applicationSettleEventWasHandled()
+            && applicationEventFetchPeriodicPulseIsInactiveAndBalanced()
             && ! applicationStopEventPosted
             && applicationStopEventCount == 0
             && isRunnableApplicationEventContext();
@@ -1686,7 +2229,12 @@ bool NativeFilePanel::applicationStopEventWasHandled() noexcept
             && applicationStopEventDequeueInvocation > applicationSettleEventDequeueInvocation
             && applicationControlEventPostedMask
                 == allApplicationControlEventsPostedMask
-            && applicationStopCallbackSucceeded;
+            && applicationEventFetchPeriodicPulseIsInactiveAndBalanced()
+            && applicationStopCallbackSucceeded
+            && applicationJuceHandoffProbeStartCount == 1
+            && applicationJuceHandoffProbeStopCount == 1
+            && applicationJuceHandoffProbeFailureCount == 0
+            && applicationJucePeriodicWakeOwned;
     }
 }
 void NativeFilePanel::finishTestApplication() noexcept
@@ -1701,9 +2249,45 @@ void NativeFilePanel::finishTestApplication() noexcept
         applicationFetchBoundContext = nullptr;
         if (applicationEventMonitor != nil)
         {
-            // JUCE's macOS stop path uses periodic events to release
-            // NSApplication::run. Retire that wake before framework teardown.
-            [NSEvent stopPeriodicEvents];
+            if (applicationEventFetchPeriodicPulseState
+                == ApplicationEventFetchPeriodicPulseState::active)
+            {
+                // Only an explicitly acquired test pulse may be stopped on an
+                // incomplete handshake. A failed start can denote a foreign source.
+                if (! stopOwnedApplicationEventFetchPeriodicPulse(
+                        ApplicationEventFetchPeriodicPulseResolutionReason::finishCleanup,
+                        0, 0, nil))
+                    std::terminate();
+            }
+            else if (applicationEventFetchPeriodicPulseState
+                     == ApplicationEventFetchPeriodicPulseState::passiveAfterStartFailure)
+            {
+                // The failed start never granted ownership. Retire only the
+                // observation; a foreign thread-global stream remains untouched.
+                if (! resolvePassiveApplicationEventFetchPeriodicPulse(
+                        ApplicationEventFetchPeriodicPulseResolutionReason::finishCleanup,
+                        0, 0, nil))
+                    std::terminate();
+            }
+            else if (applicationEventFetchPeriodicPulseState
+                     != ApplicationEventFetchPeriodicPulseState::idle)
+            {
+                std::terminate();
+            }
+            else if (applicationEventFetchPeriodicSlotMustBeProvedFree)
+            {
+                // An observation may have completed while its foreign source
+                // remained unproved. Cleanup owns no stream in this state.
+                applicationEventFetchPeriodicSlotMustBeProvedFree = false;
+            }
+
+            // The pinned JUCE stop path creates its own periodic source. It is
+            // owned by JUCE only after the STOP callback completed successfully.
+            if (applicationJucePeriodicWakeOwned)
+            {
+                [NSEvent stopPeriodicEvents];
+                applicationJucePeriodicWakeOwned = false;
+            }
             [NSEvent removeMonitor:applicationEventMonitor];
             applicationEventMonitor = nil;
         }
