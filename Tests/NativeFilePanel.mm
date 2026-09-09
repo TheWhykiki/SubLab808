@@ -129,6 +129,7 @@ static NSUInteger applicationSettleEventDequeueCount = 0;
 static NSUInteger applicationStopEventDequeueCount = 0;
 static NSInteger applicationControlEventNonce = 0;
 static NSUInteger applicationControlEventPostedMask = 0;
+static NSUInteger applicationMainMenuTrackingCancelCount = 0;
 
 static constexpr short applicationControlEventSubtype = 0x574b;
 static constexpr NSInteger applicationStartEventCode = 1;
@@ -1658,6 +1659,7 @@ void NativeFilePanel::prepareTestApplication(
         applicationStopEventDequeueCount = 0;
         applicationControlEventNonce = createApplicationControlEventNonce();
         applicationControlEventPostedMask = 0;
+        applicationMainMenuTrackingCancelCount = 0;
         applicationEventMonitor = [NSEvent
             addLocalMonitorForEventsMatchingMask:NSEventMaskApplicationDefined
                                        handler:^NSEvent* (NSEvent* event)
@@ -1821,6 +1823,52 @@ bool NativeFilePanel::applicationIsRunning() noexcept
         return [NSThread isMainThread] && NSApp != nil && [NSApp isRunning];
     }
 }
+bool NativeFilePanel::cancelApplicationMenuTrackingForShutdown() noexcept
+{
+    @autoreleasepool
+    {
+        if (! isRunnableApplicationEventContext()
+            || ! applicationStartEventWasHandled()
+            || applicationMainMenuTrackingCancelCount != 0
+            || applicationEventFetchReturnRequested
+            || applicationEventFetchReturnRequestCount != 0
+            || ! applicationEventFetchHasNoPeriodicPulseHistory()
+            || applicationFetchBarrierEventPosted
+            || applicationSettleEventPosted
+            || applicationStopEventPosted)
+            return false;
+
+        auto* mainMenu = [NSApp mainMenu];
+        if (mainMenu == nil)
+            return false;
+
+        ++applicationMainMenuTrackingCancelCount;
+        @try
+        {
+            // A remote AppKit view can begin NSMenuBarTrackingSession while the
+            // test window becomes key. Public NSMenu cancellation is the only
+            // action here: the callback must return before fetch readiness is
+            // reconsidered, so this cannot manufacture an event-loop boundary.
+            [mainMenu cancelTrackingWithoutAnimation];
+        }
+        @catch (NSException* exception)
+        {
+            const auto* name = [[exception name] UTF8String];
+            std::fprintf(stderr,
+                         "NATIVE_APP_LOOP_MENU_TRACKING_CANCEL_FAILED name=%s\n",
+                         name != nullptr ? name : "<unavailable>");
+            std::fflush(stderr);
+            return false;
+        }
+
+        std::fprintf(stderr,
+                     "NATIVE_APP_LOOP_MENU_TRACKING_CANCELLED count=%lu activeFetchDepth=%lu\n",
+                     static_cast<unsigned long>(applicationMainMenuTrackingCancelCount),
+                     static_cast<unsigned long>(applicationEventFetchDepth));
+        std::fflush(stderr);
+        return true;
+    }
+}
 bool NativeFilePanel::postApplicationStartEvent() noexcept
 {
     @autoreleasepool
@@ -1852,11 +1900,7 @@ bool NativeFilePanel::applicationIsReadyForSettleEvent() noexcept
         const auto betweenFetches = applicationEventFetchDepth == 0
             && applicationEventFetchActiveInvocation == 0
             && ! applicationEventFetchContextRecorded;
-        const auto activeFetchContext = applicationEventFetchDepth > 0
-            && applicationEventFetchActiveInvocation != 0
-            && applicationEventFetchModeSupplied
-            && applicationEventFetchMode != nil
-            && applicationEventFetchContextRecorded
+        const auto bindableOuterFetch = currentApplicationEventFetchCanBindBarrier()
             && runLoop != nullptr
             && runLoop == CFRunLoopGetMain()
             && currentRunLoopModeMatchesApplicationEventFetch(runLoop);
@@ -1869,7 +1913,8 @@ bool NativeFilePanel::applicationIsReadyForSettleEvent() noexcept
             && ! applicationStopEventPosted
             && applicationStopEventCount == 0
             && ! applicationEventFetchReturnRequested
-            && (betweenFetches || activeFetchContext)
+            && applicationMainMenuTrackingCancelCount == 1
+            && (betweenFetches || bindableOuterFetch)
             && isRunnableApplicationEventContext();
     }
 }
@@ -2151,13 +2196,14 @@ void NativeFilePanel::logApplicationSettleReadiness() noexcept
                 - applicationEventFetchRequestReturnBase
             : 0;
         std::fprintf(stderr,
-                     "NATIVE_APP_LOOP_SETTLE_READINESS depth=%lu activeInvocation=%lu context=%d mask=0x%llx dequeue=%d mode=%d request=%d path=%s pulseState=%u pulseInitialDepth=%lu pulseTargetDepth=%lu pulseTargetInvocation=%lu pulseAttempts=%lu pulseStarts=%lu pulseStartFailures=%lu pulseStops=%lu pulsePassiveResolutions=%lu pulseSlotProbeResolutions=%lu pulseResolutions=%lu pulseTargetReturns=%lu pulseDeeperReturns=%lu pulsePeriodicReturns=%lu slotProofPending=%d ledger=%d requestInitialDepth=%lu requestMinimumDepth=%lu requestEntries=%lu requestReturns=%lu sameDepthReentries=%lu noDepthProgress=%lu claims=%lu wakeDriverStops=%lu start=%d running=%d modalWindow=%d\n",
+                     "NATIVE_APP_LOOP_SETTLE_READINESS depth=%lu activeInvocation=%lu context=%d mask=0x%llx dequeue=%d mode=%d menuTrackingCancels=%lu request=%d path=%s pulseState=%u pulseInitialDepth=%lu pulseTargetDepth=%lu pulseTargetInvocation=%lu pulseAttempts=%lu pulseStarts=%lu pulseStartFailures=%lu pulseStops=%lu pulsePassiveResolutions=%lu pulseSlotProbeResolutions=%lu pulseResolutions=%lu pulseTargetReturns=%lu pulseDeeperReturns=%lu pulsePeriodicReturns=%lu slotProofPending=%d ledger=%d requestInitialDepth=%lu requestMinimumDepth=%lu requestEntries=%lu requestReturns=%lu sameDepthReentries=%lu noDepthProgress=%lu claims=%lu wakeDriverStops=%lu start=%d running=%d modalWindow=%d\n",
                      static_cast<unsigned long>(applicationEventFetchDepth),
                      static_cast<unsigned long>(applicationEventFetchActiveInvocation),
                      applicationEventFetchContextRecorded ? 1 : 0,
                      static_cast<unsigned long long>(applicationEventFetchMask),
                      applicationEventFetchDequeues ? 1 : 0,
                      applicationEventFetchModeSupplied ? 1 : 0,
+                     static_cast<unsigned long>(applicationMainMenuTrackingCancelCount),
                      applicationEventFetchReturnRequested ? 1 : 0,
                      applicationEventFetchReturnPathName(),
                      static_cast<unsigned>(applicationEventFetchPeriodicPulseState),
@@ -2275,6 +2321,7 @@ bool NativeFilePanel::applicationStopEventWasHandled() noexcept
             && applicationStopEventDequeueInvocation > applicationSettleEventDequeueInvocation
             && applicationControlEventPostedMask
                 == allApplicationControlEventsPostedMask
+            && applicationMainMenuTrackingCancelCount == 1
             && applicationEventFetchPeriodicPulseIsInactiveAndBalanced()
             && applicationStopCallbackSucceeded
             && applicationJuceHandoffProbeStartCount == 1
@@ -2339,6 +2386,7 @@ void NativeFilePanel::finishTestApplication() noexcept
         }
         applicationControlEventNonce = 0;
         applicationControlEventPostedMask = 0;
+        applicationMainMenuTrackingCancelCount = 0;
         applicationEventFetchPeriodicPulseRetryNotBefore =
             std::chrono::steady_clock::time_point {};
         applicationEventFetchPeriodicPulseRetryDeadlineRecorded = false;

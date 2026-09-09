@@ -65,6 +65,7 @@ enum class NativeApplicationShutdownStage
 {
     idle,
     watchdogArmed,
+    menuTrackingCancelled,
     fetchReturnRequested,
     stopAccepted,
     loopReturned
@@ -80,6 +81,8 @@ const char* shutdownStageName(NativeApplicationShutdownStage stage) noexcept
     {
         case NativeApplicationShutdownStage::idle: return "idle";
         case NativeApplicationShutdownStage::watchdogArmed: return "watchdog-armed";
+        case NativeApplicationShutdownStage::menuTrackingCancelled:
+            return "menu-tracking-cancelled";
         case NativeApplicationShutdownStage::fetchReturnRequested: return "fetch-return-requested";
         case NativeApplicationShutdownStage::stopAccepted: return "stop-accepted";
         case NativeApplicationShutdownStage::loopReturned: return "loop-returned";
@@ -712,7 +715,32 @@ private:
         if (shutdownStarted) return;
         shutdownStarted = true;
         completed = true;
+        // No coordinator callback may re-enter while AppKit synchronously ends
+        // menu tracking. The independent watchdog also covers cancellation and
+        // stack unwind, not only the later BARRIER/SETTLE/STOP exchange.
+        stopTimer();
         enter(Phase::awaitApplicationStopReady, 5000.0);
+        if (! armNativeApplicationReturnWatchdog())
+        {
+            std::fputs("NATIVE_APP_LOOP_RETURN_WATCHDOG_ARM_FAILED\n", stderr);
+            std::fflush(stderr);
+            std::terminate();
+        }
+        std::fputs("NATIVE_APP_LOOP_RETURN_WATCHDOG_ARMED\n", stderr);
+        std::fflush(stderr);
+        // The test process can still be inside an AppKit-created main-menu
+        // tracking session after every product-owned modal has retired. End
+        // that public tracking session exactly once, then leave this callback;
+        // only a later timer turn may prove a depth-zero/depth-one fetch.
+        if (! NativeFilePanel::cancelApplicationMenuTrackingForShutdown())
+        {
+            std::fputs("NATIVE_APP_LOOP_MENU_TRACKING_CANCEL_REQUEST_FAILED\n", stderr);
+            std::fflush(stderr);
+            std::terminate();
+        }
+        nativeApplicationShutdownStage.store(
+            NativeApplicationShutdownStage::menuTrackingCancelled,
+            std::memory_order_release);
         std::fputs("NATIVE_APP_LOOP_STOP_READY_BEGIN\n", stderr);
         std::fflush(stderr);
         // Stable readiness is established on clean main-thread timer turns.
@@ -751,14 +779,6 @@ private:
         }
         if (++fenceTurns < 3) return;
 
-        if (! armNativeApplicationReturnWatchdog())
-        {
-            std::fputs("NATIVE_APP_LOOP_RETURN_WATCHDOG_ARM_FAILED\n", stderr);
-            std::fflush(stderr);
-            std::terminate();
-        }
-        std::fputs("NATIVE_APP_LOOP_RETURN_WATCHDOG_ARMED\n", stderr);
-        std::fflush(stderr);
         // Queue BARRIER before SETTLE exists when the current depth-one fetch is
         // eligible. Otherwise use bounded, fetch-bound periodic observations
         // until a fresh eligible depth-one fetch binds and returns BARRIER.

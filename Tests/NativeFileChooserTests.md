@@ -75,14 +75,25 @@ activation, menu dismissal, panel presentation, owner transition, panel retireme
 editor reopen and control probe.
 It never calls `CFRunLoopRunInMode`, directly invokes `sendEvent:`, or enters a nested
 JUCE dispatch loop. Because `NSApplication.stop` called from a timer does not stop the
-main loop, shutdown first requires three consecutive timer turns while `NSApplication`
-is running without an AppKit modal window. JUCE may deliver those timer messages
+main loop, the final clean case boundary first calls the public
+`NSMenu.cancelTrackingWithoutAnimation` API exactly once on the test application's
+main menu. AppKit can create a nested menu-bar tracking session while its remote view
+makes the synthetic host window key; a queued event cannot end that session. The
+coordinator immediately returns from the cancellation turn and will not accept
+shutdown readiness until a later turn observes either no active event fetch or an
+eligible outermost depth-one fetch. It then requires three consecutive timer turns
+while `NSApplication` is running without an AppKit modal window. An independent
+five-second shutdown watchdog is armed before cancellation, so a blocking cancel,
+a menu stack that does not unwind, or a later event-loop return failure stays
+fail-closed. This
+test-process-only cleanup is never linked into a plugin target and cannot cancel a
+Cubase or Reaper host menu. JUCE may deliver those timer messages
 from any common run-loop mode, so posting does not depend on AppKit's transient
 `currentMode`; all four marked control events remain the supported
 ApplicationDefined type. Their private subtype, per-run random nonce and event code
 survive any AppKit event copy and are validated before the local monitor consumes one; each
 must be dequeued exactly once through the public AppKit fetch. On that final ready turn
-the coordinator arms an independent GCD watchdog and creates one shutdown request
+the coordinator creates one shutdown request
 before SETTLE exists. The bounded 10 ms source remains active only until BARRIER is
 successfully queued.
 
@@ -196,9 +207,9 @@ non-unloadable by the sanitizer runtime, which would invalidate the oracle.
 
 START has a five-second dispatch deadline. After START, the coordinator has an absolute
 32-second isolated / 435-second sequential functional deadline. Even the maximum bounded
-failure cleanup plus the five-second readiness phase and five-second event/return watchdog
+failure cleanup plus the single five-second shutdown watchdog
 stays below CTest's 60-second / 480-second process watchdog with reserve. CTest remains the
-fallback for a callback that blocks before the independent shutdown watchdog is armed.
+fallback for a callback that blocks before shutdown begins.
 
 To reproduce one isolated case manually, also set
 `WHYKIKI_PRESET_TEST_NATIVE_CASE` to an operation (`import` or `export`) plus

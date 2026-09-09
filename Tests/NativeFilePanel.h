@@ -24,6 +24,9 @@ public:
                                        ApplicationFetchBoundCallback,
                                        void* applicationFetchBoundContext);
     [[nodiscard]] static bool applicationIsRunning() noexcept;
+    // Test-app shutdown only: dismiss any transient main-menu tracking once,
+    // then return to AppKit so a later outer fetch can prove the event boundary.
+    [[nodiscard]] static bool cancelApplicationMenuTrackingForShutdown() noexcept;
     // Private START/BARRIER/SETTLE/STOP events prove distinct dispatches through
     // the real NSApplication event loop. An eligible depth-one fetch is returned
     // with BARRIER. Other active fetch stacks may receive bounded, mode-matched,
