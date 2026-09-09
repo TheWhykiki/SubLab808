@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased
+## 1.4.0 (unreleased)
+
+- Expand the factory bank from 8 to 64 distinct, fully specified bass recipes; preserve all legacy program indices and values.
+- Add a searchable preset browser, categories, favourites and previous/next navigation.
+- Add persistent user presets with Save/Save As, rename, delete, validated import/export and conflict-safe atomic writes.
+- Preserve user preset identity, baseline and unsaved edits in DAW state; protect edited sounds during browser navigation.
+- Add persistence, invalid-file, UI and complete-bank audio tests to CI.
+- Advance both Decay and Release smoothers during sounding voices, so automation is ready before the next envelope-phase change.
+- Restart the deterministic Click sequence on prepare and successful state restore, while keeping ordinary notes and factory changes continuous and preserving the running voice.
+- Check every host-rendered sample for NaN/Inf; calibrate the validator with invalid samples and cover overlapping or rejected state restores.
+- Reject malformed, non-finite and out-of-range project-state parameters atomically; invalid direct host values use legal DSP defaults.
+- Guard asynchronous preset actions with revisioned sound tokens so same-ID restore cycles cannot authorize stale Save As, Rename, Delete, Export or Load callbacks.
+- Validate embedded user-preset selections as one complete canonical record and remove duplicate selection nodes when saving state.
+- Sign the final root VST3 without recursive overwrite and then verify the complete bundle recursively and strictly.
 
 - Corrected the maximum host-reported tail to 47 s, matching the exponential 4 s decay time constant.
 - The oscillator now stops exactly at the envelope silence threshold; worst-case output is silent by the reported tail.
@@ -24,7 +37,7 @@
 - The loaded VST3 wrapper is rendered through its reported maximum tail, not only checked for metadata.
 - The completed VST3 is re-signed after JUCE writes its module metadata, keeping the final resource seal valid.
 - Final signing defaults to ad hoc but accepts a Developer ID identity for release builds.
-- CI now fails unless the built VST3 contains exactly the intended ARM64 architecture.
+- CI now builds macOS universal (`arm64`/`x86_64`) on native Arm and Intel runners plus Windows x64 and native Windows ARM64EC VST3s; it enforces every bundle architecture and macOS 11 slice.
 - Host-test failures report invalid MIDI capability and plugin names explicitly; removed the unsafe SIGABRT handler.
 - UI snapshot validation encodes in memory instead of leaving generated files in the checkout.
 - Tune now acts live on a held note (previously only at note-on); note-on behaviour is unchanged.
