@@ -749,7 +749,9 @@ static bool beginApplicationEventFetchPeriodicPulse(bool immediateSlotProbe) noe
 
     @try
     {
-        [NSEvent startPeriodicEventsAfterDelay:0.0
+        const auto initialDelay = immediateSlotProbe
+            ? 0.0 : applicationEventFetchPeriodicPulsePeriod;
+        [NSEvent startPeriodicEventsAfterDelay:initialDelay
                                     withPeriod:applicationEventFetchPeriodicPulsePeriod];
     }
     @catch (NSException* exception)

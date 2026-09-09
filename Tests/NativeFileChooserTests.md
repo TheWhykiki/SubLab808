@@ -92,13 +92,15 @@ be blocked in nested tracking fetches, or in an outer fetch which deliberately
 excludes ApplicationDefined events. When that exact supplied mask accepts
 `NSEventTypePeriodic`, dequeue is enabled, and its supplied mode equals the current
 main-run-loop mode, the harness starts one short, fetch-bound public AppKit periodic
-stream. Ownership is recorded before the start call. A successful start is stopped
+stream after one positive-period delay, leaving already-ready AppKit work ahead of
+the wake. Ownership is recorded before the start call. A successful start is stopped
 immediately when its target fetch returns for any reason or when the first deeper
 fetch returns a Periodic event. If AppKit reports that the thread already has a
 periodic stream, the harness observes the same physical return boundary passively and
 never calls `stopPeriodicEvents` for that foreign stream. BARRIER remains forbidden
-until a later main-thread turn successfully acquires and immediately stops its own
-zero-delivery probe, proving that the thread-global Periodic slot is free. A failed
+until a later main-thread turn synchronously acquires and immediately stops its own
+zero-delay, zero-delivery probe without a run-loop yield, proving that the
+thread-global Periodic slot is free. A failed
 probe returns to passive observation. A later 10 ms turn can bind a fresh observation
 to the restored current invocation; same-depth reentry is legal and receives a new
 invocation token.
