@@ -77,6 +77,28 @@ class WindowsUpdaterContractTests(unittest.TestCase):
         self.assertNotIn("Authorization:", self.source)
         self.assertNotIn("api.github.com/repos/" + "${", self.source)
 
+    def test_msi_strings_use_documented_nonnull_sizing_and_bounded_readback(self):
+        record = self.source[self.source.index("std::string msiString("):
+                             self.source.index("std::vector<std::vector<std::string>> msiRows(")]
+        summary = self.source[self.source.index("std::string summaryString("):
+                              self.source.index("void verifyMsiDatabase(")]
+        for implementation in (record, summary):
+            self.assertIn("DWORD characters{}", implementation)
+            self.assertIn("wchar_t empty{}", implementation)
+            self.assertIn("&empty, &characters", implementation)
+            self.assertIn("characters <= 32767", implementation)
+            self.assertIn("capacity == characters", implementation)
+            self.assertNotIn("nullptr, &characters", implementation)
+        for native_regression in (
+            "MsiCreateRecord(3)", "MsiRecordSetInteger(record.get(), 2, -1)",
+            "msiString(record.get(), 3).empty()", "std::string(4096, 'A')",
+            "summary-api-regression.msi", "MsiSummaryInfoPersist(summary.get())",
+            'summaryString(database.get(), kMsiSummaryTemplate) == "Arm64;1033"',
+            "summaryString(database.get(), kMsiSummaryRevisionNumber)",
+            "summaryString(database.get(), 14)",
+        ):
+            self.assertIn(native_regression, self.source)
+
     def test_msi_and_payload_are_checked_before_elevation(self):
         implementation = self.source + "\n" + self.policy + "\n" + self.authenticode
         required = [

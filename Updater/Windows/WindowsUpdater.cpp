@@ -1606,12 +1606,17 @@ void verifyAuthenticodePackageSigner(const Path& path, std::string_view packageS
 std::string msiString(MSIHANDLE record, UINT field)
 {
     DWORD characters{};
-    const auto first = MsiRecordGetStringW(record, field, nullptr, &characters);
+    // MSI sizing differs from many Win32 APIs: NULL is explicitly unsupported.
+    // Use a real empty buffer with zero capacity, as required by msiquery.h.
+    wchar_t empty{};
+    const auto first = MsiRecordGetStringW(record, field, &empty, &characters);
     require(first == ERROR_MORE_DATA || (first == ERROR_SUCCESS && characters == 0),
-            "Cannot size MSI string field");
+            "Cannot size MSI string field (status " + std::to_string(first) + ")");
+    require(characters <= 32767, "MSI string field exceeds its fixed bound");
     std::vector<wchar_t> buffer(static_cast<std::size_t>(characters) + 1u);
     DWORD capacity = characters + 1u;
-    require(MsiRecordGetStringW(record, field, buffer.data(), &capacity) == ERROR_SUCCESS,
+    require(MsiRecordGetStringW(record, field, buffer.data(), &capacity) == ERROR_SUCCESS
+                && capacity == characters,
             "Cannot read MSI string field");
     return narrow(std::wstring_view(buffer.data(), capacity));
 }
@@ -1668,14 +1673,19 @@ std::string summaryString(MSIHANDLE database, UINT property)
     INT integer{};
     FILETIME time{};
     DWORD characters{};
+    wchar_t empty{};
     const auto first = MsiSummaryInfoGetPropertyW(summary.get(), property, &type, &integer, &time,
-                                                   nullptr, &characters);
+                                                   &empty, &characters);
     require(first == ERROR_MORE_DATA || (first == ERROR_SUCCESS && characters == 0),
-            "Cannot size MSI summary property");
+            "Cannot size MSI summary property " + std::to_string(property)
+                + " (status " + std::to_string(first) + ")");
+    require(type == VT_LPSTR && characters <= 32767,
+            "MSI summary property must be a bounded string");
     std::vector<wchar_t> buffer(static_cast<std::size_t>(characters) + 1u);
     DWORD capacity = characters + 1u;
     require(MsiSummaryInfoGetPropertyW(summary.get(), property, &type, &integer, &time,
-                                       buffer.data(), &capacity) == ERROR_SUCCESS && type == VT_LPSTR,
+                                       buffer.data(), &capacity) == ERROR_SUCCESS && type == VT_LPSTR
+                && capacity == characters,
             "Cannot read MSI summary property");
     return narrow(std::wstring_view(buffer.data(), capacity));
 }
@@ -3331,7 +3341,11 @@ int probeWindowsMsiDatabase(const wchar_t* path, const wchar_t* version)
         verifyMsiDatabase(Path(path), *parsed);
         return 0;
     }
-    catch (const std::exception&) { return 1; }
+    catch (const std::exception& error)
+    {
+        std::fprintf(stderr, "MSI policy rejection: %.512s\n", error.what());
+        return 1;
+    }
 }
 
 int runWindowsUpdaterSelfTests()
@@ -3878,6 +3892,45 @@ int runWindowsUpdaterSelfTests()
         {
             (void) deleteChild(temporaryRoot, cleanupRoot.filename().wstring());
         } };
+
+        // Exercise the actual MSI APIs, including non-empty/empty and integer
+        // record fields plus architecture and PackageCode summary strings.
+        {
+            MsiHandle record(MsiCreateRecord(3));
+            const std::wstring text(4096, L'A');
+            require(record.get() != 0
+                        && MsiRecordSetStringW(record.get(), 1, text.c_str()) == ERROR_SUCCESS
+                        && MsiRecordSetInteger(record.get(), 2, -1) == ERROR_SUCCESS,
+                    "Cannot create MSI string-read regression fixture");
+            require(msiString(record.get(), 1) == std::string(4096, 'A')
+                        && msiString(record.get(), 2) == "-1"
+                        && msiString(record.get(), 3).empty(),
+                    "MSI record string sizing/content regression");
+            const auto summaryFixture = cleanupRoot / L"summary-api-regression.msi";
+            {
+                MSIHANDLE rawDatabase{}, rawSummary{};
+                require(MsiOpenDatabaseW(summaryFixture.c_str(), MSIDBOPEN_CREATE, &rawDatabase) == ERROR_SUCCESS,
+                        "Cannot create MSI summary regression fixture");
+                MsiHandle database(rawDatabase);
+                require(MsiGetSummaryInformationW(database.get(), nullptr, 3, &rawSummary) == ERROR_SUCCESS,
+                        "Cannot create MSI summary regression metadata");
+                MsiHandle summary(rawSummary);
+                require(MsiSummaryInfoSetPropertyW(summary.get(), kMsiSummaryTemplate, VT_LPSTR,
+                            0, nullptr, L"Arm64;1033") == ERROR_SUCCESS
+                            && MsiSummaryInfoSetPropertyW(summary.get(), kMsiSummaryRevisionNumber,
+                                VT_LPSTR, 0, nullptr, L"{00112233-4455-4677-8899-AABBCCDDEEFF}") == ERROR_SUCCESS
+                            && MsiSummaryInfoSetPropertyW(summary.get(), 14, VT_I4, 500, nullptr, nullptr) == ERROR_SUCCESS
+                            && MsiSummaryInfoPersist(summary.get()) == ERROR_SUCCESS
+                            && MsiDatabaseCommit(database.get()) == ERROR_SUCCESS,
+                        "Cannot write MSI summary regression metadata");
+                require(summaryString(database.get(), kMsiSummaryTemplate) == "Arm64;1033"
+                            && summaryString(database.get(), kMsiSummaryRevisionNumber)
+                                == "{00112233-4455-4677-8899-AABBCCDDEEFF}"
+                            && expectFailure([&] { (void) summaryString(database.get(), 14); }),
+                        "MSI architecture/PackageCode summary string regression");
+            }
+            require(DeleteFileW(summaryFixture.c_str()) != 0, "Cannot remove MSI summary regression fixture");
+        }
 
         const auto gateJournalId = newOperationId();
         const auto gateJournalOperation = cleanupRoot / widen(gateJournalId);
