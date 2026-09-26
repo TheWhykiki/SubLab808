@@ -1666,8 +1666,9 @@ std::map<std::string, std::string> msiProperties(MSIHANDLE database)
 std::string summaryString(MSIHANDLE database, UINT property)
 {
     MSIHANDLE rawSummary{};
-    require(MsiGetSummaryInformationW(database, nullptr, 0, &rawSummary) == ERROR_SUCCESS,
-            "Cannot open MSI summary information");
+    const auto openStatus = MsiGetSummaryInformationW(database, nullptr, 0, &rawSummary);
+    require(openStatus == ERROR_SUCCESS,
+            "Cannot open MSI summary information (status " + std::to_string(openStatus) + ")");
     MsiHandle summary(rawSummary);
     UINT type{};
     INT integer{};
@@ -3923,6 +3924,14 @@ int runWindowsUpdaterSelfTests()
                             && MsiSummaryInfoPersist(summary.get()) == ERROR_SUCCESS
                             && MsiDatabaseCommit(database.get()) == ERROR_SUCCESS,
                         "Cannot write MSI summary regression metadata");
+            }
+            // The write-mode SummaryInformation stream must be closed before a
+            // reader opens it. Reopen the committed database exactly as production.
+            {
+                MSIHANDLE rawDatabase{};
+                require(MsiOpenDatabaseW(summaryFixture.c_str(), nullptr, &rawDatabase) == ERROR_SUCCESS,
+                        "Cannot reopen committed MSI summary regression fixture");
+                MsiHandle database(rawDatabase);
                 require(summaryString(database.get(), kMsiSummaryTemplate) == "Arm64;1033"
                             && summaryString(database.get(), kMsiSummaryRevisionNumber)
                                 == "{00112233-4455-4677-8899-AABBCCDDEEFF}"

@@ -93,11 +93,15 @@ class WindowsUpdaterContractTests(unittest.TestCase):
             "MsiCreateRecord(3)", "MsiRecordSetInteger(record.get(), 2, -1)",
             "msiString(record.get(), 3).empty()", "std::string(4096, 'A')",
             "summary-api-regression.msi", "MsiSummaryInfoPersist(summary.get())",
+            "Cannot reopen committed MSI summary regression fixture",
             'summaryString(database.get(), kMsiSummaryTemplate) == "Arm64;1033"',
             "summaryString(database.get(), kMsiSummaryRevisionNumber)",
             "summaryString(database.get(), 14)",
         ):
             self.assertIn(native_regression, self.source)
+        reopen = self.source.index("Cannot reopen committed MSI summary regression fixture")
+        self.assertLess(self.source.index("Cannot write MSI summary regression metadata"), reopen)
+        self.assertLess(reopen, self.source.index('summaryString(database.get(), kMsiSummaryTemplate) == "Arm64;1033"'))
 
     def test_msi_and_payload_are_checked_before_elevation(self):
         implementation = self.source + "\n" + self.policy + "\n" + self.authenticode

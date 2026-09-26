@@ -167,6 +167,13 @@ jobs:
           }
       - name: Configure
         run: cmake -S . -B build -G "${{ matrix.cmake_generator }}" -A ${{ matrix.cmake_platform }}
+      - name: Check native updater APIs before the full plugin build
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --target SubLab808WindowsUpdaterSelfTests --parallel
+          if ($LASTEXITCODE -ne 0) { throw "Native updater self-test build failed" }
+          ctest --test-dir build -C Release --output-on-failure --no-tests=error -R '^SubLab808WindowsUpdaterSelfTest$'
+          if ($LASTEXITCODE -ne 0) { throw "Native updater API self-test failed" }
       - name: Build
         run: cmake --build build --config Release --target SubLab808Tests SubLab808_VST3 SubLab808HostTests SubLab808PresetTests SubLab808WindowsUpdaterPolicyTests SubLab808WindowsUpdaterSelfTests SubLab808WindowsUpdaterProductionShape SubLab808WindowsUpdaterLauncherShape --parallel
       - name: Test without desktop dialogs
