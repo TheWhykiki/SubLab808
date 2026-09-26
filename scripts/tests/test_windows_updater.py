@@ -21,6 +21,10 @@ class WindowsUpdaterContractTests(unittest.TestCase):
         cls.authenticode = (UPDATER / "Authenticode.h").read_text(encoding="utf-8")
 
     def test_portable_policy_executes(self):
+        portable = (UPDATER / "ProfileEku.h").read_text(encoding="utf-8")
+        self.assertNotIn("windows.h", portable)
+        self.assertNotIn("WinVerifyTrust", portable)
+        self.assertIn('#include "ProfileEku.h"', self.authenticode)
         compiler = os.environ.get("CXX") or shutil.which("c++") or shutil.which("clang++")
         if not compiler:
             self.skipTest("No C++ compiler is available for the portable policy test")

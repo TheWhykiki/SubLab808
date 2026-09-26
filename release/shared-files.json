@@ -10,6 +10,7 @@
     "Updater/UpdateCore.swift",
     "Updater/UpdaterApp.swift",
     "Updater/Windows/Authenticode.h",
+    "Updater/Windows/ProfileEku.h",
     "Updater/Windows/UpdaterPolicy.cpp",
     "Updater/Windows/UpdaterPolicy.h",
     "Updater/Windows/WindowsUpdater.cpp",

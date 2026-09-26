@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import plistlib
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -177,7 +178,17 @@ class ReleasePipelineTests(unittest.TestCase):
         manifest = source_release.make_manifest(config, commit, files, [])
         (self.root / source_release.SBOM).write_bytes(files[source_release.SBOM][0])
         (self.root / source_release.MANIFEST).write_bytes(source_release.canonical_json(manifest))
-        shutil.rmtree(self.root / ".git")  # Test-owned temporary fixture only.
+        git_fixture = self.root / ".git"
+        def remove_readonly_fixture_file(function, path, error):
+            candidate = Path(path)
+            if (not isinstance(error[1], PermissionError) or candidate.is_symlink()
+                    or not candidate.is_file() or not candidate.is_relative_to(git_fixture)):
+                raise error[1]
+            # Git objects are read-only on Windows. Only this test-owned temporary
+            # metadata may be made writable; all unexpected cleanup failures abort.
+            candidate.chmod(candidate.stat().st_mode | stat.S_IWRITE)
+            function(path)
+        shutil.rmtree(git_fixture, onerror=remove_readonly_fixture_file)
         return manifest
 
     def test_gitless_source_archive_rebuilds_unsigned_package_with_original_provenance(self):
