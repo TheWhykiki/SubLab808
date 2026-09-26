@@ -335,6 +335,35 @@ std::string releaseByIdApiUrl(std::string_view owner,
          + std::string(repository) + "/releases/" + std::to_string(releaseId);
 }
 
+bool hasSafeMsiExecuteSequence(const std::vector<MsiSequenceRow>& rows)
+{
+    std::map<std::string, int> actions;
+    constexpr std::array required { "FindRelatedProducts", "LaunchConditions",
+        "InstallInitialize", "RemoveExistingProducts", "InstallFiles" };
+    for (const auto& row : rows)
+    {
+        const auto relevant = std::find(required.begin(), required.end(), row.action) != required.end()
+                           || row.action == "MigrateFeatureStates";
+        if (! relevant) continue;
+        int sequence{};
+        const auto [end, error] = std::from_chars(row.sequence.data(),
+            row.sequence.data() + row.sequence.size(), sequence);
+        if (! row.condition.empty() || error != std::errc{}
+            || end != row.sequence.data() + row.sequence.size() || sequence <= 0
+            || ! actions.emplace(row.action, sequence).second)
+            return false;
+    }
+    int previous{};
+    for (const auto* action : required)
+    {
+        const auto found = actions.find(action);
+        if (found == actions.end() || found->second <= previous) return false;
+        previous = found->second;
+    }
+    const auto migration = actions.find("MigrateFeatureStates");
+    return migration == actions.end() || migration->second > actions.at("FindRelatedProducts");
+}
+
 bool isForbiddenMsiSideEffectTable(std::string_view table)
 {
     constexpr std::array forbidden {

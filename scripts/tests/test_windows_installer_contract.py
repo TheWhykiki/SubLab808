@@ -15,6 +15,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
+PRODUCT = json.loads((ROOT / "release/product.json").read_text(encoding="utf-8"))["productName"]
 WIX_NAMESPACE = "http://wixtoolset.org/schemas/v4/wxs"
 UPGRADE_NAMESPACE = uuid.UUID("bd4ae2ea-c1c6-5d51-a960-55f67866e15b")
 
@@ -47,6 +48,7 @@ class WindowsInstallerContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         cls.docs = (ROOT / "WINDOWS_INSTALLER.md").read_text(encoding="utf-8")
+        cls.signing = (ROOT / "scripts/artifact-signing.ps1").read_text(encoding="utf-8")
 
     def elements(self, name: str) -> list[ET.Element]:
         return list(self.wxs.iter(f"{{{WIX_NAMESPACE}}}{name}"))
@@ -163,7 +165,7 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
         ]
         resolve_signtool = self.script[
             self.script.index("function Resolve-SignTool") :
-            self.script.index("function Resolve-SigningCertificate")
+            self.script.index("function Resolve-ArtifactSigning")
         ]
         production = self.script[
             self.script.index("if ($AllowUnsigned)") :
@@ -201,7 +203,7 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
 
     def test_product_configuration_has_stable_architecture_identities(self) -> None:
         self.assertEqual(self.config["schemaVersion"], 1)
-        self.assertEqual(self.config["productName"], ROOT.name)
+        self.assertEqual(self.config["productName"], PRODUCT)
         self.assertEqual(self.config["manufacturer"], "Whykiki Audio")
         codes = self.config["upgradeCodes"]
         self.assertEqual(set(codes), {"x64", "arm64ec"})
@@ -210,7 +212,7 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
             parsed = uuid.UUID(value)
             expected = uuid.uuid5(
                 UPGRADE_NAMESPACE,
-                f"Whykiki Audio/{ROOT.name}/Windows MSI/{architecture}/upgrade",
+                f"Whykiki Audio/{PRODUCT}/Windows MSI/{architecture}/upgrade",
             )
             self.assertEqual(parsed, expected)
         expected_classes = {
@@ -225,7 +227,7 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
         }
         self.assertEqual(
             {(item["cid"], item["category"]) for item in self.config["vst3Classes"]},
-            expected_classes[ROOT.name],
+            expected_classes[PRODUCT],
         )
 
     def test_package_is_per_machine_major_upgrade_without_custom_actions(self) -> None:
@@ -473,6 +475,24 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
         ):
             self.assertIn(token, self.script)
 
+    def test_real_msi_sequence_and_architecture_mutants_reach_native_policy(self) -> None:
+        for token in (
+            "InstallExecuteSequence = @($executeSequenceEvidence.ToArray()",
+            "Invoke-MsiDatabaseProbe $nativeProbe $msiPath $Version 0",
+            "Invoke-MsiDatabaseProbe $Probe $copy $Version 1",
+            "nativeUpdaterSequenceMutationTests",
+            "nativeUpdaterArchitectureMutationTests",
+            "Invoke-MsiArchitectureMutationTest",
+            "Signed packaging requires the native updater MSI policy probe.",
+            "installExecuteSequence = @($msiContract.InstallExecuteSequence)",
+        ):
+            self.assertIn(token, self.script)
+        source = (ROOT / "Updater/Windows/WindowsUpdater.cpp").read_text()
+        self.assertIn("verifyMsiDatabase(Path(path), *parsed)", source)
+        main = (ROOT / "Tests/WindowsUpdater/WindowsUpdaterTests.cpp").read_text()
+        self.assertIn('--validate-msi-database', main)
+        self.assertIn('WK_WINDOWS_UPDATER_TEST_MODE', main)
+
     def test_moduleinfo_identity_and_mutations_are_fail_closed(self) -> None:
         contract_start = self.script.index("function Test-ModuleInfoContract")
         mutation_end = self.script.index("function Normalize-Guid", contract_start)
@@ -509,7 +529,7 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
             "moduleInfoIdentityValidated = $true",
             "classIdentities = @($moduleInfoContract.ClassIdentities)",
             "sha256 = $moduleInfoContract.Sha256",
-            "schemaVersion = 4",
+            "schemaVersion = 5",
         ):
             self.assertIn(token, self.script)
 
@@ -653,15 +673,14 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
 
     def test_signing_is_fail_closed_and_precedes_msi_signing(self) -> None:
         for token in (
-            "Production mode requires exactly one of -CertificateThumbprint or -CertificateSubject",
+            "Resolve-ArtifactSigning $SigningDlibPath $SigningDlibSha256 $SigningMetadataPath",
             "Production mode requires -TimestampUrl",
-            "Production mode requires the exact 64-hex -ExpectedSignerSha256 compiled into the updater",
-            "ExpectedNextSignerSha256 must be empty or exactly 64 hexadecimal characters",
-            "ExpectedNextSignerSha256 must differ from the current ExpectedSignerSha256",
+            "ExpectedProfileEku must be a full Public Trust identity OID.",
+            "ExpectedNextProfileEku must be empty or a distinct full Public Trust identity OID.",
             "Production mode requires -ExpectedReleaseGatePublicKeyXY as exactly 128 uppercase hexadecimal characters",
             "ExpectedReleaseGateNextPublicKeyXY must be empty or exactly 128 uppercase hexadecimal characters",
             "ExpectedReleaseGateNextPublicKeyXY must differ from ExpectedReleaseGatePublicKeyXY",
-            "Selected signing certificate does not match the SHA-256 fingerprint compiled into the updater",
+            "Artifact Signing SDK dlib does not match the pinned SHA-256.",
             "Production packages require exactly the product updater",
             "Invoke-UpdaterBuildContract",
             "--validate-build-contract",
@@ -671,8 +690,8 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
             "--manufacturer",
             "--github-owner",
             "--github-repository",
-            "--current-signer-sha256",
-            "--next-signer-sha256",
+            "--current-profile-eku",
+            "--next-profile-eku",
             "--release-gate-public-key-xy",
             "--release-gate-next-public-key-xy",
             '"schemaVersion":3',
@@ -699,24 +718,22 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
         self.assertLess(payload_sign, wix_build)
         self.assertLess(wix_build, msi_sign)
         for token in (
-            "Resolve-SigningCertificate",
-            "Signing identity must resolve to exactly one certificate",
-            "Unexpected signer certificate after signing",
-            "TimeStamperCertificate",
+            "Resolve-ArtifactSigning",
+            "Only AzureCliCredential may sign.",
+            "Assert-ArtifactSigningIdentity $Path $ExpectedProfile",
             "signerCertificateSha256",
-            "updaterCurrentSignerSha256",
-            "updaterNextSignerSha256",
-            "payloadSignerAllowlistSha256",
+            "updaterCurrentProfileEku",
+            "updaterNextProfileEku",
+            "payloadProfileEkuAllowlist",
             "releaseGatePublicKeyXY",
             "releaseGateNextPublicKeyXY",
             "releaseGatePublicKeyAllowlistXY",
         ):
             self.assertIn(token, self.script)
         self.assertNotIn("@('/n',", self.script)
-        self.assertLess(
-            self.script.index("$signerCertificateSha256 -ceq $ExpectedSignerSha256"),
-            payload_sign,
-        )
+        self.assertNotIn("CertificateThumbprint", self.script)
+        self.assertNotIn("HasPrivateKey", self.script)
+        self.assertIn("TimeStamperCertificate", self.signing)
         self.assertLess(self.script.index("Invoke-UpdaterBuildContract (Join-Path"), payload_sign)
         contract_start = self.script.index("function Invoke-UpdaterBuildContract")
         contract_end = self.script.index("function Invoke-AdministrativeExtraction", contract_start)
@@ -757,7 +774,7 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
             "function Invoke-AdministrativeExtraction", contract_start
         )
         contract = self.script[contract_start:contract_end]
-        next_signer = contract.index('"nextSignerSha256"')
+        next_signer = contract.index('"nextProfileEku"')
         current_gate_key = contract.index('"releaseGatePublicKeyXY"')
         next_gate_key = contract.index('"releaseGateNextPublicKeyXY"')
         self.assertLess(next_signer, current_gate_key)
@@ -782,7 +799,7 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
             r"releaseGatePublicKeyAllowlistXY = if \(\$AllowUnsigned\) \{\s+@\(\)",
         )
         self.assertIn(
-            "($evidence.schemaVersion -eq 4)",
+            "($evidence.schemaVersion -eq 5 -and $evidence.releaseContractVersion -eq 2)",
             self.acceptance,
         )
 
@@ -821,8 +838,8 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
             "$script:InstallStateUnknown = -1",
             "$script:InstallStateDefault = 5",
             "WindowsInstaller.Installer",
-            "Get-AuthenticodeSignature",
-            "GetCertHashString",
+            "Assert-ArtifactSigningIdentity",
+            "MSI signer leaf does not match the recorded release evidence",
             "Get-FileHash",
             "Get-MsiIdentityContract",
             "SELECT `Property`, `Value` FROM `Property`",
@@ -833,8 +850,8 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
             "MSI UpgradeCode does not match the independently expected architecture identity",
             "ExpectedOtherArchitectureUpgradeCode",
             "ExpectedMsiArchitecture",
-            "ExpectedNextSignerSha256",
-            "payloadSignerAllowlistSha256",
+            "ExpectedNextProfileEku",
+            "payloadProfileEkuAllowlist",
             "ExpectedReleaseGatePublicKeyXY",
             "ExpectedReleaseGateNextPublicKeyXY",
             "releaseGatePublicKeyXY",
@@ -866,7 +883,7 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
         self.assertNotIn("[System.IO.Directory]::Delete", self.acceptance)
         lease = self.acceptance.index("$msiLease = [System.IO.File]::Open(")
         hash_check = self.acceptance.index("$actualMsiHash = (Get-FileHash")
-        signature_check = self.acceptance.index("Get-AuthenticodeSignature")
+        signature_check = self.acceptance.index("Assert-ArtifactSigningIdentity $resolvedMsi")
         product_code_binding = self.acceptance.index(
             "$msiIdentity = Get-MsiIdentityContract $resolvedMsi"
         )

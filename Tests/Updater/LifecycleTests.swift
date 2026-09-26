@@ -42,6 +42,7 @@ import CryptoKit
             return prepared
         }
         app.operations.installed = { _, _ in false }
+        app.operations.revalidate = { try $0.candidate.verifyDownload($0.file) }
         app.operations.usersOfPlugin = { _ in [] }
         app.operations.rejectDowngrade = { _, _ in }
         app.operations.finishUserMigration = { _, _, _ in nil }
@@ -137,6 +138,22 @@ import CryptoKit
             app.beginInstallation()
             try drain { !app.busy }
             try require(app.step == .download && app.record != nil && app.prepared == nil && app.button.title == "Paket erneut laden", "Corrupt package has no safe re-download action")
+        }
+        try test("changed signer cannot reach Installer on retry") {
+            let app = try fixture(root)
+            app.operations.revalidate = { _ in throw UpdateFailure("Foreign Installer signer") }
+            app.beginInstallation()
+            try drain { !app.busy }
+            try require(app.prepared == nil && app.resumeFailed && app.record != nil,
+                        "Changed signer did not invalidate prepared download")
+        }
+        try test("package changed during recovery journaling cannot reach Installer") {
+            let app = try fixture(root)
+            app.operations.saveRecoveryHelper = { _, _ in try Data("changed after signer check".utf8).write(to: app.prepared!.file) }
+            app.beginInstallation()
+            try drain { !app.busy }
+            try require(app.prepared == nil && app.resumeFailed && app.record != nil,
+                        "Package mutation between signature verification and launch was accepted")
         }
         try test("active DAW use prevents Installer handoff") {
             let app = try fixture(root)

@@ -115,6 +115,7 @@ final class HTTPClient: NSObject, URLSessionDataDelegate, URLSessionDownloadDele
             let size = try location.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
             try require(size > 0 && size <= limit, "Ungültige Downloadgröße")
             try FileManager.default.moveItem(at: location, to: destination)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
             finish(.success(Data()))
         } catch { finish(.failure(error)) }
     }

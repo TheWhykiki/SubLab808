@@ -179,6 +179,7 @@ def prepare(
             "vst3ZipSha256": sha256(output / archive_name),
             "pipelineManifestSha256": sha256(candidate / "release-manifest.json"),
             "sourceManifestSha256": sha256(candidate / "source-manifest.json"),
+            "vst3BinarySha256": manifest["packaged_binary_sha256"].upper(),
         }
         (output / evidence_name).write_text(
             json.dumps(evidence, sort_keys=True, indent=2) + "\n", encoding="utf-8"
@@ -236,7 +237,7 @@ def validate(
         require(evidence.get(key) == expected_value, f"macOS evidence field is invalid: {key}")
     require(evidence.get("packageSha256") == sha256(package), "macOS PKG hash mismatch")
     require(evidence.get("vst3ZipSha256") == sha256(archive), "macOS VST3 ZIP hash mismatch")
-    for key in ("sourceSha256", "pipelineManifestSha256", "sourceManifestSha256"):
+    for key in ("sourceSha256", "pipelineManifestSha256", "sourceManifestSha256", "vst3BinarySha256"):
         require(SHA256_RE.fullmatch(str(evidence.get(key, ""))) is not None,
                 f"macOS evidence hash is invalid: {key}")
     verification = evidence.get("verification")

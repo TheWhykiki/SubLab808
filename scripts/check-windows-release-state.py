@@ -136,6 +136,7 @@ def expected_release_asset_names(product: str, version: str) -> tuple[str, ...]:
         f"{product}-{version}-macOS-universal.pkg",
         f"{product}-{version}-macOS-universal-VST3.zip",
         f"{product}-{version}-macOS-universal.evidence.json",
+        f"{product}-{version}-Source.zip",
         f"{product}-{version}-SHA256SUMS.txt",
     )
 

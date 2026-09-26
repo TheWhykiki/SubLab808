@@ -14,6 +14,12 @@
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
     <Property Id="MSIDEPLOYMENTCOMPLIANT" Value="1" />
 
+    <InstallExecuteSequence>
+      <FindRelatedProducts Before="LaunchConditions" />
+    </InstallExecuteSequence>
+    <InstallUISequence>
+      <FindRelatedProducts Before="LaunchConditions" />
+    </InstallUISequence>
     <MajorUpgrade AllowDowngrades="no"
                   AllowSameVersionUpgrades="no"
                   MigrateFeatures="yes"

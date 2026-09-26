@@ -6,6 +6,43 @@ on:
   pull_request:
 
 jobs:
+  release-parity:
+    name: Shared release contract parity
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: current
+          persist-credentials: false
+      - name: Resolve coordinated peer branch to an immutable commit
+        id: peer
+        env:
+          WK_PEER_REPOSITORY: TheWhykiki/ReverseLab
+          WK_PEER_REF: ${{ github.head_ref || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git check-ref-format "refs/heads/$WK_PEER_REF"
+          resolved="$(git ls-remote --heads "https://github.com/$WK_PEER_REPOSITORY.git" "refs/heads/$WK_PEER_REF")"
+          if [ -z "$resolved" ]; then
+            WK_PEER_REF=main
+            resolved="$(git ls-remote --heads "https://github.com/$WK_PEER_REPOSITORY.git" refs/heads/main)"
+          fi
+          sha="${resolved%%$'\t'*}"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          printf 'sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+          printf 'Peer: %s at %s (%s)\n' "$WK_PEER_REPOSITORY" "$sha" "$WK_PEER_REF" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: TheWhykiki/ReverseLab
+          ref: ${{ steps.peer.outputs.sha }}
+          path: peer
+          persist-credentials: false
+      - name: Reject cross-product security and release drift
+        run: python3 -B current/scripts/release_contract.py --repo current --other peer
+
   macos-universal:
     name: macOS universal build + ${{ matrix.host_arch }} tests
     strategy:
@@ -40,6 +77,10 @@ jobs:
         run: cmake --build build --target SubLab808Tests SubLab808_VST3 SubLab808HostTests SubLab808PresetTests SubLab808WindowsUpdaterPolicyTests -j "$(sysctl -n hw.ncpu)"
       - name: Test
         run: ctest --test-dir build --output-on-failure
+      - name: Rebuild and load from complete source ZIP without Git
+        run: >-
+          python3 -B scripts/test-source-roundtrip.py
+          --juce build/_deps/juce-src --generator "Unix Makefiles"
       - name: Stress native chooser teardown on arm64
         if: matrix.host_arch == 'arm64'
         run: >-
@@ -136,6 +177,11 @@ jobs:
           $env:WHYKIKI_PRESET_TEST_SAVE_RESTORE_ONLY = "1"
           ctest --test-dir build -C Release --output-on-failure --no-tests=error -R "^SubLab808Presets$"
           if ($LASTEXITCODE -ne 0) { throw "Preset persistence subset failed" }
+      - name: Rebuild and load from complete source ZIP without Git
+        shell: pwsh
+        run: >-
+          python -B scripts/test-source-roundtrip.py --juce build/_deps/juce-src
+          --generator "${{ matrix.cmake_generator }}" --platform "${{ matrix.cmake_platform }}"
       - name: Verify Windows VST3 architecture
         shell: pwsh
         run: |
@@ -241,6 +287,7 @@ jobs:
             -Version $version `
             -OutputDirectory "build/windows-installer" `
             -HostTestPath $hostTestBinary `
+            -UpdaterTestPath "build/Release/SubLab808WindowsUpdaterSelfTests.exe" `
             -AllowUnsigned
           if ($LASTEXITCODE -ne 0) { throw "Windows MSI validation failed" }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

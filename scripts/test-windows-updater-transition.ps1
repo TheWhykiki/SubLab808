@@ -44,9 +44,9 @@ param(
     [string] $BaselineSourceCommit,
 
     [Parameter(Mandatory = $true)]
-    [string] $ExpectedSignerSha256,
+    [string] $ExpectedProfileEku,
 
-    [string] $ExpectedNextSignerSha256,
+    [string] $ExpectedNextProfileEku,
 
     [Parameter(Mandatory = $true)]
     [string] $ExpectedReleaseGatePublicKeyXY,
@@ -54,7 +54,7 @@ param(
     [string] $ExpectedReleaseGateNextPublicKeyXY,
 
     [Parameter(Mandatory = $true)]
-    [string] $ReleaseGatePrivateKeyPkcs8Base64,
+    [string] $ReleaseGateKeyVaultKeyId,
 
     [Parameter(Mandatory = $true)]
     [string] $HostTestPath,
@@ -77,6 +77,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'artifact-signing.ps1')
+. (Join-Path $PSScriptRoot 'release-gate-key.ps1')
 
 $script:InstallStateUnknown = -1
 $script:InstallStateDefault = 5
@@ -154,6 +156,7 @@ function Get-ExpectedReleaseAssetNames {
         "$Product-$Version-macOS-universal.pkg"
         "$Product-$Version-macOS-universal-VST3.zip"
         "$Product-$Version-macOS-universal.evidence.json"
+        "$Product-$Version-Source.zip"
         "$Product-$Version-SHA256SUMS.txt"
     )
 }
@@ -188,7 +191,7 @@ function Assert-ReleaseContract {
     $assets = @($Release.assets)
     $expectedNames = @(Get-ExpectedReleaseAssetNames $Version)
     Assert-Condition ($assets.Count -eq $expectedNames.Count) `
-        'Release does not contain exactly eight cross-platform assets.'
+        'Release does not contain exactly nine cross-platform assets.'
     $byName = [System.Collections.Generic.Dictionary[string, object]]::new(
         [System.StringComparer]::Ordinal)
     foreach ($asset in $assets) {
@@ -384,7 +387,7 @@ function Read-EvidenceContract {
     Assert-Condition ($raw.Length -gt 0 -and $raw.Length -le 8MB) `
         'Windows evidence has an invalid size.'
     $evidence = $raw | ConvertFrom-Json
-    Assert-Condition ($evidence.schemaVersion -eq 4) 'Unsupported Windows evidence schema.'
+    Assert-Condition ($evidence.schemaVersion -eq 5 -and $evidence.releaseContractVersion -eq 2) 'Unsupported Windows evidence schema.'
     Assert-Condition ([string]$evidence.artifactStatus -ceq 'SIGNED' -and
                       $evidence.signed -is [bool] -and $evidence.signed) `
         'Windows transition requires signed production evidence.'
@@ -408,15 +411,16 @@ function Read-EvidenceContract {
         '^[0-9A-F]{8}-[0-9A-F]{4}-[1-5][0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$') `
         'Evidence ProductCode is not canonical.'
 
-    $signer = ([string]$evidence.signerCertificateSha256).Replace(' ', '').ToUpperInvariant()
-    $updaterCurrent = ([string]$evidence.updaterCurrentSignerSha256).Replace(' ', '').ToUpperInvariant()
-    $updaterNext = ([string]$evidence.updaterNextSignerSha256).Replace(' ', '').ToUpperInvariant()
-    Assert-Condition ($signer -cmatch '^[0-9A-F]{64}$' -and $updaterCurrent -ceq $signer) `
+    $leafSha256 = [string]$evidence.signerCertificateSha256
+    $signer = [string]$evidence.signingProfileEku
+    $updaterCurrent = ([string]$evidence.updaterCurrentProfileEku).Replace(' ', '').ToUpperInvariant()
+    $updaterNext = ([string]$evidence.updaterNextProfileEku).Replace(' ', '').ToUpperInvariant()
+    Assert-Condition ($leafSha256 -cmatch '^[0-9A-F]{64}$' -and (Test-ArtifactSigningProfileEku $signer) -and $updaterCurrent -ceq $signer) `
         'Evidence current signer identity is malformed or inconsistent.'
     Assert-Condition ([string]::IsNullOrEmpty($updaterNext) -or
-                      ($updaterNext -cmatch '^[0-9A-F]{64}$' -and $updaterNext -cne $signer)) `
+                      ((Test-ArtifactSigningProfileEku $updaterNext) -and $updaterNext -cne $signer)) `
         'Evidence next signer identity is malformed or duplicates current.'
-    [string[]]$allowlist = @($evidence.payloadSignerAllowlistSha256)
+    [string[]]$allowlist = @($evidence.payloadProfileEkuAllowlist)
     $expectedAllowlist = if ([string]::IsNullOrEmpty($updaterNext)) {
         @($signer)
     } else {
@@ -552,15 +556,7 @@ function Assert-MsiIdentity {
 function Assert-AuthenticodeSigner {
     param([string] $Path, [string] $ExpectedPin, [string] $Description)
 
-    $signature = Get-AuthenticodeSignature -LiteralPath $Path
-    Assert-Condition ($signature.Status -eq [System.Management.Automation.SignatureStatus]::Valid -and
-                      $null -ne $signature.SignerCertificate) `
-        "$Description Authenticode signature is invalid: $($signature.Status)"
-    Assert-Condition ($null -ne $signature.TimeStamperCertificate) `
-        "$Description has no inspectable Authenticode timestamp."
-    $actualPin = $signature.SignerCertificate.GetCertHashString(
-        [System.Security.Cryptography.HashAlgorithmName]::SHA256).ToUpperInvariant()
-    Assert-Condition ($actualPin -ceq $ExpectedPin) "$Description signer pin mismatch."
+    [void](Assert-ArtifactSigningIdentity $Path $ExpectedPin)
 }
 
 function Get-MsiProductState {
@@ -638,100 +634,9 @@ function New-CryptographicHex {
     return [Convert]::ToHexString($bytes)
 }
 
-function Import-ReleaseGateSigningKey {
-    param(
-        [string] $PrivateKeyPkcs8Base64,
-        [string] $ExpectedPublicKeyXY
-    )
-
-    Assert-Condition (-not [string]::IsNullOrWhiteSpace($PrivateKeyPkcs8Base64) -and
-                      $PrivateKeyPkcs8Base64.Length -le 8192) `
-        'Release-gate PKCS#8 secret is missing or exceeds its fixed bound.'
-    [byte[]] $privateBytes = $null
-    $key = $null
-    try {
-        $privateBytes = [Convert]::FromBase64String($PrivateKeyPkcs8Base64)
-        Assert-Condition ($privateBytes.Length -gt 0 -and $privateBytes.Length -le 4096 -and
-                          [Convert]::ToBase64String($privateBytes) -ceq $PrivateKeyPkcs8Base64) `
-            'Release-gate PKCS#8 secret is not canonical bounded base64.'
-        $key = [System.Security.Cryptography.ECDsa]::Create()
-        [int] $bytesRead = 0
-        $key.ImportPkcs8PrivateKey($privateBytes, [ref]$bytesRead)
-        Assert-Condition ($bytesRead -eq $privateBytes.Length) `
-            'Release-gate PKCS#8 secret contains trailing data.'
-        $parameters = $key.ExportParameters($false)
-        Assert-Condition ($parameters.Q.X.Length -eq 32 -and $parameters.Q.Y.Length -eq 32) `
-            'Release-gate private key is not ECDSA P-256.'
-        $actualPublicKeyXY = [Convert]::ToHexString($parameters.Q.X) +
-            [Convert]::ToHexString($parameters.Q.Y)
-        Assert-Condition ($actualPublicKeyXY -ceq $ExpectedPublicKeyXY) `
-            'Release-gate private key does not match the configured active public key.'
-        return [pscustomobject]@{
-            Key = $key
-            PublicKeyXY = $actualPublicKeyXY
-        }
-    } catch {
-        if ($null -ne $key) { $key.Dispose() }
-        throw
-    } finally {
-        if ($null -ne $privateBytes) {
-            [Array]::Clear($privateBytes, 0, $privateBytes.Length)
-        }
-    }
-}
-
-function New-LowSReleaseGateSignature {
-    param(
-        [System.Security.Cryptography.ECDsa] $SigningKey,
-        [byte[]] $Message
-    )
-
-    [byte[]] $signature = $SigningKey.SignData(
-        $Message,
-        [System.Security.Cryptography.HashAlgorithmName]::SHA256,
-        [System.Security.Cryptography.DSASignatureFormat]::IeeeP1363FixedFieldConcatenation)
-    Assert-Condition ($signature.Length -eq 64) `
-        'Release-gate signer did not return a P-256 P1363 signature.'
-    [byte[]] $orderBytes = [Convert]::FromHexString(
-        'FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551')
-    [byte[]] $halfOrderBytes = [Convert]::FromHexString(
-        '7FFFFFFF800000007FFFFFFFFFFFFFFFDE737D56D38BCF4279DCE5617E3192A8')
-    [byte[]] $rBytes = [byte[]]::new(32)
-    [byte[]] $sBytes = [byte[]]::new(32)
-    [Array]::Copy($signature, 0, $rBytes, 0, 32)
-    [Array]::Copy($signature, 32, $sBytes, 0, 32)
-    try {
-        $order = [System.Numerics.BigInteger]::new($orderBytes, $true, $true)
-        $halfOrder = [System.Numerics.BigInteger]::new($halfOrderBytes, $true, $true)
-        $r = [System.Numerics.BigInteger]::new($rBytes, $true, $true)
-        $s = [System.Numerics.BigInteger]::new($sBytes, $true, $true)
-        Assert-Condition ($r -gt [System.Numerics.BigInteger]::Zero -and $r -lt $order -and
-                          $s -gt [System.Numerics.BigInteger]::Zero -and $s -lt $order) `
-            'Release-gate signer returned an invalid P-256 scalar.'
-        if ($s -gt $halfOrder) {
-            [byte[]] $lowS = ($order - $s).ToByteArray($true, $true)
-            try {
-                Assert-Condition ($lowS.Length -gt 0 -and $lowS.Length -le 32) `
-                    'Release-gate low-S normalization failed.'
-                [Array]::Clear($signature, 32, 32)
-                [Array]::Copy($lowS, 0, $signature, 64 - $lowS.Length, $lowS.Length)
-            } finally {
-                [Array]::Clear($lowS, 0, $lowS.Length)
-            }
-        }
-        return [Convert]::ToHexString($signature)
-    } finally {
-        [Array]::Clear($signature, 0, $signature.Length)
-        [Array]::Clear($orderBytes, 0, $orderBytes.Length)
-        [Array]::Clear($halfOrderBytes, 0, $halfOrderBytes.Length)
-        [Array]::Clear($rBytes, 0, $rBytes.Length)
-        [Array]::Clear($sBytes, 0, $sBytes.Length)
-    }
-}
-
 function New-ReleaseGateAuthorization {
     param(
-        [System.Security.Cryptography.ECDsa] $SigningKey,
+        [object] $SigningKey,
         [string] $InstalledVersion,
         [string] $Challenge,
         [string] $PipeName
@@ -876,7 +781,7 @@ function Invoke-ReleaseGateUpdater {
         $startInfo = [System.Diagnostics.ProcessStartInfo]::new($UpdaterPath)
         $startInfo.UseShellExecute = $false
         $startInfo.CreateNoWindow = $true
-        [void]$startInfo.Environment.Remove('WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64')
+        [void]$startInfo.Environment.Remove('AZURE_CLIENT_SECRET')
         $arguments = @(
             '--release-gate',
             '--challenge', $Challenge,
@@ -1038,14 +943,14 @@ Assert-Condition ($ExpectedUpgradeCode -ceq $normalizedUpgradeCode -and
 $architectureMsiContract = if ($Architecture -ceq 'x64') { 'x64' } else { 'arm64' }
 Assert-Condition ($ExpectedMsiArchitecture -ceq $architectureMsiContract) `
     'ExpectedMsiArchitecture is inconsistent with Architecture.'
-$expectedPin = $ExpectedSignerSha256.Replace(' ', '').ToUpperInvariant()
-$expectedNextPin = ([string]$ExpectedNextSignerSha256).Replace(' ', '').ToUpperInvariant()
-Assert-Condition ($expectedPin -cmatch '^[0-9A-F]{64}$') `
-    'ExpectedSignerSha256 must be canonical.'
+$expectedPin = $ExpectedProfileEku.Replace(' ', '').ToUpperInvariant()
+$expectedNextPin = ([string]$ExpectedNextProfileEku).Replace(' ', '').ToUpperInvariant()
+Assert-Condition ((Test-ArtifactSigningProfileEku $expectedPin)) `
+    'ExpectedProfileEku must be canonical.'
 Assert-Condition ([string]::IsNullOrEmpty($expectedNextPin) -or
-                  ($expectedNextPin -cmatch '^[0-9A-F]{64}$' -and
+                  ((Test-ArtifactSigningProfileEku $expectedNextPin) -and
                    $expectedNextPin -cne $expectedPin)) `
-    'ExpectedNextSignerSha256 must be empty or a distinct canonical pin.'
+    'ExpectedNextProfileEku must be empty or a distinct canonical pin.'
 $expectedReleaseGatePublicKeyXY = [string]$ExpectedReleaseGatePublicKeyXY
 $expectedReleaseGateNextPublicKeyXY = [string]$ExpectedReleaseGateNextPublicKeyXY
 Assert-Condition ($expectedReleaseGatePublicKeyXY -cmatch '^[0-9A-F]{128}$') `
@@ -1054,11 +959,7 @@ Assert-Condition ([string]::IsNullOrEmpty($expectedReleaseGateNextPublicKeyXY) -
                   ($expectedReleaseGateNextPublicKeyXY -cmatch '^[0-9A-F]{128}$' -and
                    $expectedReleaseGateNextPublicKeyXY -cne $expectedReleaseGatePublicKeyXY)) `
     'ExpectedReleaseGateNextPublicKeyXY must be empty or a distinct canonical P-256 X||Y.'
-$releaseGatePrivateKeyText = [string]$ReleaseGatePrivateKeyPkcs8Base64
-$ReleaseGatePrivateKeyPkcs8Base64 = ''
-Remove-Item Env:WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64 -ErrorAction SilentlyContinue
-Assert-Condition (-not [string]::IsNullOrWhiteSpace($releaseGatePrivateKeyText)) `
-    'ReleaseGatePrivateKeyPkcs8Base64 is required.'
+$releaseGateKey = Get-ReleaseGateSigningKey $ReleaseGateKeyVaultKeyId $expectedReleaseGatePublicKeyXY
 
 if ($Mode -ceq 'bootstrap') {
     Assert-Condition ($BaselineReleaseId -eq 0 -and
@@ -1154,10 +1055,6 @@ try {
     $cleanupAuthorized = $true
 
     if ($Mode -ceq 'bootstrap') {
-        $bootstrapSigningKeyContract = Import-ReleaseGateSigningKey $releaseGatePrivateKeyText `
-            $expectedReleaseGatePublicKeyXY
-        $bootstrapSigningKeyContract.Key.Dispose()
-        $releaseGatePrivateKeyText = ''
         $cleanArguments = @{
             MsiPath = $candidateMsi
             EvidencePath = $candidateEvidencePath
@@ -1169,13 +1066,13 @@ try {
             ExpectedManufacturer = $ExpectedManufacturer
             ExpectedUpgradeCode = $normalizedUpgradeCode
             ExpectedOtherArchitectureUpgradeCode = $normalizedOtherUpgradeCode
-            ExpectedSignerSha256 = $expectedPin
+            ExpectedProfileEku = $expectedPin
             ExpectedReleaseGatePublicKeyXY = $expectedReleaseGatePublicKeyXY
             InstallerTimeoutSeconds = $InstallerTimeoutSeconds
             HostTestTimeoutSeconds = $HostTestTimeoutSeconds
         }
         if (-not [string]::IsNullOrEmpty($expectedNextPin)) {
-            $cleanArguments['ExpectedNextSignerSha256'] = $expectedNextPin
+            $cleanArguments['ExpectedNextProfileEku'] = $expectedNextPin
         }
         if (-not [string]::IsNullOrEmpty($expectedReleaseGateNextPublicKeyXY)) {
             $cleanArguments['ExpectedReleaseGateNextPublicKeyXY'] =
@@ -1270,15 +1167,8 @@ try {
         $pipeName = "WhykikiAudio.UpdaterReleaseGate.$(New-CryptographicHex 16)"
         $operationChallenge = $challenge
         $operationPipeName = $pipeName
-        $signingKeyContract = Import-ReleaseGateSigningKey $releaseGatePrivateKeyText `
-            $expectedReleaseGatePublicKeyXY
-        try {
-            $authorization = New-ReleaseGateAuthorization $signingKeyContract.Key `
-                $BaselineVersion $challenge $pipeName
-        } finally {
-            $signingKeyContract.Key.Dispose()
-            $releaseGatePrivateKeyText = ''
-        }
+        $authorization = New-ReleaseGateAuthorization $releaseGateKey `
+            $BaselineVersion $challenge $pipeName
         $operationAuthorizationSignature = $authorization.SignatureP1363
         $installedUpdaterSha256 = (Get-FileHash -LiteralPath $installedUpdater -Algorithm SHA256).Hash
         $gateReceipt = Invoke-ReleaseGateUpdater $installedUpdater $BaselineVersion `

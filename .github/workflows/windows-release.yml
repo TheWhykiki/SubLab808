@@ -55,6 +55,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+          submodules: recursive
 
       - name: Require immutable GitHub Releases policy
         shell: bash
@@ -66,6 +67,16 @@ jobs:
           policy="$(gh api --method GET -H 'X-GitHub-Api-Version: 2026-03-10' \
             "repos/$GITHUB_REPOSITORY/immutable-releases")"
           test "$(jq -r 'if type == "object" and .enabled == true then "true" else "false" end' <<< "$policy")" = true
+          protection_dir="$(mktemp -d "$RUNNER_TEMP/whykiki-protection.XXXXXX")"
+          branch_uri="$(jq -rn --arg branch "$GITHUB_REF_NAME" '$branch | @uri')"
+          gh api "repos/$GITHUB_REPOSITORY/branches/$branch_uri/protection" > "$protection_dir/branch.json"
+          gh api "repos/$GITHUB_REPOSITORY/environments/release-signing" > "$protection_dir/signing.json"
+          gh api "repos/$GITHUB_REPOSITORY/environments/physical-daw-release" > "$protection_dir/physical.json"
+          python3 -B scripts/validate-release-protection.py \
+            --branch-protection-json "$protection_dir/branch.json" \
+            --signing-environment-json "$protection_dir/signing.json" \
+            --physical-environment-json "$protection_dir/physical.json" \
+            --owner "${GITHUB_REPOSITORY%%/*}" --actor "$GITHUB_ACTOR"
 
       - name: Resolve immutable bootstrap or exact previous Windows release
         id: release_state
@@ -104,8 +115,10 @@ jobs:
       inputs.confirm_release == true &&
       github.repository == 'TheWhykiki/SubLab808' &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    environment: release-signing
     permissions:
       contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -133,24 +146,33 @@ jobs:
             platform: ARM64EC
             build_dir: build-windows-release-arm64ec
             vst3_directory: arm64ec-win
-            sign_tool_arch: arm64
+            sign_tool_arch: x64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     env:
       PRODUCT: SubLab808
       WK_INPUT_TAG: ${{ inputs.tag }}
       WK_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-      SIGNER_SHA256: ${{ vars.WINDOWS_CODE_SIGNING_CERT_SHA256 }}
-      NEXT_SIGNER_SHA256: ${{ vars.WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256 }}
+      PROFILE_EKU: ${{ vars.WINDOWS_ARTIFACT_SIGNING_PROFILE_EKU }}
+      NEXT_PROFILE_EKU: ${{ vars.WINDOWS_NEXT_ARTIFACT_SIGNING_PROFILE_EKU }}
       RELEASE_GATE_PUBLIC_KEY_XY: ${{ vars.WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY }}
       RELEASE_GATE_NEXT_PUBLIC_KEY_XY: ${{ vars.WINDOWS_RELEASE_GATE_NEXT_PUBLIC_KEY_XY }}
-      TIMESTAMP_URL: ${{ vars.WINDOWS_RFC3161_TIMESTAMP_URL }}
+      TIMESTAMP_URL: http://timestamp.acs.microsoft.com/
+      RELEASE_GATE_KEY_VAULT_KEY_ID: ${{ vars.WINDOWS_RELEASE_GATE_KEY_VAULT_KEY_ID }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
           persist-credentials: false
+          submodules: recursive
+
+      - name: Authenticate Azure using the protected environment identity
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       - name: Verify immutable tag, runner and public release configuration
         shell: pwsh
@@ -196,16 +218,12 @@ jobs:
               $env:PROCESSOR_ARCHITECTURE -cne '${{ matrix.processor_arch }}') {
             throw 'Release build is not running on the required native Windows architecture.'
           }
-          $pin = ([string]$env:SIGNER_SHA256).Replace(' ', '').ToUpperInvariant()
-          if ($pin -cnotmatch '^[0-9A-F]{64}$') {
-            throw 'WINDOWS_CODE_SIGNING_CERT_SHA256 must be exactly 64 hexadecimal characters.'
-          }
-          $nextPin = ([string]$env:NEXT_SIGNER_SHA256).Replace(' ', '').ToUpperInvariant()
-          if ($nextPin -and $nextPin -cnotmatch '^[0-9A-F]{64}$') {
-            throw 'WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256 must be empty or exactly 64 hexadecimal characters.'
-          }
-          if ($nextPin -and $nextPin -ceq $pin) {
-            throw 'WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256 must differ from the current certificate pin.'
+          . ./scripts/artifact-signing.ps1
+          $pin = [string]$env:PROFILE_EKU
+          $nextPin = [string]$env:NEXT_PROFILE_EKU
+          if (-not (Test-ArtifactSigningProfileEku $pin) -or
+              ($nextPin -and (-not (Test-ArtifactSigningProfileEku $nextPin) -or $nextPin -ceq $pin))) {
+            throw 'Artifact Signing profile EKU policy is malformed.'
           }
           $releaseGateKey = [string]$env:RELEASE_GATE_PUBLIC_KEY_XY
           $nextReleaseGateKey = [string]$env:RELEASE_GATE_NEXT_PUBLIC_KEY_XY
@@ -217,75 +235,24 @@ jobs:
                $nextReleaseGateKey -ceq $releaseGateKey)) {
             throw 'WINDOWS_RELEASE_GATE_NEXT_PUBLIC_KEY_XY must be empty or a distinct canonical P-256 point.'
           }
-          $timestamp = $null
-          if (-not [uri]::TryCreate($env:TIMESTAMP_URL, [System.UriKind]::Absolute, [ref]$timestamp) -or
-              $timestamp.Scheme -cne 'https') {
-            throw 'WINDOWS_RFC3161_TIMESTAMP_URL must be an absolute HTTPS URL.'
+          if ($env:TIMESTAMP_URL -cne 'http://timestamp.acs.microsoft.com/') {
+            throw 'Artifact Signing requires its pinned RFC3161 endpoint.'
           }
           "WK_RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "WK_RELEASE_VERSION=$($tag.Substring(1))" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "WK_TAG_COMMIT=$tagCommit" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "WK_SIGNER_SHA256=$pin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "WK_NEXT_SIGNER_SHA256=$nextPin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WK_PROFILE_EKU=$pin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WK_NEXT_PROFILE_EKU=$nextPin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "WK_RELEASE_GATE_PUBLIC_KEY_XY=$releaseGateKey" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "WK_RELEASE_GATE_NEXT_PUBLIC_KEY_XY=$nextReleaseGateKey" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Verify active release-gate authorization key pair
+      - name: Verify non-exportable release-gate public key
         shell: pwsh
-        env:
-          WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64: ${{ secrets.WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64 }}
         run: |
-          $privateText = [string]$env:WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64
-          if ([string]::IsNullOrWhiteSpace($privateText) -or $privateText.Length -gt 8192) {
-            throw 'WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64 is missing or exceeds its fixed bound.'
-          }
-          [byte[]]$privateBytes = $null
-          [byte[]]$probe = $null
-          [byte[]]$signature = $null
-          $key = $null
-          try {
-            $privateBytes = [Convert]::FromBase64String($privateText)
-            if ($privateBytes.Length -eq 0 -or $privateBytes.Length -gt 4096 -or
-                [Convert]::ToBase64String($privateBytes) -cne $privateText) {
-              throw 'Release-gate PKCS#8 secret is not canonical bounded base64.'
-            }
-            $key = [System.Security.Cryptography.ECDsa]::Create()
-            [int]$bytesRead = 0
-            $key.ImportPkcs8PrivateKey($privateBytes, [ref]$bytesRead)
-            if ($bytesRead -ne $privateBytes.Length) {
-              throw 'Release-gate PKCS#8 secret contains trailing data.'
-            }
-            $parameters = $key.ExportParameters($false)
-            if ($parameters.Q.X.Length -ne 32 -or $parameters.Q.Y.Length -ne 32) {
-              throw 'Release-gate private key is not ECDSA P-256.'
-            }
-            $actualPublicKey = [Convert]::ToHexString($parameters.Q.X) +
-              [Convert]::ToHexString($parameters.Q.Y)
-            if ($actualPublicKey -cne $env:WK_RELEASE_GATE_PUBLIC_KEY_XY) {
-              throw 'Release-gate private key does not match the active public-key variable.'
-            }
-            $probe = [byte[]]::new(32)
-            [System.Security.Cryptography.RandomNumberGenerator]::Fill($probe)
-            $signature = $key.SignData(
-              $probe,
-              [System.Security.Cryptography.HashAlgorithmName]::SHA256,
-              [System.Security.Cryptography.DSASignatureFormat]::IeeeP1363FixedFieldConcatenation)
-            if ($signature.Length -ne 64 -or -not $key.VerifyData(
-                $probe, $signature,
-                [System.Security.Cryptography.HashAlgorithmName]::SHA256,
-                [System.Security.Cryptography.DSASignatureFormat]::IeeeP1363FixedFieldConcatenation)) {
-              throw 'Release-gate P-256 key pair failed its signing self-test.'
-            }
-          } finally {
-            if ($null -ne $signature) { [Array]::Clear($signature, 0, $signature.Length) }
-            if ($null -ne $probe) { [Array]::Clear($probe, 0, $probe.Length) }
-            if ($null -ne $privateBytes) { [Array]::Clear($privateBytes, 0, $privateBytes.Length) }
-            if ($null -ne $key) { $key.Dispose() }
-            Remove-Item Env:WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64 -ErrorAction SilentlyContinue
-            $privateText = ''
-          }
+          & ./scripts/verify-release-gate-key.ps1 -KeyId $env:RELEASE_GATE_KEY_VAULT_KEY_ID `
+            -ExpectedPublicKeyXY $env:WK_RELEASE_GATE_PUBLIC_KEY_XY
 
       - name: Prove the installed baseline authorizes the active release-gate key
         if: needs.authorize_windows_release.outputs.mode == 'upgrade'
@@ -312,7 +279,7 @@ jobs:
               $release.draft -isnot [bool] -or $release.draft -or
               $release.prerelease -isnot [bool] -or $release.prerelease -or
               $release.immutable -isnot [bool] -or -not $release.immutable -or
-              @($release.assets).Count -ne 8) {
+              @($release.assets).Count -ne 9) {
             throw 'Authorized baseline is no longer the exact immutable stable release.'
           }
           $evidenceName = "SubLab808-$env:WK_BASELINE_VERSION-Windows-${{ matrix.artifact_arch }}.evidence.json"
@@ -338,7 +305,7 @@ jobs:
             throw 'Downloaded baseline evidence differs from its immutable GitHub digest.'
           }
           $evidence = Get-Content -LiteralPath $evidencePath -Raw -Encoding utf8 | ConvertFrom-Json
-          if ($evidence.schemaVersion -ne 4 -or
+          if ($evidence.schemaVersion -ne 5 -or $evidence.releaseContractVersion -ne 2 -or
               [string]$evidence.artifactStatus -cne 'SIGNED' -or
               $evidence.signed -isnot [bool] -or -not $evidence.signed -or
               [string]$evidence.product -cne 'SubLab808' -or
@@ -370,8 +337,8 @@ jobs:
         run: |
           cmake -S . -B '${{ matrix.build_dir }}' `
             -G '${{ matrix.generator }}' -A '${{ matrix.platform }}' `
-            "-DSUBLAB808_WINDOWS_UPDATER_SIGNER_SHA256:STRING=$env:WK_SIGNER_SHA256" `
-            "-DSUBLAB808_WINDOWS_UPDATER_NEXT_SIGNER_SHA256:STRING=$env:WK_NEXT_SIGNER_SHA256" `
+            "-DSUBLAB808_WINDOWS_UPDATER_PROFILE_EKU:STRING=$env:WK_PROFILE_EKU" `
+            "-DSUBLAB808_WINDOWS_UPDATER_NEXT_PROFILE_EKU:STRING=$env:WK_NEXT_PROFILE_EKU" `
             "-DSUBLAB808_WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY:STRING=$env:WK_RELEASE_GATE_PUBLIC_KEY_XY" `
             "-DSUBLAB808_WINDOWS_RELEASE_GATE_NEXT_PUBLIC_KEY_XY:STRING=$env:WK_RELEASE_GATE_NEXT_PUBLIC_KEY_XY"
           if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed.' }
@@ -413,66 +380,15 @@ jobs:
             -R '^SubLab808Presets$'
           if ($LASTEXITCODE -ne 0) { throw 'Preset persistence release tests failed.' }
 
-      - name: Import ephemeral signing certificate and verify leaf pin
+      - name: Prepare pinned Microsoft Artifact Signing client
         shell: pwsh
         env:
-          PFX_BASE64: ${{ secrets.WINDOWS_CODE_SIGNING_PFX_BASE64 }}
-          PFX_PASSWORD: ${{ secrets.WINDOWS_CODE_SIGNING_PFX_PASSWORD }}
+          WK_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.WINDOWS_ARTIFACT_SIGNING_ENDPOINT }}
+          WK_ARTIFACT_SIGNING_ACCOUNT: ${{ vars.WINDOWS_ARTIFACT_SIGNING_ACCOUNT }}
+          WK_ARTIFACT_SIGNING_PROFILE: ${{ vars.WINDOWS_ARTIFACT_SIGNING_PROFILE }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:PFX_BASE64) -or
-              [string]::IsNullOrWhiteSpace($env:PFX_PASSWORD)) {
-            throw 'Both Windows code-signing PFX secrets are required.'
-          }
-          $nonce = [guid]::NewGuid().ToString('N')
-          $storeName = "WhykikiRelease-$nonce"
-          $pfxPath = Join-Path $env:RUNNER_TEMP "SubLab808-$nonce-signing.pfx"
-          "WK_CERT_STORE_NAME=$storeName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "WK_PFX_PATH=$pfxPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
-            $storeName,
-            [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
-          try {
-            $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-            if ($store.Certificates.Count -ne 0) { throw 'Ephemeral certificate store is not empty.' }
-          } finally {
-            $store.Dispose()
-          }
-          $bytes = [Convert]::FromBase64String($env:PFX_BASE64)
-          try {
-            [System.IO.File]::WriteAllBytes($pfxPath, $bytes)
-          } finally {
-            [Array]::Clear($bytes, 0, $bytes.Length)
-          }
-          $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-          $acl = [System.Security.AccessControl.FileSecurity]::new()
-          $acl.SetAccessRuleProtection($true, $false)
-          $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
-            $identity,
-            [System.Security.AccessControl.FileSystemRights]::FullControl,
-            [System.Security.AccessControl.AccessControlType]::Allow))
-          Set-Acl -LiteralPath $pfxPath -AclObject $acl
-          $password = ConvertTo-SecureString $env:PFX_PASSWORD -AsPlainText -Force
-          $imported = @(Import-PfxCertificate -FilePath $pfxPath `
-            -CertStoreLocation "Cert:\CurrentUser\$storeName" -Password $password)
-          $privateLeaves = @($imported | Where-Object { $_.HasPrivateKey })
-          if ($privateLeaves.Count -ne 1) { throw 'PFX must contain exactly one private-key leaf certificate.' }
-          $leaf = $privateLeaves[0]
-          $now = [DateTime]::UtcNow
-          if ($leaf.NotBefore.ToUniversalTime() -gt $now -or $leaf.NotAfter.ToUniversalTime() -lt $now) {
-            throw 'Code-signing certificate is outside its validity period.'
-          }
-          $eku = @($leaf.Extensions |
-            Where-Object { $_ -is [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] } |
-            ForEach-Object EnhancedKeyUsages | ForEach-Object Value)
-          if ($eku -cnotcontains '1.3.6.1.5.5.7.3.3') { throw 'Certificate is not valid for code signing.' }
-          $actualPin = $leaf.GetCertHashString(
-            [System.Security.Cryptography.HashAlgorithmName]::SHA256).ToUpperInvariant()
-          if ($actualPin -cne $env:WK_SIGNER_SHA256) {
-            throw 'Imported certificate leaf does not match the configured public SHA-256 pin.'
-          }
-          "WK_CERT_THUMBPRINT=$($leaf.Thumbprint.Replace(' ', '').ToUpperInvariant())" |
-            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Remove-Item Env:PFX_BASE64, Env:PFX_PASSWORD -ErrorAction SilentlyContinue
+          & ./scripts/setup-artifact-signing.ps1 -Endpoint $env:WK_ARTIFACT_SIGNING_ENDPOINT `
+            -AccountName $env:WK_ARTIFACT_SIGNING_ACCOUNT -ProfileName $env:WK_ARTIFACT_SIGNING_PROFILE
 
       - name: Sign payload, build MSI and validate candidate
         shell: pwsh
@@ -484,7 +400,7 @@ jobs:
             ForEach-Object { Join-Path $_.FullName '${{ matrix.sign_tool_arch }}/signtool.exe' } |
             Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
             Select-Object -First 1
-          if (-not $signTool) { throw 'A native Windows SDK signtool.exe was not found.' }
+          if (-not $signTool) { throw 'The x64 Windows SDK signtool.exe was not found.' }
           $bundle = (Resolve-Path -LiteralPath '${{ matrix.build_dir }}/SubLab808_artefacts/Release/VST3/SubLab808.vst3').Path
           $updater = (Resolve-Path -LiteralPath (Join-Path $bundle 'Contents/Helpers/SubLab808Updater.exe')).Path
           $hostTest = (Resolve-Path -LiteralPath '${{ matrix.build_dir }}/SubLab808HostTests_artefacts/Release/SubLab808HostTests.exe').Path
@@ -496,16 +412,18 @@ jobs:
             SourceCommit = $env:WK_TAG_COMMIT
             OutputDirectory = $output
             UpdaterPath = $updater
-            ExpectedSignerSha256 = $env:WK_SIGNER_SHA256
+            ExpectedProfileEku = $env:WK_PROFILE_EKU
             ExpectedReleaseGatePublicKeyXY = $env:WK_RELEASE_GATE_PUBLIC_KEY_XY
             HostTestPath = $hostTest
+            UpdaterTestPath = '${{ matrix.build_dir }}/Release/SubLab808WindowsUpdaterSelfTests.exe'
             SignToolPath = $signTool
-            CertificateThumbprint = $env:WK_CERT_THUMBPRINT
-            CertificateStoreName = $env:WK_CERT_STORE_NAME
+            SigningDlibPath = $env:WK_SIGNING_DLIB_PATH
+            SigningDlibSha256 = $env:WK_SIGNING_DLIB_SHA256
+            SigningMetadataPath = $env:WK_SIGNING_METADATA_PATH
             TimestampUrl = $env:TIMESTAMP_URL
           }
-          if (-not [string]::IsNullOrEmpty($env:WK_NEXT_SIGNER_SHA256)) {
-            $buildArguments['ExpectedNextSignerSha256'] = $env:WK_NEXT_SIGNER_SHA256
+          if (-not [string]::IsNullOrEmpty($env:WK_NEXT_PROFILE_EKU)) {
+            $buildArguments['ExpectedNextProfileEku'] = $env:WK_NEXT_PROFILE_EKU
           }
           if (-not [string]::IsNullOrEmpty($env:WK_RELEASE_GATE_NEXT_PUBLIC_KEY_XY)) {
             $buildArguments['ExpectedReleaseGateNextPublicKeyXY'] =
@@ -524,11 +442,11 @@ jobs:
             '--product', 'SubLab808',
             '--version', $env:WK_RELEASE_VERSION,
             '--source-commit', $env:WK_TAG_COMMIT,
-            '--expected-signer-sha256', $env:WK_SIGNER_SHA256,
+            '--expected-profile-eku', $env:WK_PROFILE_EKU,
             '--expected-release-gate-public-key-xy', $env:WK_RELEASE_GATE_PUBLIC_KEY_XY
           )
-          if (-not [string]::IsNullOrEmpty($env:WK_NEXT_SIGNER_SHA256)) {
-            $validatorArguments += @('--expected-next-signer-sha256', $env:WK_NEXT_SIGNER_SHA256)
+          if (-not [string]::IsNullOrEmpty($env:WK_NEXT_PROFILE_EKU)) {
+            $validatorArguments += @('--expected-next-profile-eku', $env:WK_NEXT_PROFILE_EKU)
           }
           if (-not [string]::IsNullOrEmpty($env:WK_RELEASE_GATE_NEXT_PUBLIC_KEY_XY)) {
             $validatorArguments += @(
@@ -558,11 +476,11 @@ jobs:
             ExpectedManufacturer = 'Whykiki Audio'
             ExpectedUpgradeCode = '${{ matrix.upgrade_code }}'
             ExpectedOtherArchitectureUpgradeCode = '${{ matrix.other_architecture_upgrade_code }}'
-            ExpectedSignerSha256 = $env:WK_SIGNER_SHA256
+            ExpectedProfileEku = $env:WK_PROFILE_EKU
             ExpectedReleaseGatePublicKeyXY = $env:WK_RELEASE_GATE_PUBLIC_KEY_XY
           }
-          if (-not [string]::IsNullOrEmpty($env:WK_NEXT_SIGNER_SHA256)) {
-            $acceptanceArguments['ExpectedNextSignerSha256'] = $env:WK_NEXT_SIGNER_SHA256
+          if (-not [string]::IsNullOrEmpty($env:WK_NEXT_PROFILE_EKU)) {
+            $acceptanceArguments['ExpectedNextProfileEku'] = $env:WK_NEXT_PROFILE_EKU
           }
           if (-not [string]::IsNullOrEmpty($env:WK_RELEASE_GATE_NEXT_PUBLIC_KEY_XY)) {
             $acceptanceArguments['ExpectedReleaseGateNextPublicKeyXY'] =
@@ -586,35 +504,14 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Remove PFX and ephemeral certificate store
+      - name: Clear Azure CLI session
         if: always()
         shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          if (-not [string]::IsNullOrWhiteSpace($env:WK_PFX_PATH) -and
-              (Test-Path -LiteralPath $env:WK_PFX_PATH -PathType Leaf)) {
-            Remove-Item -LiteralPath $env:WK_PFX_PATH -Force
-          }
-          if ($env:WK_CERT_STORE_NAME -match '^WhykikiRelease-[0-9a-f]{32}$') {
-            $store = $null
-            try {
-              $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
-                $env:WK_CERT_STORE_NAME,
-                [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
-              $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-              foreach ($certificate in @($store.Certificates)) { $store.Remove($certificate) }
-            } finally {
-              if ($null -ne $store) { $store.Dispose() }
-              Remove-Item -LiteralPath "Cert:\CurrentUser\$env:WK_CERT_STORE_NAME" -Recurse -Force `
-                -ErrorAction SilentlyContinue
-            }
-            if (Test-Path -LiteralPath "Cert:\CurrentUser\$env:WK_CERT_STORE_NAME") {
-              throw 'Ephemeral certificate store cleanup failed.'
-            }
-          }
+        run: az account clear
 
   build-macos:
     name: Build, sign and notarize macOS universal
+    environment: release-signing
     needs: authorize_windows_release
     if: >-
       needs.authorize_windows_release.result == 'success' &&
@@ -633,6 +530,8 @@ jobs:
       INSTALLER_IDENTITY: ${{ vars.MACOS_DEVELOPER_ID_INSTALLER_IDENTITY }}
       APPLICATION_SIGNER_SHA256: ${{ vars.MACOS_DEVELOPER_ID_APPLICATION_CERT_SHA256 }}
       INSTALLER_SIGNER_SHA256: ${{ vars.MACOS_DEVELOPER_ID_INSTALLER_CERT_SHA256 }}
+      NEXT_APPLICATION_SIGNER_SHA256: ${{ vars.MACOS_NEXT_DEVELOPER_ID_APPLICATION_CERT_SHA256 }}
+      NEXT_INSTALLER_SIGNER_SHA256: ${{ vars.MACOS_NEXT_DEVELOPER_ID_INSTALLER_CERT_SHA256 }}
       NOTARY_KEY_ID: ${{ vars.MACOS_NOTARY_KEY_ID }}
       NOTARY_ISSUER_ID: ${{ vars.MACOS_NOTARY_ISSUER_ID }}
     steps:
@@ -641,6 +540,7 @@ jobs:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
           persist-credentials: false
+          submodules: recursive
 
       - name: Verify immutable macOS release source and public identities
         shell: bash
@@ -775,6 +675,10 @@ jobs:
           export SUBLAB808_NOTARY_PROFILE="$notary_profile"
           export SUBLAB808_NOTARY_KEYCHAIN="$temporary_keychain"
           export SUBLAB808_BUILD_JOBS=3
+          export MACOS_DEVELOPER_ID_APPLICATION_CERT_SHA256="$WK_MAC_APP_PIN"
+          export MACOS_DEVELOPER_ID_INSTALLER_CERT_SHA256="$WK_MAC_INSTALLER_PIN"
+          export MACOS_NEXT_DEVELOPER_ID_APPLICATION_CERT_SHA256="$NEXT_APPLICATION_SIGNER_SHA256"
+          export MACOS_NEXT_DEVELOPER_ID_INSTALLER_CERT_SHA256="$NEXT_INSTALLER_SIGNER_SHA256"
           ./scripts/package-release.sh Release "$WK_RELEASE_VERSION"
           shopt -s nullglob
           candidates=(dist/"SubLab808-$WK_RELEASE_VERSION-"*)
@@ -787,19 +691,7 @@ jobs:
             --installer-signer-sha256 "$WK_MAC_INSTALLER_PIN"
           package="release-assets-macos/SubLab808-$WK_RELEASE_VERSION-macOS-universal.pkg"
           archive="release-assets-macos/SubLab808-$WK_RELEASE_VERSION-macOS-universal-VST3.zip"
-          pkg_signature="$(LC_ALL=C pkgutil --check-signature "$package" 2>&1)"
-          grep -F "$INSTALLER_IDENTITY" <<< "$pkg_signature" >/dev/null
-          grep -F 'Signed with a trusted timestamp' <<< "$pkg_signature" >/dev/null
-          package_installer_pin="$(printf '%s\n' "$pkg_signature" | awk '
-            /^[[:space:]]*1[.][[:space:]]/ { leaf = 1; next }
-            leaf && /SHA256 Fingerprint:/ { fingerprint = 1; sub(/^.*SHA256 Fingerprint:/, "") }
-            fingerprint {
-              line = $0
-              gsub(/[^0-9A-Fa-f]/, "", line)
-              value = value toupper(line)
-              if (length(value) >= 64) { print substr(value, 1, 64); exit }
-            }')"
-          test "$package_installer_pin" = "$WK_MAC_INSTALLER_PIN"
+          # The shared Swift verifier below pins the PKG leaf and both VST3 slices.
           xcrun stapler validate "$package"
           spctl --assess --type install --verbose=4 "$package"
           roundtrip="$credential_dir/zip-roundtrip"
@@ -811,12 +703,10 @@ jobs:
           grep -F "Authority=$APPLICATION_IDENTITY" <<< "$codesign_details" >/dev/null
           grep -F 'Runtime Version=' <<< "$codesign_details" >/dev/null
           grep -F 'Timestamp=' <<< "$codesign_details" >/dev/null
-          certificate_prefix="$credential_dir/artifact-signing-certificate-"
-          codesign -d --extract-certificates "$certificate_prefix" "$bundle"
-          test -f "${certificate_prefix}0"
-          artifact_app_pin="$(openssl x509 -inform DER -in "${certificate_prefix}0" \
-            -noout -fingerprint -sha256 | awk -F= '{print $2}' | tr -d ':' | tr '[:lower:]' '[:upper:]')"
-          test "$artifact_app_pin" = "$WK_MAC_APP_PIN"
+          python3 -B scripts/verify-macos-signers.py --package "$package" --bundle "$bundle" \
+            --application-cert-sha256 "$WK_MAC_APP_PIN" --installer-cert-sha256 "$WK_MAC_INSTALLER_PIN" \
+            --next-application-cert-sha256 "$NEXT_APPLICATION_SIGNER_SHA256" \
+            --next-installer-cert-sha256 "$NEXT_INSTALLER_SIGNER_SHA256"
           xcrun stapler validate "$bundle"
           spctl --assess --type execute --verbose=4 "$bundle"
           architectures="$(lipo -archs "$bundle/Contents/MacOS/SubLab808" | tr ' ' '\n' | LC_ALL=C sort | xargs)"
@@ -850,12 +740,15 @@ jobs:
       WK_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       APPLICATION_SIGNER_SHA256: ${{ vars.MACOS_DEVELOPER_ID_APPLICATION_CERT_SHA256 }}
       INSTALLER_SIGNER_SHA256: ${{ vars.MACOS_DEVELOPER_ID_INSTALLER_CERT_SHA256 }}
+      NEXT_APPLICATION_SIGNER_SHA256: ${{ vars.MACOS_NEXT_DEVELOPER_ID_APPLICATION_CERT_SHA256 }}
+      NEXT_INSTALLER_SIGNER_SHA256: ${{ vars.MACOS_NEXT_DEVELOPER_ID_INSTALLER_CERT_SHA256 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
           persist-credentials: false
+          submodules: recursive
 
       - name: Verify immutable source and build the Intel host harness
         shell: bash
@@ -906,17 +799,7 @@ jobs:
           package="release-assets-macos/SubLab808-$WK_RELEASE_VERSION-macOS-universal.pkg"
           archive="release-assets-macos/SubLab808-$WK_RELEASE_VERSION-macOS-universal-VST3.zip"
           evidence="release-assets-macos/SubLab808-$WK_RELEASE_VERSION-macOS-universal.evidence.json"
-          pkg_signature="$(LC_ALL=C pkgutil --check-signature "$package" 2>&1)"
-          package_installer_pin="$(printf '%s\n' "$pkg_signature" | awk '
-            /^[[:space:]]*1[.][[:space:]]/ { leaf = 1; next }
-            leaf && /SHA256 Fingerprint:/ { fingerprint = 1; sub(/^.*SHA256 Fingerprint:/, "") }
-            fingerprint {
-              line = $0
-              gsub(/[^0-9A-Fa-f]/, "", line)
-              value = value toupper(line)
-              if (length(value) >= 64) { print substr(value, 1, 64); exit }
-            }')"
-          test "$package_installer_pin" = "$installer_pin"
+          # The shared Swift verifier below pins the PKG leaf and both VST3 slices.
           xcrun stapler validate "$package"
           spctl --assess --type install --verbose=4 "$package"
           roundtrip=''
@@ -948,12 +831,10 @@ jobs:
               zip) signed_bundle="$zip_bundle" ;;
               package) signed_bundle="$package_bundle" ;;
             esac
-            certificate_prefix="$roundtrip/$source-artifact-signing-certificate-"
-            codesign -d --extract-certificates "$certificate_prefix" "$signed_bundle"
-            test -f "${certificate_prefix}0"
-            artifact_app_pin="$(openssl x509 -inform DER -in "${certificate_prefix}0" \
-              -noout -fingerprint -sha256 | awk -F= '{print $2}' | tr -d ':' | tr '[:lower:]' '[:upper:]')"
-            test "$artifact_app_pin" = "$app_pin"
+            python3 -B scripts/verify-macos-signers.py --package "$package" --bundle "$signed_bundle" \
+              --application-cert-sha256 "$app_pin" --installer-cert-sha256 "$installer_pin" \
+              --next-application-cert-sha256 "$NEXT_APPLICATION_SIGNER_SHA256" \
+              --next-installer-cert-sha256 "$NEXT_INSTALLER_SIGNER_SHA256"
           done
           xcrun stapler validate "$zip_bundle"
           spctl --assess --type execute --verbose=4 "$zip_bundle"
@@ -975,14 +856,48 @@ jobs:
           [[ "$candidate_digest" =~ ^[0-9a-f]{64}$ ]]
           printf 'candidate_sha256=%s\n' "$candidate_digest" >> "$GITHUB_OUTPUT"
 
+  source-release:
+    name: Build complete corresponding source archive
+    needs: authorize_windows_release
+    if: needs.authorize_windows_release.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      PRODUCT: SubLab808
+      WK_INPUT_TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+          submodules: recursive
+      - name: Assemble and verify exact tagged sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          juce_source="$RUNNER_TEMP/source-juce"
+          git clone --no-checkout https://github.com/juce-framework/JUCE.git "$juce_source"
+          git -C "$juce_source" checkout --detach 91ad83ae34a81e0833b1a2b0866f54846370ae53
+          mkdir -p "$RUNNER_TEMP/source-assets"
+          archive="$RUNNER_TEMP/source-assets/$PRODUCT-${WK_INPUT_TAG#v}-Source.zip"
+          python3 -B scripts/source-release.py create --repo . --juce "$juce_source" --output "$archive" --commit "$(git rev-parse HEAD)"
+          python3 -B scripts/source-release.py verify --archive "$archive" --commit "$(git rev-parse HEAD)"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: SubLab808-SOURCE-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/source-assets
+          if-no-files-found: error
+
   stage-release:
     name: Stage complete immutable public prerelease
-    needs: [authorize_windows_release, build-windows, build-macos, test-macos-intel-candidate]
+    needs: [authorize_windows_release, build-windows, build-macos, test-macos-intel-candidate, source-release]
     if: >-
       needs.build-windows.result == 'success' &&
       needs.authorize_windows_release.result == 'success' &&
       needs.build-macos.result == 'success' &&
       needs.test-macos-intel-candidate.result == 'success' &&
+      needs.source-release.result == 'success' &&
       inputs.confirm_release == true &&
       github.repository == 'TheWhykiki/SubLab808' &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
@@ -1002,14 +917,16 @@ jobs:
       PRODUCT: SubLab808
       WK_INPUT_TAG: ${{ inputs.tag }}
       WK_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-      SIGNER_SHA256: ${{ vars.WINDOWS_CODE_SIGNING_CERT_SHA256 }}
-      NEXT_SIGNER_SHA256: ${{ vars.WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256 }}
+      PROFILE_EKU: ${{ vars.WINDOWS_ARTIFACT_SIGNING_PROFILE_EKU }}
+      NEXT_PROFILE_EKU: ${{ vars.WINDOWS_NEXT_ARTIFACT_SIGNING_PROFILE_EKU }}
       RELEASE_GATE_PUBLIC_KEY_XY: ${{ vars.WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY }}
       RELEASE_GATE_NEXT_PUBLIC_KEY_XY: ${{ vars.WINDOWS_RELEASE_GATE_NEXT_PUBLIC_KEY_XY }}
       APPLICATION_IDENTITY: ${{ vars.MACOS_DEVELOPER_ID_APPLICATION_IDENTITY }}
       INSTALLER_IDENTITY: ${{ vars.MACOS_DEVELOPER_ID_INSTALLER_IDENTITY }}
       APPLICATION_SIGNER_SHA256: ${{ vars.MACOS_DEVELOPER_ID_APPLICATION_CERT_SHA256 }}
       INSTALLER_SIGNER_SHA256: ${{ vars.MACOS_DEVELOPER_ID_INSTALLER_CERT_SHA256 }}
+      NEXT_APPLICATION_SIGNER_SHA256: ${{ vars.MACOS_NEXT_DEVELOPER_ID_APPLICATION_CERT_SHA256 }}
+      NEXT_INSTALLER_SIGNER_SHA256: ${{ vars.MACOS_NEXT_DEVELOPER_ID_INSTALLER_CERT_SHA256 }}
       WK_INTEL_TESTED_MACOS_CANDIDATE_SHA256: ${{ needs.test-macos-intel-candidate.outputs.candidate_sha256 }}
       WK_INITIAL_RELEASE_STATE: ${{ needs.authorize_windows_release.outputs.release_state }}
       WK_INITIAL_RELEASE_STATE_SHA256: ${{ needs.authorize_windows_release.outputs.release_state_sha256 }}
@@ -1020,6 +937,7 @@ jobs:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
           persist-credentials: false
+          submodules: recursive
 
       - name: Download both signed Windows candidates
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -1033,6 +951,12 @@ jobs:
         with:
           name: SubLab808-macOS-universal-SIGNED-NOTARIZED-RELEASE-CANDIDATE-${{ github.run_id }}-${{ github.run_attempt }}
           path: release-assets/macos
+
+      - name: Download complete corresponding source archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: SubLab808-SOURCE-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-assets/source
 
       - name: Revalidate source, evidence, signatures, notarization and all hashes
         shell: bash
@@ -1052,14 +976,14 @@ jobs:
             remote_commit="$(printf '%s\n' "$remote_lines" | awk -v direct="refs/tags/$tag" '$2 == direct { print $1 }')"
           fi
           test "$remote_commit" = "$tag_commit"
-          pin="$(printf '%s' "$SIGNER_SHA256" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
-          next_pin="$(printf '%s' "$NEXT_SIGNER_SHA256" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+          pin="$PROFILE_EKU"
+          next_pin="$NEXT_PROFILE_EKU"
           release_gate_key="$RELEASE_GATE_PUBLIC_KEY_XY"
           next_release_gate_key="$RELEASE_GATE_NEXT_PUBLIC_KEY_XY"
           app_pin="$(printf '%s' "$APPLICATION_SIGNER_SHA256" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
           installer_pin="$(printf '%s' "$INSTALLER_SIGNER_SHA256" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
-          [[ "$pin" =~ ^[0-9A-F]{64}$ ]]
-          [[ -z "$next_pin" || "$next_pin" =~ ^[0-9A-F]{64}$ ]]
+          [[ "$pin" =~ ^1\.3\.6\.1\.4\.1\.311\.97\.[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ -z "$next_pin" || "$next_pin" =~ ^1\.3\.6\.1\.4\.1\.311\.97\.[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
           [[ -z "$next_pin" || "$next_pin" != "$pin" ]]
           [[ "$release_gate_key" =~ ^[0-9A-F]{128}$ ]]
           [[ -z "$next_release_gate_key" || "$next_release_gate_key" =~ ^[0-9A-F]{128}$ ]]
@@ -1069,8 +993,8 @@ jobs:
           python3 scripts/validate-windows-release-assets.py \
             --directory release-assets/windows --product SubLab808 --version "$version" \
             --source-commit "$tag_commit" \
-            --expected-signer-sha256 "$pin" \
-            --expected-next-signer-sha256 "$next_pin" \
+            --expected-profile-eku "$pin" \
+            --expected-next-profile-eku "$next_pin" \
             --expected-release-gate-public-key-xy "$release_gate_key" \
             --expected-release-gate-next-public-key-xy "$next_release_gate_key" \
             --architecture x64 --architecture arm64ec
@@ -1078,6 +1002,8 @@ jobs:
             --directory release-assets/macos --product SubLab808 --version "$version" \
             --commit "$tag_commit" --application-signer-sha256 "$app_pin" \
             --installer-signer-sha256 "$installer_pin"
+          python3 -B scripts/source-release.py verify \
+            --archive "release-assets/source/SubLab808-$version-Source.zip" --commit "$tag_commit"
           package="release-assets/macos/SubLab808-$version-macOS-universal.pkg"
           archive="release-assets/macos/SubLab808-$version-macOS-universal-VST3.zip"
           evidence="release-assets/macos/SubLab808-$version-macOS-universal.evidence.json"
@@ -1089,19 +1015,7 @@ jobs:
             done | LC_ALL=C sort | shasum -a 256 | awk '{print $1}'
           )"
           test "$actual_candidate_digest" = "$tested_candidate_digest"
-          pkg_signature="$(LC_ALL=C pkgutil --check-signature "$package" 2>&1)"
-          grep -F "$INSTALLER_IDENTITY" <<< "$pkg_signature" >/dev/null
-          grep -F 'Signed with a trusted timestamp' <<< "$pkg_signature" >/dev/null
-          package_installer_pin="$(printf '%s\n' "$pkg_signature" | awk '
-            /^[[:space:]]*1[.][[:space:]]/ { leaf = 1; next }
-            leaf && /SHA256 Fingerprint:/ { fingerprint = 1; sub(/^.*SHA256 Fingerprint:/, "") }
-            fingerprint {
-              line = $0
-              gsub(/[^0-9A-Fa-f]/, "", line)
-              value = value toupper(line)
-              if (length(value) >= 64) { print substr(value, 1, 64); exit }
-            }')"
-          test "$package_installer_pin" = "$installer_pin"
+          # The shared Swift verifier below pins the PKG leaf and both VST3 slices.
           xcrun stapler validate "$package"
           spctl --assess --type install --verbose=4 "$package"
           roundtrip=''
@@ -1122,12 +1036,10 @@ jobs:
           grep -F "Authority=$APPLICATION_IDENTITY" <<< "$codesign_details" >/dev/null
           grep -F 'Runtime Version=' <<< "$codesign_details" >/dev/null
           grep -F 'Timestamp=' <<< "$codesign_details" >/dev/null
-          certificate_prefix="$roundtrip/artifact-signing-certificate-"
-          codesign -d --extract-certificates "$certificate_prefix" "$bundle"
-          test -f "${certificate_prefix}0"
-          artifact_app_pin="$(openssl x509 -inform DER -in "${certificate_prefix}0" \
-            -noout -fingerprint -sha256 | awk -F= '{print $2}' | tr -d ':' | tr '[:lower:]' '[:upper:]')"
-          test "$artifact_app_pin" = "$app_pin"
+          python3 -B scripts/verify-macos-signers.py --package "$package" --bundle "$bundle" \
+            --application-cert-sha256 "$app_pin" --installer-cert-sha256 "$installer_pin" \
+            --next-application-cert-sha256 "$NEXT_APPLICATION_SIGNER_SHA256" \
+            --next-installer-cert-sha256 "$NEXT_INSTALLER_SIGNER_SHA256"
           xcrun stapler validate "$bundle"
           spctl --assess --type execute --verbose=4 "$bundle"
           architectures="$(lipo -archs "$bundle/Contents/MacOS/SubLab808" | tr ' ' '\n' | LC_ALL=C sort | xargs)"
@@ -1141,6 +1053,7 @@ jobs:
             "release-assets/macos/SubLab808-$version-macOS-universal.pkg"
             "release-assets/macos/SubLab808-$version-macOS-universal-VST3.zip"
             "release-assets/macos/SubLab808-$version-macOS-universal.evidence.json"
+            "release-assets/source/SubLab808-$version-Source.zip"
           )
           : > "release-assets/$checksum"
           for asset in "${checksum_assets[@]}"; do
@@ -1158,6 +1071,16 @@ jobs:
           policy="$(gh api --method GET -H 'X-GitHub-Api-Version: 2026-03-10' \
             "repos/$GITHUB_REPOSITORY/immutable-releases")"
           test "$(jq -r 'if type == "object" and .enabled == true then "true" else "false" end' <<< "$policy")" = true
+          protection_dir="$(mktemp -d "$RUNNER_TEMP/whykiki-protection.XXXXXX")"
+          branch_uri="$(jq -rn --arg branch "$GITHUB_REF_NAME" '$branch | @uri')"
+          gh api "repos/$GITHUB_REPOSITORY/branches/$branch_uri/protection" > "$protection_dir/branch.json"
+          gh api "repos/$GITHUB_REPOSITORY/environments/release-signing" > "$protection_dir/signing.json"
+          gh api "repos/$GITHUB_REPOSITORY/environments/physical-daw-release" > "$protection_dir/physical.json"
+          python3 -B scripts/validate-release-protection.py \
+            --branch-protection-json "$protection_dir/branch.json" \
+            --signing-environment-json "$protection_dir/signing.json" \
+            --physical-environment-json "$protection_dir/physical.json" \
+            --owner "${GITHUB_REPOSITORY%%/*}" --actor "$GITHUB_ACTOR"
 
       - name: Create a complete draft and expose that exact ID as an immutable prerelease
         id: stage_release
@@ -1269,6 +1192,7 @@ jobs:
             "release-assets/macos/SubLab808-$version-macOS-universal.pkg"
             "release-assets/macos/SubLab808-$version-macOS-universal-VST3.zip"
             "release-assets/macos/SubLab808-$version-macOS-universal.evidence.json"
+            "release-assets/source/SubLab808-$version-Source.zip"
             "release-assets/SubLab808-$version-SHA256SUMS.txt"
           )
 
@@ -1449,7 +1373,7 @@ jobs:
           test "$public_verified" = true
           staged_verified=true
           printf 'staged_verified=true\n' >> "$GITHUB_OUTPUT"
-          printf 'Immutable prerelease ID %s is public with eight verified assets; Latest is unchanged.\n\nPhysical receipt binding: runId=%s runAttempt=%s releaseId=%s tag=%s commit=%s assetManifestSha256=%s\n\nInstallable artifact digests:\n' \
+          printf 'Immutable prerelease ID %s is public with nine verified assets; Latest is unchanged.\n\nPhysical receipt binding: runId=%s runAttempt=%s releaseId=%s tag=%s commit=%s assetManifestSha256=%s\n\nInstallable artifact digests:\n' \
             "$created_release_id" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
             "$created_release_id" "$tag" "$tag_commit" "$asset_manifest_sha256" \
             >> "$GITHUB_STEP_SUMMARY"
@@ -1467,8 +1391,10 @@ jobs:
       inputs.confirm_release == true &&
       github.repository == 'TheWhykiki/SubLab808' &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    environment: release-signing
     permissions:
       contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -1499,8 +1425,8 @@ jobs:
       WK_BASELINE_COMMIT: ${{ needs.authorize_windows_release.outputs.baseline_commit }}
       WK_CANDIDATE_RELEASE_ID: ${{ needs.stage-release.outputs.release_id }}
       WK_CANDIDATE_COMMIT: ${{ needs.stage-release.outputs.candidate_commit }}
-      SIGNER_SHA256: ${{ vars.WINDOWS_CODE_SIGNING_CERT_SHA256 }}
-      NEXT_SIGNER_SHA256: ${{ vars.WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256 }}
+      PROFILE_EKU: ${{ vars.WINDOWS_ARTIFACT_SIGNING_PROFILE_EKU }}
+      NEXT_PROFILE_EKU: ${{ vars.WINDOWS_NEXT_ARTIFACT_SIGNING_PROFILE_EKU }}
       RELEASE_GATE_PUBLIC_KEY_XY: ${{ vars.WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY }}
       RELEASE_GATE_NEXT_PUBLIC_KEY_XY: ${{ vars.WINDOWS_RELEASE_GATE_NEXT_PUBLIC_KEY_XY }}
     steps:
@@ -1509,6 +1435,7 @@ jobs:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
           persist-credentials: false
+          submodules: recursive
 
       - name: Materialize trusted transition gates from the dispatch commit
         shell: pwsh
@@ -1522,6 +1449,11 @@ jobs:
           & git show "${env:GITHUB_SHA}:scripts/test-windows-installer.ps1" |
             Set-Content -LiteralPath (Join-Path $trusted 'test-windows-installer.ps1') -Encoding utf8
           if ($LASTEXITCODE -ne 0) { throw 'Cannot materialize the trusted clean-install gate.' }
+          foreach ($helper in @('artifact-signing.ps1', 'verify-release-gate-key.ps1', 'release-gate-key.ps1')) {
+            & git show "${env:GITHUB_SHA}:scripts/$helper" |
+              Set-Content -LiteralPath (Join-Path $trusted $helper) -Encoding utf8
+            if ($LASTEXITCODE -ne 0) { throw "Cannot materialize trusted dependency: $helper" }
+          }
           "WK_TRUSTED_TRANSITION_GATE=$(Join-Path $trusted 'test-windows-updater-transition.ps1')" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "WK_TRUSTED_CLEAN_INSTALL_GATE=$(Join-Path $trusted 'test-windows-installer.ps1')" |
@@ -1533,20 +1465,28 @@ jobs:
           name: SubLab808-Windows-${{ matrix.artifact_arch }}-TRANSITION-HARNESS-${{ github.run_id }}-${{ github.run_attempt }}
           path: transition-harness
 
+      - name: Authenticate transition gate with Azure OIDC
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
       - name: Exercise public immutable release through the installed updater
         shell: pwsh
         env:
-          WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64: ${{ secrets.WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64 }}
+          RELEASE_GATE_KEY_VAULT_KEY_ID: ${{ vars.WINDOWS_RELEASE_GATE_KEY_VAULT_KEY_ID }}
         run: |
           if ('${{ runner.arch }}' -cne '${{ matrix.runner_arch }}' -or
               $env:PROCESSOR_ARCHITECTURE -cne '${{ matrix.processor_arch }}') {
             throw 'Transition acceptance is not running on the required native architecture.'
           }
-          $pin = ([string]$env:SIGNER_SHA256).Replace(' ', '').ToUpperInvariant()
-          $nextPin = ([string]$env:NEXT_SIGNER_SHA256).Replace(' ', '').ToUpperInvariant()
-          if ($pin -cnotmatch '^[0-9A-F]{64}$' -or
-              ($nextPin -and $nextPin -cnotmatch '^[0-9A-F]{64}$')) {
-            throw 'Windows signer pins are malformed.'
+          . ./scripts/artifact-signing.ps1
+          $pin = [string]$env:PROFILE_EKU
+          $nextPin = [string]$env:NEXT_PROFILE_EKU
+          if (-not (Test-ArtifactSigningProfileEku $pin) -or
+              ($nextPin -and (-not (Test-ArtifactSigningProfileEku $nextPin) -or $nextPin -ceq $pin))) {
+            throw 'Artifact Signing profile EKUs are malformed.'
           }
           $releaseGateKey = [string]$env:RELEASE_GATE_PUBLIC_KEY_XY
           $nextReleaseGateKey = [string]$env:RELEASE_GATE_NEXT_PUBLIC_KEY_XY
@@ -1556,10 +1496,8 @@ jobs:
                 $nextReleaseGateKey -ceq $releaseGateKey))) {
             throw 'Windows release-gate public-key variables are malformed.'
           }
-          $releaseGatePrivateKey = [string]$env:WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64
-          if ([string]::IsNullOrWhiteSpace($releaseGatePrivateKey)) {
-            throw 'Windows release-gate private-key secret is missing.'
-          }
+          & ./scripts/verify-release-gate-key.ps1 -KeyId $env:RELEASE_GATE_KEY_VAULT_KEY_ID `
+            -ExpectedPublicKeyXY $releaseGateKey
           [long]$baselineReleaseId = 0
           if (-not [string]::IsNullOrWhiteSpace($env:WK_BASELINE_RELEASE_ID)) {
             $baselineReleaseId = [long]$env:WK_BASELINE_RELEASE_ID
@@ -1579,11 +1517,11 @@ jobs:
             BaselineTag = $env:WK_BASELINE_TAG
             BaselineVersion = $env:WK_BASELINE_VERSION
             BaselineSourceCommit = $env:WK_BASELINE_COMMIT
-            ExpectedSignerSha256 = $pin
-            ExpectedNextSignerSha256 = $nextPin
+            ExpectedProfileEku = $pin
+            ExpectedNextProfileEku = $nextPin
             ExpectedReleaseGatePublicKeyXY = $releaseGateKey
             ExpectedReleaseGateNextPublicKeyXY = $nextReleaseGateKey
-            ReleaseGatePrivateKeyPkcs8Base64 = $releaseGatePrivateKey
+            ReleaseGateKeyVaultKeyId = $env:RELEASE_GATE_KEY_VAULT_KEY_ID
             HostTestPath = (Resolve-Path -LiteralPath 'transition-harness/SubLab808HostTests.exe').Path
             CleanInstallGatePath = $env:WK_TRUSTED_CLEAN_INSTALL_GATE
             ReceiptPath = (Join-Path $env:RUNNER_TEMP 'windows-transition-receipt.json')
@@ -1598,6 +1536,11 @@ jobs:
           path: ${{ runner.temp }}/windows-transition-receipt.json
           if-no-files-found: error
           retention-days: 30
+
+      - name: Clear transition Azure CLI session
+        if: always()
+        shell: pwsh
+        run: az account clear
 
   physical-daw-acceptance:
     name: Physical Cubase/Reaper receipt for immutable release ${{ needs.stage-release.outputs.release_id }}
@@ -1636,6 +1579,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+          submodules: recursive
 
       - name: Validate protected-environment review and exact physical DAW receipt
         id: physical_receipt
@@ -1691,6 +1635,15 @@ jobs:
           gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
             "repos/$GITHUB_REPOSITORY/releases/$WK_CANDIDATE_RELEASE_ID" \
             > "$gate_directory/release.json"
+          mkdir "$gate_directory/evidence"
+          for platform in Windows-x64 Windows-arm64ec macOS-universal; do
+            name="$PRODUCT-${WK_INPUT_TAG#v}-$platform.evidence.json"
+            asset_id="$(jq -er --arg name "$name" \
+              '[.assets[] | select(.name == $name)] | select(length == 1) | .[0].id | select(type == "number" and . > 0 and floor == .)' \
+              "$gate_directory/release.json")"
+            gh api -H 'Accept: application/octet-stream' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$gate_directory/evidence/$name"
+          done
           receipt_path="$RUNNER_TEMP/physical-daw-release-receipt.json"
           receipt_sha256="$(python3 -B scripts/validate-physical-daw-release-receipt.py \
             --environment-json "$gate_directory/environment.json" \
@@ -1700,6 +1653,7 @@ jobs:
             --candidate-compare-json "$gate_directory/candidate-compare.json" \
             --workflow-compare-json "$gate_directory/workflow-compare.json" \
             --release-json "$gate_directory/release.json" \
+            --evidence-directory "$gate_directory/evidence" \
             --repository "$GITHUB_REPOSITORY" --product "$PRODUCT" \
             --environment "$WK_PHYSICAL_ENVIRONMENT" \
             --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
@@ -1733,7 +1687,7 @@ jobs:
           retention-days: 90
 
   finalize-release:
-    name: Promote automatically and physically accepted immutable prerelease or leave it quarantined
+    name: Promote owner-approved and physically accepted immutable prerelease or quarantine
     needs: [authorize_windows_release, stage-release, accept-windows-upgrade, physical-daw-acceptance]
     if: >-
       always() &&
@@ -1771,6 +1725,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+          submodules: recursive
 
       - name: Require immutable GitHub Releases policy before finalization
         shell: bash
@@ -1782,6 +1737,16 @@ jobs:
           policy="$(gh api --method GET -H 'X-GitHub-Api-Version: 2026-03-10' \
             "repos/$GITHUB_REPOSITORY/immutable-releases")"
           test "$(jq -r 'if type == "object" and .enabled == true then "true" else "false" end' <<< "$policy")" = true
+          protection_dir="$(mktemp -d "$RUNNER_TEMP/whykiki-protection.XXXXXX")"
+          branch_uri="$(jq -rn --arg branch "$GITHUB_REF_NAME" '$branch | @uri')"
+          gh api "repos/$GITHUB_REPOSITORY/branches/$branch_uri/protection" > "$protection_dir/branch.json"
+          gh api "repos/$GITHUB_REPOSITORY/environments/release-signing" > "$protection_dir/signing.json"
+          gh api "repos/$GITHUB_REPOSITORY/environments/physical-daw-release" > "$protection_dir/physical.json"
+          python3 -B scripts/validate-release-protection.py \
+            --branch-protection-json "$protection_dir/branch.json" \
+            --signing-environment-json "$protection_dir/signing.json" \
+            --physical-environment-json "$protection_dir/physical.json" \
+            --owner "${GITHUB_REPOSITORY%%/*}" --actor "$GITHUB_ACTOR"
 
       - name: Audit exact staged ID and promote only after both native gates
         shell: bash
@@ -1855,7 +1820,7 @@ jobs:
               type == "object" and .id == $id and .tag_name == $tag and
               .target_commitish == $commit and (.body // "" | contains($marker)) and
               .draft == false and .prerelease == true and .immutable == true and
-              (.assets | length == 8)
+              (.assets | length == 9)
           ' "$candidate_metadata" >/dev/null || fail_unknown 'candidate identity or immutable prerelease state changed'
           manifest="$(jq -c '[.assets[] | {digest,id,name,size,state}] | sort_by(.name,.id)' "$candidate_metadata")" || \
             fail_unknown 'candidate asset manifest is malformed'
@@ -1917,7 +1882,7 @@ jobs:
             --argjson attempt "$GITHUB_RUN_ATTEMPT" --argjson release "$release_id" '
               type == "object" and
               (keys == ["branchProtection", "environment", "environmentId", "receipt", "review", "schemaVersion"]) and
-              .schemaVersion == 1 and .environment == $environment and
+              .schemaVersion == 2 and .environment == $environment and
               (.environmentId | type == "number" and . > 0 and floor == .) and
               (.branchProtection | type == "object" and
                 (keys == ["candidateAncestor", "name", "observedCommit", "protected", "workflowAncestor"]) and
@@ -1974,8 +1939,19 @@ jobs:
           verify_current_ancestor "$WK_CANDIDATE_COMMIT" 'candidate commit'
           verify_current_ancestor "$GITHUB_SHA" 'workflow commit'
 
+          owner_comments="$(mktemp "$RUNNER_TEMP/whykiki-owner-approval.XXXXXX")"
+          owner_repository="$(mktemp "$RUNNER_TEMP/whykiki-owner-repository.XXXXXX")"
+          printf '%s' "$current_repository" > "$owner_repository"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/commits/$WK_CANDIDATE_COMMIT/comments?per_page=100" \
+            > "$owner_comments" || quarantine 'owner approval cannot be read'
+          python3 -B scripts/validate-owner-promotion.py \
+            --comments "$owner_comments" --repository-json "$owner_repository" \
+            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --release-id "$release_id" --tag "$tag" --commit "$WK_CANDIDATE_COMMIT" \
+            --asset-manifest-sha256 "$WK_ASSET_MANIFEST_SHA256" || quarantine 'explicit owner promotion approval is missing or invalid'
+
           promotion_attempted=true
-          stable_body="$(printf '%s\n\n%s\n\n<!-- whykiki-physical-daw-receipt-v1:%s -->\n<!-- %s -->' \
+          stable_body="$(printf '%s\n\n%s\n\n<!-- whykiki-physical-daw-receipt-v2:%s -->\n<!-- %s -->' \
             'Signed Windows x64 and native ARM64EC installers plus the signed, notarized universal macOS VST3 package and archive. Both native Windows transition gates and the protected physical Cubase/Reaper gate passed.' \
             "Physical DAW receipt: reviewer @$WK_PHYSICAL_REVIEWER (GitHub user ID $WK_PHYSICAL_REVIEWER_ID), workflow run $GITHUB_RUN_ID attempt $GITHUB_RUN_ATTEMPT, SHA-256 $WK_PHYSICAL_RECEIPT_SHA256." \
             "$WK_PHYSICAL_RECEIPT_BASE64" "$marker")"
@@ -2001,7 +1977,7 @@ jobs:
                    .target_commitish == $commit and (.body // "" | contains($marker)) and
                    .name == $name and .body == $body and
                    .draft == false and .prerelease == false and .immutable == true and
-                   (.assets | length == 8)
+                   (.assets | length == 9)
                  ' "$candidate_metadata" >/dev/null && \
                [[ "$(printf '%s' "$(jq -c '[.assets[] | {digest,id,name,size,state}] | sort_by(.name,.id)' "$candidate_metadata")" | sha256sum | awk '{print $1}')" == "$WK_ASSET_MANIFEST_SHA256" ]] && \
                [[ "$(read_latest_state)" == "$release_id"$'\t'"$tag" ]]; then
@@ -2017,7 +1993,7 @@ jobs:
                  --arg commit "$WK_CANDIDATE_COMMIT" --arg marker "$marker" '
                    .id == $id and .tag_name == $tag and .target_commitish == $commit and
                    (.body // "" | contains($marker)) and .draft == false and
-                   .prerelease == true and .immutable == true and (.assets | length == 8)
+                   .prerelease == true and .immutable == true and (.assets | length == 9)
                  ' "$candidate_metadata" >/dev/null && \
                [[ "$(printf '%s' "$(jq -c '[.assets[] | {digest,id,name,size,state}] | sort_by(.name,.id)' "$candidate_metadata")" | sha256sum | awk '{print $1}')" == "$WK_ASSET_MANIFEST_SHA256" ]] && \
                [[ "$(read_latest_state)" == "$expected_latest_state" ]]; then

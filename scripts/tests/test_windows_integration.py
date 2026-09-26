@@ -10,6 +10,7 @@ import xml.etree.ElementTree as ET
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+PRODUCT = json.loads((ROOT / "release/product.json").read_text(encoding="utf-8"))["productName"]
 
 
 class WindowsIntegrationContractTests(unittest.TestCase):
@@ -30,7 +31,7 @@ class WindowsIntegrationContractTests(unittest.TestCase):
             ROOT / "Updater" / "Windows" / "UpdaterVersion.rc.in"
         ).read_text(encoding="utf-8")
         cls.manifest = ET.parse(ROOT / "Updater" / "Windows" / "Updater.manifest").getroot()
-        workflow_name = "build.yml" if ROOT.name == "SubLab808" else "ci.yml"
+        workflow_name = "build.yml" if PRODUCT == "SubLab808" else "ci.yml"
         cls.workflow = (ROOT / ".github" / "workflows" / workflow_name).read_text(encoding="utf-8")
         cls.config = json.loads(
             (ROOT / "Installer" / "Windows" / "package-config.json").read_text(encoding="utf-8")
@@ -58,12 +59,12 @@ class WindowsIntegrationContractTests(unittest.TestCase):
         for token in (
             'file(READ "${CMAKE_CURRENT_SOURCE_DIR}/Installer/Windows/package-config.json"',
             'WK_WINDOWS_UPDATER_GITHUB_OWNER="TheWhykiki"',
-            'WK_WINDOWS_UPDATER_SIGNER_SHA256="${updater_signer}"',
-            'WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256="${updater_next_signer}"',
+            'WK_WINDOWS_UPDATER_PROFILE_EKU="${updater_signer}"',
+            'WK_WINDOWS_UPDATER_NEXT_PROFILE_EKU="${updater_next_signer}"',
             'if(updater_signer STREQUAL "")',
-            'next_signer_variable "${product_upper}_WINDOWS_UPDATER_NEXT_SIGNER_SHA256"',
-            'must differ from ${signer_variable}',
-            'must be exactly 64 hexadecimal characters',
+            'next_signer_variable "${product_upper}_WINDOWS_UPDATER_NEXT_PROFILE_EKU"',
+            'must be a distinct Artifact Signing profile EKU',
+            'must be an Artifact Signing profile EKU',
             'WK_UPDATER_ENABLED=1',
             'Contents/Helpers/${product}Updater.exe',
         ):
@@ -73,7 +74,7 @@ class WindowsIntegrationContractTests(unittest.TestCase):
         enable = self.cmake.index("WK_UPDATER_ENABLED=1", production)
         self.assertLess(disabled, production)
         self.assertLess(production, enable)
-        self.assertEqual(self.config["productName"], ROOT.name)
+        self.assertEqual(self.config["productName"], PRODUCT)
         self.assertEqual(set(self.config["upgradeCodes"]), {"x64", "arm64ec"})
 
     def test_ci_compiles_both_safe_and_production_shapes(self) -> None:
@@ -92,7 +93,7 @@ class WindowsIntegrationContractTests(unittest.TestCase):
         self.assertIn("UNSIGNED-NOT-FOR-DISTRIBUTION", self.workflow)
         self.assertIn("build-windows-installer.ps1", self.workflow)
         self.assertIn("-AllowUnsigned", self.workflow)
-        self.assertNotIn("-ExpectedSignerSha256", self.workflow)
+        self.assertNotIn("-ExpectedProfileEku", self.workflow)
         self.assertNotIn("UpdaterLauncherLinkShape-UNSIGNED", self.workflow)
 
         launcher_shape_start = self.cmake.index(
@@ -114,10 +115,10 @@ class WindowsIntegrationContractTests(unittest.TestCase):
         selftest_start = self.cmake.index("add_executable(${product}WindowsUpdaterSelfTests")
         selftest_end = self.cmake.index("add_test(NAME ${product}WindowsUpdaterSelfTest", selftest_start)
         self.assertIn("Updater/Windows/Updater.manifest", self.cmake[selftest_start:selftest_end])
-        self.assertIn("WK_WINDOWS_UPDATER_SIGNER_SHA256", self.cmake[selftest_start:selftest_end])
-        self.assertIn("WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256", self.cmake[selftest_start:selftest_end])
+        self.assertIn("WK_WINDOWS_UPDATER_PROFILE_EKU", self.cmake[selftest_start:selftest_end])
+        self.assertIn("WK_WINDOWS_UPDATER_NEXT_PROFILE_EKU", self.cmake[selftest_start:selftest_end])
         launcher_shape = self.cmake[launcher_shape_start:launcher_shape_end]
-        self.assertNotIn("WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256", launcher_shape)
+        self.assertNotIn("WK_WINDOWS_UPDATER_NEXT_PROFILE_EKU", launcher_shape)
 
     def test_distributed_updater_has_exact_windows_version_resource(self) -> None:
         for token in (
@@ -148,13 +149,7 @@ class WindowsIntegrationContractTests(unittest.TestCase):
             'L"Contents" / L"Helpers"',
             "std::wstring(product.toWideCharPointer())",
             "CreateProcessW(finalHelper.c_str(), nullptr",
-            "WinVerifyTrust",
-            "WTD_REVOKE_NONE",
-            "WTD_CACHE_ONLY_URL_RETRIEVAL",
-            "WTD_DISABLE_MD2_MD4",
-            "WTD_STATEACTION_CLOSE",
-            "status != ERROR_SUCCESS",
-            "CERT_SHA256_HASH_PROP_ID",
+            "wk::authenticode::verify(helper, expectedSigner, {}, false)",
             "FILE_FLAG_OPEN_REPARSE_POINT",
             "GetFinalPathNameByHandleW",
             "INVALID_HANDLE_VALUE",
@@ -167,17 +162,14 @@ class WindowsIntegrationContractTests(unittest.TestCase):
         self.assertNotIn("WTD_REVOCATION_CHECK_NONE", self.launcher)
         self.assertNotIn("WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT", self.launcher)
         self.assertNotIn("WTD_SAFER_FLAG", self.launcher)
-        local_trust = self.launcher.index("WTD_REVOKE_NONE")
-        signer_pin = self.launcher.index("CERT_SHA256_HASH_PROP_ID")
+        trust = self.launcher.index("wk::authenticode::verify(helper, expectedSigner, {}, false)")
         process_start = self.launcher.index("CreateProcessW(finalHelper.c_str(), nullptr")
-        self.assertLess(local_trust, signer_pin)
-        self.assertLess(signer_pin, process_start)
-        for token in (
-            "trust.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN",
-            "WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT | WTD_SAFER_FLAG",
-        ):
-            self.assertIn(token, self.updater)
-        self.assertNotIn("WTD_CACHE_ONLY_URL_RETRIEVAL", self.updater)
+        self.assertLess(trust, process_start)
+        policy = (ROOT / "Updater/Windows/Authenticode.h").read_text(encoding="utf-8")
+        for token in ("WinVerifyTrust", "WTD_CACHE_ONLY_URL_RETRIEVAL", "WTD_DISABLE_MD2_MD4",
+                      "online ? WTD_REVOKE_WHOLECHAIN : WTD_REVOKE_NONE",
+                      "WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT", "CERT_SHA256_HASH_PROP_ID"):
+            self.assertIn(token, policy)
         self.assertNotIn("ShellExecute", self.launcher)
         self.assertNotIn("system(", self.launcher)
         self.assertNotIn("toStdWString", self.launcher)

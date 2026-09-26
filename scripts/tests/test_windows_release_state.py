@@ -14,7 +14,7 @@ import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-PRODUCT = ROOT.name
+PRODUCT = json.loads((ROOT / "release/product.json").read_text(encoding="utf-8"))["productName"]
 SCRIPT = ROOT / "scripts" / "check-windows-release-state.py"
 SPEC = importlib.util.spec_from_file_location("windows_release_state", SCRIPT)
 if SPEC is None or SPEC.loader is None:
@@ -192,6 +192,8 @@ class WindowsReleaseStateTests(unittest.TestCase):
 
     def test_complete_windows_asset_set_is_exact(self) -> None:
         complete = release("v1.0.0", 10, windows=True)
+        self.assertEqual(len(complete["assets"]), 9)
+        self.assertIn(f"{PRODUCT}-1.0.0-Source.zip", {item["name"] for item in complete["assets"]})
         for index in range(len(complete["assets"])):
             partial = copy.deepcopy(complete)
             del partial["assets"][index]

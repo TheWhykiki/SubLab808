@@ -38,12 +38,22 @@ WSH, Python, MSI/MSP, SCR, CPL, OCX und SYS) sind im Bundle vollständig verbote
 
 ## Voraussetzungen
 
+Jeder CI-Lauf baut das MSI mit WiX 6 für die jeweilige Architektur und archiviert
+die vollständig aus dieser Datei gelesene `InstallExecuteSequence` (Action,
+Condition, Sequence) in der Evidence. Vierzehn reale Sequenzmutanten und ein
+MSI mit absichtlich falscher Architektur werden sowohl vom Packager als auch
+vom nativen C++-Updater-Datenbankprüfer abgelehnt. Dessen
+`--validate-msi-database`-Einstieg existiert ausschließlich im nicht installierenden
+SelfTest-Target. Für signierte Kandidaten ist `-UpdaterTestPath` verpflichtend;
+unsigned CI übergibt denselben Prüfer. Nach Signierung wird die Sequenz erneut
+ausgelesen und auf unveränderte Tabellenwerte geprüft.
+
 - Windows mit PowerShell 7.2 oder neuer
 - ein .NET SDK, das das lokale WiX-Tool ausführen kann
 - Visual Studio C++ Build Tools und Windows SDK (`dumpbin.exe`, `signtool.exe`)
 - ein bereits gebautes `<Product>.vst3` mit genau einem passenden Windows-Payload
-- für Produktionsartefakte ein zugängliches Code-Signing-Zertifikat und ein eigener
-  HTTPS-RFC-3161-Zeitstempel-Endpunkt
+- für Produktionsartefakte ein validiertes Azure Artifact Signing Public Trust-Profil,
+  GitHub-OIDC-Anmeldung und der Microsoft-RFC3161-Dienst
 
 Der Skriptaufruf verändert das übergebene Bundle nicht. Er erstellt eine geprüfte
 Arbeitskopie, signiert dort alle inhaltsbasiert erkannten PE-Dateien, baut daraus
@@ -55,64 +65,52 @@ Redistributable-Version voraus.
 
 ## Signierter Produktionsbuild
 
-Die Standardeinstellung ist fail-closed: Ohne genau eine Zertifikatsauswahl und
-ohne RFC 3161-Zeitstempel wird kein Kandidat erzeugt. Die folgenden Werte sind
-absichtlich Platzhalter und keine mitgelieferten Zertifikate oder Dienste:
+RFC 3161 schützt den Zeitstempel kryptografisch.
+
+Der Build verlangt einen vollständigen Artifact-Signing-Profil-EKU-Pin und eine
+OIDC-basierte Azure-CLI-Anmeldung. Private Windows-Schlüssel werden nicht exportiert
+oder in GitHub gespeichert. Die folgenden Pfade und Identitäten sind Platzhalter:
 
 ```powershell
-$bundle = (Resolve-Path '<path-to-product.vst3>').Path
-$hostTest = (Resolve-Path '<path-to-native-host-test.exe>').Path
-$updater = (Resolve-Path "$bundle\Contents\Helpers\<Product>Updater.exe").Path
-
-./scripts/build-windows-installer.ps1 `
-    -Architecture x64 `
-    -BundlePath $bundle `
-    -Version '1.2.3' `
-    -SourceCommit '<40-lowercase-hex-tag-commit>' `
-    -UpdaterPath $updater `
-    -ExpectedSignerSha256 '<64-hex-certificate-sha256-from-cmake>' `
-    -ExpectedNextSignerSha256 '<optional-distinct-64-hex-next-certificate-sha256>' `
-    -ExpectedReleaseGatePublicKeyXY '<128-uppercase-hex-p256-x-then-y-from-cmake>' `
-    -ExpectedReleaseGateNextPublicKeyXY '<optional-distinct-128-uppercase-hex-next-p256-key>' `
-    -CertificateThumbprint '<40-hex-certificate-thumbprint>' `
-    -TimestampUrl 'https://<your-rfc3161-provider>' `
-    -HostTestPath $hostTest
+$arguments = @{
+    Architecture = 'x64'
+    BundlePath = '<path-to-product.vst3>'
+    Version = '1.2.3'
+    SourceCommit = '<40-lowercase-hex-tag-commit>'
+    UpdaterPath = '<path-to-product.vst3>\Contents\Helpers\<Product>Updater.exe'
+    UpdaterTestPath = '<build>\Release\<Product>WindowsUpdaterSelfTests.exe'
+    ExpectedProfileEku = '<complete-public-trust-profile-oid>'
+    ExpectedReleaseGatePublicKeyXY = '<128-uppercase-hex-p256-x-then-y>'
+    SigningDlibPath = '<pinned-client>\bin\x64\Azure.CodeSigning.Dlib.dll'
+    SigningDlibSha256 = '<64-hex-pinned-dlib-sha256>'
+    SigningMetadataPath = '<oidc-metadata.json>'
+    TimestampUrl = 'http://timestamp.acs.microsoft.com/'
+    HostTestPath = '<native-host-test.exe>'
+}
+./scripts/build-windows-installer.ps1 @arguments
 ```
 
-Statt `-CertificateThumbprint` kann genau einmal `-CertificateSubject` angegeben
-werden. `-CertificateStoreName` ist standardmäßig `My`; Zertifikate aus dem
-Computerkonto benötigen zusätzlich `-UseMachineCertificateStore`. Ein
-Produktionspaket verlangt exakt `Contents\Helpers\<Product>Updater.exe` über
-`-UpdaterPath` und bindet die Evidence über `-SourceCommit` exakt an den
-40-stelligen, kleingeschriebenen Git-Commit des Release-Tags. Dessen in CMake
-eingebrannter aktueller 64-stelliger Zertifikat-SHA-256 muss zusätzlich
-unverändert als `-ExpectedSignerSha256` übergeben werden. Der optionale, davon
-verschiedene nächste Updater-Pin wird mit `-ExpectedNextSignerSha256` gebunden.
-Er erweitert ausschließlich die vom Updater akzeptierte Download-Payload und
-darf nicht das Zertifikat der PFX oder einer in diesem Lauf erzeugten Signatur
-sein. Entsprechend binden `-ExpectedReleaseGatePublicKeyXY` und optional
-`-ExpectedReleaseGateNextPublicKeyXY` den aktuellen und vorbereiteten nächsten
-P-256-Public-Key bytegenau an CMake, Helper und Evidence. Beide Werte sind
-128 Großhex-Zeichen `X||Y`; Current ist zwingend und Next muss leer oder
-verschieden sein. Das Skript bricht ab, wenn der tatsächliche Fingerprint des ausgewählten
-Zertifikats vom aktuellen Pin abweicht. Der Updater muss dieselbe x64-
-beziehungsweise ARM64EC-PE-Architektur wie das Plug-in besitzen. Vor jeder
-Signatur führt das Skript den gestagten Helper
-mit dessen rein lesendem `--validate-build-contract`-Modus aus. Dazu erzeugt es
-für jeden Aufruf eine kryptografisch zufällige 32-Byte-Challenge und eine zufällige,
-auf den aktuellen Benutzer beschränkte Named Pipe mit genau einer Instanz.
-Packager und WIN32-Helper binden dabei beide Gegenstellen aneinander: Der Helper
-prüft die PID des Pipe-Servers; der Packager liest die vom Betriebssystem gemeldete
-Client-PID aus der verbundenen Pipe und verlangt exakt die PID des gerade von ihm
-gestarteten Helpers. Erst danach liest er unabhängig von einer Konsole genau einen
-kanonischen ASCII-/UTF-8-JSON-Datensatz.
+Der Workflow erzeugt SDK und Metadaten mit `scripts/setup-artifact-signing.ps1`.
+Metadaten erlauben ausschließlich AzureCliCredential; `azure/login` erhält
+seine kurzlebigen Credentials über GitHub OIDC. SignTool und dlib laufen immer als
+x64-Prozess, auf Windows on Arm unter Emulation. Dumpbin, Produkt, Updater und
+Hosttest bleiben architekturgerecht nativ.
+
+Optional ergänzt `-ExpectedNextProfileEku` eine vorbereitete Profilrotation.
+`-ExpectedReleaseGateNextPublicKeyXY` ergänzt unabhängig davon eine Gate-Key-
+Rotation. Die aktuellen Pins sind zwingend; Next muss jeweils verschieden sein.
+Der Produktionshelper ist exakt `Contents\Helpers\<Product>Updater.exe`.
+Vor der ersten Signatur prüft der Packager seine vollständige kompilierte
+Identität über eine private Named Pipe, zufällige Challenge und OS-geprüfte
+Peer-PIDs. Zertifikats-Leaves dürfen täglich wechseln; jedes PE und das MSI
+müssen zum selben festgelegten aktuellen Public-Trust-Profil gehören.
 
 Der Datensatz enthält Schema und Schemaversion, Challenge, Server-PID,
 Produktions-/Compile-only-Modus sowie die vollständige kompilierte Identität:
 Produkt, Version, Hersteller, GitHub-Owner und -Repository, Architektur, beide
 UpgradeCodes, aktuellen Signer-Pin und optionalen nächsten Signer-Pin. Der
-kanonische Build-Vertrag verwendet Schema 3 mit `currentSignerSha256`,
-`nextSignerSha256`, `releaseGatePublicKeyXY` und
+kanonische Build-Vertrag verwendet Schema 3 mit `currentProfileEku`,
+`nextProfileEku`, `releaseGatePublicKeyXY` und
 `releaseGateNextPublicKeyXY`. Verbindung, begrenztes Lesen und Prozessende teilen sich ein
 30-Sekunden-Limit; das Skript liest höchstens die erwartete Länge plus ein Byte.
 Nur bytegenaue Übereinstimmung ohne BOM, Zusatz-Whitespace oder Folgedaten
@@ -126,11 +124,9 @@ patch-artiges PE vorhanden sein. `-UpdaterPath` dient nur der zusätzlichen
 expliziten Bindung und kann einen versteckten oder umbenannten Helper nicht aus
 der Klassifikation herausnehmen.
 
-Eine Subject-Auswahl muss exakt und eindeutig auf ein Zertifikat im gewählten
-Store passen. Das Skript signiert anschließend immer über dessen aufgelösten
-Thumbprint, verifiziert nach jeder Signatur denselben Signer und schreibt dessen
-SHA-256-Zertifikatsfingerprint in die Evidence. Dadurch kann eine mehrdeutige
-Subject-Suche nicht still ein anderes Zertifikat auswählen.
+Nach jeder Signatur werden Windows-Vertrauen, Zeitstempel, Code-Signing-EKU,
+Public-Trust-EKU und exakter Profil-EKU geprüft. Leaf-Fingerprints bleiben reine
+Evidence und sind keine dauerhaften Vertrauensanker.
 
 Für Windows on Arm wird derselbe Befehl nativ auf einem Arm64-System mit
 `-Architecture arm64ec` ausgeführt. Im Produktionsmodus ist `-HostTestPath`
@@ -238,9 +234,9 @@ Das Resultat ist ein neues, atomar veröffentlichtes Kandidatenverzeichnis unter
 `dist\windows` (oder `-OutputDirectory`). Es enthält genau das MSI und eine
 `*.evidence.json` mit MSI-Hash, vollständiger Payload-Hashliste, Produkt- und
 UpgradeCodes sowie expliziten Ergebnissen für Graph-, Referenz-, Side-Effect-,
-Sequenz- und Extraktionslayout-Prüfung. Evidence-Schema 4 protokolliert zusätzlich
-`updaterCurrentSignerSha256`, den optionalen `updaterNextSignerSha256` und die
-exakt geordnete `payloadSignerAllowlistSha256` als `[current]` oder
+Sequenz- und Extraktionslayout-Prüfung. Evidence-Schema 5 mit `releaseContractVersion=2` protokolliert zusätzlich
+`updaterCurrentProfileEku`, den optionalen `updaterNextProfileEku` und die
+exakt geordnete `payloadProfileEkuAllowlist` als `[current]` oder
 `[current, next]`. Zusätzlich bindet es `releaseGatePublicKeyXY`, den optionalen
 `releaseGateNextPublicKeyXY` und die exakt geordnete
 `releaseGatePublicKeyAllowlistXY` nach demselben Current/Next-Prinzip. Außerdem
@@ -259,6 +255,13 @@ Signierte MSI-Dateien heißen
 `<Product>-<Version>-Windows-arm64ec.msi`. Testkandidaten fügen unmittelbar vor
 `.msi` den Marker `-UNSIGNED-NOT-FOR-DISTRIBUTION` ein; das umgebende
 Verzeichnis verwendet denselben Basenamen.
+
+Die ExecuteSequence muss genau einmal und bedingungslos positive
+`FindRelatedProducts`- und `LaunchConditions`-Einträge enthalten, mit
+`FindRelatedProducts < LaunchConditions < InstallInitialize < RemoveExistingProducts < InstallFiles`.
+Feature-Migration folgt ebenfalls der Upgrade-Suche. Packager und nativer Updater
+prüfen dieselbe Regel; 14 Mutationen tatsächlicher MSI-Tabellen müssen vor Signierung
+abgelehnt werden (`validation.sequenceMutationTests=14`).
 
 ## Upgrades und Rollback
 
@@ -294,7 +297,7 @@ ist das exakte Toolmanifest der Lock-Vertrag. Eine Versionsspanne oder ein globa
 
 WiX 6 unterliegt zusätzlich zur Open-Source-Lizenz dem Programm zur
 **Open Source Maintenance Fee (OSMF)**. Nach den veröffentlichten Bedingungen
-benötigen Organisationen oberhalb der dort genannten Umsatzschwelle eine passende
+benötigen Organisationen mit mehr als 10.000 USD Jahresumsatz eine passende
 FireGiant-Sponsorschaft. WiX 6 erzwingt die EULA noch nicht technisch, die
 vertragliche Pflicht kann trotzdem bestehen. Vor einem kommerziellen Build sind
 die jeweils aktuellen [WiX-OSMF-Bedingungen](https://docs.firegiant.com/wix/osmf/)
@@ -330,7 +333,7 @@ Kandidat darf diesen Schritt nie erreichen.
 Der signierte Release-Workflow führt vor dem Artefakt-Upload zusätzlich
 `scripts/test-windows-installer.ps1` auf dem jeweils nativen x64- beziehungsweise
 ARM64-Runner aus. Das Skript prüft MSI-Hash, gültige Authenticode-Signatur,
-Zeitstempel und den aktuellen öffentlichen SHA-256-Signer-Pin. Der optionale
+Zeitstempel und den aktuellen öffentlichen Public-Trust-Profil-EKU. Der optionale
 nächste Pin und die daraus gebildete geordnete Allowlist müssen zusätzlich exakt
 mit der Evidence übereinstimmen; das MSI selbst muss weiterhin mit dem aktuellen
 Pin signiert sein. Zusätzlich bindet der Gate die
@@ -374,7 +377,7 @@ architekturfähige Testumgebungen und werden nicht durch synthetische Fixtures a
 bestanden behauptet.
 
 Der konkrete, taggebundene GitHub-Actions-Vertrag einschließlich kurzlebigem
-PFX-Import, Architektur-Jobs, Evidence-Revalidierung und atomarem Draft-Publish
+Azure-OIDC-Signing, Architektur-Jobs, Evidence-Revalidierung und atomarem Draft-Publish
 steht in [WINDOWS_RELEASE.md](WINDOWS_RELEASE.md).
 
 Die ICE-Validierung benötigt einen Windows-Installer-fähigen Benutzerkontext.

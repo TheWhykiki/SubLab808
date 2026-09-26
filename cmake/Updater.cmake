@@ -21,6 +21,18 @@ function(wk_add_updater product)
 
     if(APPLE)
         find_package(Python3 COMPONENTS Interpreter REQUIRED)
+        set(updater_pin_args "")
+        foreach(pin_kind APPLICATION INSTALLER NEXT_APPLICATION NEXT_INSTALLER)
+            set(pin_variable "WK_MACOS_${pin_kind}_CERT_SHA256")
+            set(${pin_variable} "" CACHE STRING "macOS updater ${pin_kind} certificate SHA-256 pin")
+            string(TOLOWER "${pin_kind}" pin_option)
+            string(REPLACE "_" "-" pin_option "${pin_option}")
+            list(APPEND updater_pin_args "--${pin_option}-cert-sha256=${${pin_variable}}")
+        endforeach()
+        # configure_file tracks changes to cache pins even with Makefile generators.
+        # Its contents are public trust anchors, never private signing material.
+        string(JOIN "\n" updater_pin_configuration ${updater_pin_args})
+        file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/Updater/signer-pins.txt" CONTENT "${updater_pin_configuration}\n")
         set(updater_app "${CMAKE_CURRENT_BINARY_DIR}/Updater/${product}Updater.app")
         set(updater_arch_args "")
         foreach(architecture IN LISTS CMAKE_OSX_ARCHITECTURES)
@@ -28,10 +40,11 @@ function(wk_add_updater product)
         endforeach()
         add_custom_command(OUTPUT "${updater_app}/Contents/MacOS/${product}Updater"
             COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/scripts/build-updater.py"
-                --product "${product}" --version "${PROJECT_VERSION}" --output "${updater_app}" ${updater_arch_args}
+                --product "${product}" --version "${PROJECT_VERSION}" --output "${updater_app}" ${updater_arch_args} ${updater_pin_args}
             DEPENDS scripts/build-updater.py Updater/main.swift Updater/UpdateCore.swift
                     Updater/HTTPClient.swift Updater/PackageService.swift
                     Updater/UpdaterApp.swift Updater/InstallationRecord.swift
+                    Updater/SignerPolicy.swift "${CMAKE_CURRENT_BINARY_DIR}/Updater/signer-pins.txt"
             VERBATIM)
         add_custom_target(${product}Updater DEPENDS "${updater_app}/Contents/MacOS/${product}Updater")
         add_test(NAME ${product}UpdaterPolicy COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test-updater.py")
@@ -94,19 +107,19 @@ function(wk_add_updater product)
         WK_WINDOWS_UPDATER_OTHER_UPGRADE_CODE="${updater_other_upgrade_code}"
         UNICODE _UNICODE _WIN32_WINNT=0x0A00 WINVER=0x0A00)
     set(updater_libraries juce::juce_core bcrypt comctl32 crypt32 msi ole32 shell32 winhttp wintrust advapi32)
-    set(non_distribution_current_signer "1111111111111111111111111111111111111111111111111111111111111111")
-    set(non_distribution_next_signer "2222222222222222222222222222222222222222222222222222222222222222")
+    set(non_distribution_current_signer "1.3.6.1.4.1.311.97.100.200.300.400")
+    set(non_distribution_next_signer "1.3.6.1.4.1.311.97.101.201.301.401")
 
-    # This target compiles the complete native implementation but is prevented
-    # in source from opening files, networking, elevating or installing.
+    # This target compiles the complete native policy. Its explicit MSI probe
+    # reads databases only; test mode cannot network, elevate or install.
     add_executable(${product}WindowsUpdaterSelfTests
         Tests/WindowsUpdater/WindowsUpdaterTests.cpp
         Updater/Windows/Updater.manifest ${updater_sources})
     target_include_directories(${product}WindowsUpdaterSelfTests PRIVATE Updater/Windows)
     target_compile_definitions(${product}WindowsUpdaterSelfTests PRIVATE
         ${updater_definitions}
-        WK_WINDOWS_UPDATER_SIGNER_SHA256="${non_distribution_current_signer}"
-        WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256="${non_distribution_next_signer}"
+        WK_WINDOWS_UPDATER_PROFILE_EKU="${non_distribution_current_signer}"
+        WK_WINDOWS_UPDATER_NEXT_PROFILE_EKU="${non_distribution_next_signer}"
         WK_WINDOWS_UPDATER_TEST_MODE=1)
     target_link_libraries(${product}WindowsUpdaterSelfTests PRIVATE ${updater_libraries}
         juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
@@ -123,8 +136,8 @@ function(wk_add_updater product)
     target_include_directories(${product}WindowsUpdaterProductionShape PRIVATE Updater/Windows)
     target_compile_definitions(${product}WindowsUpdaterProductionShape PRIVATE
         ${updater_definitions}
-        WK_WINDOWS_UPDATER_SIGNER_SHA256="${non_distribution_current_signer}"
-        WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256="${non_distribution_next_signer}"
+        WK_WINDOWS_UPDATER_PROFILE_EKU="${non_distribution_current_signer}"
+        WK_WINDOWS_UPDATER_NEXT_PROFILE_EKU="${non_distribution_next_signer}"
         WK_WINDOWS_UPDATER_COMPILE_ONLY=1)
     target_link_libraries(${product}WindowsUpdaterProductionShape PRIVATE ${updater_libraries}
         juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
@@ -142,7 +155,7 @@ function(wk_add_updater product)
         Source/UpdaterLauncher.cpp)
     target_compile_definitions(${product}WindowsUpdaterLauncherShape PRIVATE
         WK_UPDATER_ENABLED=1
-        WK_WINDOWS_UPDATER_SIGNER_SHA256="${non_distribution_current_signer}")
+        WK_WINDOWS_UPDATER_PROFILE_EKU="${non_distribution_current_signer}")
     target_link_libraries(${product}WindowsUpdaterLauncherShape PRIVATE juce::juce_gui_basics
         crypt32 wintrust
         juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
@@ -151,31 +164,28 @@ function(wk_add_updater product)
         OUTPUT_NAME "${product}UpdaterLauncherLinkShape-UNSIGNED-NOT-FOR-DISTRIBUTION")
 
     string(TOUPPER "${product}" product_upper)
-    set(signer_variable "${product_upper}_WINDOWS_UPDATER_SIGNER_SHA256")
+    set(signer_variable "${product_upper}_WINDOWS_UPDATER_PROFILE_EKU")
     set(${signer_variable} "" CACHE STRING
-        "SHA-256 distribution certificate fingerprint that enables the signed Windows updater")
+        "Azure Artifact Signing Public Trust profile EKU enabling the Windows updater")
     set(updater_signer "${${signer_variable}}")
     if(updater_signer STREQUAL "")
         message(STATUS "${product}: Windows updater UI disabled until ${signer_variable} is configured")
         return()
     endif()
-    string(LENGTH "${updater_signer}" updater_signer_length)
-    if(NOT updater_signer_length EQUAL 64 OR NOT updater_signer MATCHES "^[0-9A-Fa-f]+$")
-        message(FATAL_ERROR "${signer_variable} must be exactly 64 hexadecimal characters")
+    # A complete profile OID, not the generic Public Trust marker or a leaf hash.
+    # Runtime and packager additionally parse each canonical ASN.1 OID component.
+    if(NOT updater_signer MATCHES "^1\\.3\\.6\\.1\\.4\\.1\\.311\\.97\\.[0-9]+(\\.[0-9]+)+$"
+       OR updater_signer STREQUAL "1.3.6.1.4.1.311.97.1.0")
+        message(FATAL_ERROR "${signer_variable} must be an Artifact Signing profile EKU")
     endif()
-    string(TOUPPER "${updater_signer}" updater_signer)
-    set(next_signer_variable "${product_upper}_WINDOWS_UPDATER_NEXT_SIGNER_SHA256")
-    set(${next_signer_variable} "" CACHE STRING
-        "Optional next SHA-256 distribution certificate fingerprint accepted for Windows payload rotation")
+    set(next_signer_variable "${product_upper}_WINDOWS_UPDATER_NEXT_PROFILE_EKU")
+    set(${next_signer_variable} "" CACHE STRING "Optional next Artifact Signing profile EKU")
     set(updater_next_signer "${${next_signer_variable}}")
     if(NOT updater_next_signer STREQUAL "")
-        string(LENGTH "${updater_next_signer}" updater_next_signer_length)
-        if(NOT updater_next_signer_length EQUAL 64 OR NOT updater_next_signer MATCHES "^[0-9A-Fa-f]+$")
-            message(FATAL_ERROR "${next_signer_variable} must be empty or exactly 64 hexadecimal characters")
-        endif()
-        string(TOUPPER "${updater_next_signer}" updater_next_signer)
-        if("${updater_next_signer}" STREQUAL "${updater_signer}")
-            message(FATAL_ERROR "${next_signer_variable} must differ from ${signer_variable}")
+        if(NOT updater_next_signer MATCHES "^1\\.3\\.6\\.1\\.4\\.1\\.311\\.97\\.[0-9]+(\\.[0-9]+)+$"
+           OR updater_next_signer STREQUAL "1.3.6.1.4.1.311.97.1.0"
+           OR updater_next_signer STREQUAL updater_signer)
+            message(FATAL_ERROR "${next_signer_variable} must be a distinct Artifact Signing profile EKU")
         endif()
     endif()
 
@@ -185,8 +195,8 @@ function(wk_add_updater product)
     target_include_directories(${product}WindowsUpdater PRIVATE Updater/Windows)
     target_compile_definitions(${product}WindowsUpdater PRIVATE
         ${updater_definitions}
-        WK_WINDOWS_UPDATER_SIGNER_SHA256="${updater_signer}"
-        WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256="${updater_next_signer}")
+        WK_WINDOWS_UPDATER_PROFILE_EKU="${updater_signer}"
+        WK_WINDOWS_UPDATER_NEXT_PROFILE_EKU="${updater_next_signer}")
     target_link_libraries(${product}WindowsUpdater PRIVATE ${updater_libraries}
         juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
     target_compile_options(${product}WindowsUpdater PRIVATE /W4 /permissive- /utf-8)
@@ -196,7 +206,7 @@ function(wk_add_updater product)
     set_property(TARGET ${product}_VST3 APPEND PROPERTY LINK_DEPENDS "$<TARGET_FILE:${product}WindowsUpdater>")
     target_sources(${product} PRIVATE Source/UpdaterLauncher.cpp)
     target_compile_definitions(${product} PRIVATE
-        WK_UPDATER_ENABLED=1 WK_WINDOWS_UPDATER_SIGNER_SHA256="${updater_signer}")
+        WK_UPDATER_ENABLED=1 WK_WINDOWS_UPDATER_PROFILE_EKU="${updater_signer}")
     target_link_libraries(${product} PRIVATE crypt32 wintrust)
     set(vst3_bundle "$<GENEX_EVAL:$<TARGET_PROPERTY:${product}_VST3,JUCE_PLUGIN_ARTEFACT_FILE>>")
     add_custom_command(TARGET ${product}_VST3 POST_BUILD

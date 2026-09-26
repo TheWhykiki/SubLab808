@@ -45,7 +45,7 @@ The plugin-side launcher verifies the bundled helper before `CreateProcessW`
 while holding its non-reparse file handle against replacement. `WinVerifyTrust`
 checks the signed bytes, timestamp and locally available certificate chain with
 revocation disabled for this one UI-thread gate; URL retrieval is cache-only.
-Any local trust error or mismatch with the plugin's exact current SHA-256 leaf pin blocks
+Any local trust error or mismatch with the plugin's exact current Artifact Signing profile EKU blocks
 launch. This avoids rejecting a valid first-run/offline system merely because it
 has no cached CRL/OCSP response. The standalone updater then performs online
 whole-chain revocation checking. Its running image and every copied image must
@@ -53,13 +53,22 @@ match the exact current pin before any ordinary update work. The downloaded MSI
 may match either that current pin or one optional, distinct next pin. There is no
 certificate subject/issuer-name fallback.
 
+The shared `Authenticode.h` reads the precise signer/counter-signer selected by
+WinVerifyTrust. Its certificate must contain the code-signing EKU, the Artifact
+Signing Public Trust marker and exactly one allowed profile identity. A verified
+RFC3161 timestamp within the signing certificate's validity is mandatory.
+All dialogs expose version, AGPL-3.0-only and the exact source release tag.
+
 Before elevation, the complete MSI is size/hash checked, held against write or
 replacement, accepted by `WinVerifyTrust`, and bound to the one- or two-entry
-payload signer allowlist. Its actual leaf fingerprint becomes the package signer.
+payload signer allowlist. Its authenticated Public Trust identity EKU becomes the package signer.
 The updater then opens the MSI database
 read-only and verifies exact product, manufacturer, version, architecture,
 ProductCode/UpgradeCodes, per-machine scope and downgrade/other-architecture
-rules. The WiX 6.0.2 Upgrade table must contain exactly the three reviewed rows,
+rules. The execute sequence is checked as
+`FindRelatedProducts < LaunchConditions < InstallInitialize < RemoveExistingProducts < InstallFiles`.
+Security-relevant actions must be unique, unconditional and positive; feature
+migration must follow upgrade discovery. The WiX 6.0.2 Upgrade table must contain exactly the three reviewed rows,
 including NULL `Remove` fields and their exact bounds, languages and attributes.
 Every file must have a safe leaf name and belong to a 64-bit component whose
 Directory ancestry is part of a complete cycle-free graph ending at the one
@@ -84,11 +93,11 @@ alternate data streams, case-colliding paths, executable scripts and foreign
 files outside the one VST3 payload are rejected. `moduleinfo.json` must identify
 the exact product, vendor and version. Every PE inside the bundle must have the
 expected x64 or ARM64EC/ARM64X form and must use exactly the MSI's actual package
-signer—not merely either allowlisted certificate. The same exact leaf check is
+profile identity, not merely either allowlisted profile. Certificate leaves may roll daily. The same profile check is
 repeated on the installed payload. The updater records a complete
 path/size/SHA-256 tree fingerprint.
 
-For a rotation from certificate A to B, first publish and retain a bridge release
+For a rotation from profile identity A to B, first publish and retain a bridge release
 whose helper is compiled with current A plus next B and whose complete package is
 still signed by A. Only a later release may switch the helper's current pin and
 package signer to B. Do not delete the bridge release. If it falls outside the
@@ -176,8 +185,8 @@ target_compile_definitions(${PROJECT_NAME}WindowsUpdater PRIVATE
     WK_WINDOWS_UPDATER_GITHUB_REPOSITORY="${PROJECT_NAME}"
     WK_WINDOWS_UPDATER_UPGRADE_CODE="${CURRENT_ARCH_UPGRADE_CODE}"
     WK_WINDOWS_UPDATER_OTHER_UPGRADE_CODE="${OTHER_ARCH_UPGRADE_CODE}"
-    WK_WINDOWS_UPDATER_SIGNER_SHA256="${DISTRIBUTION_SIGNER_SHA256}"
-    WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256="${OPTIONAL_NEXT_DISTRIBUTION_SIGNER_SHA256}"
+    WK_WINDOWS_UPDATER_PROFILE_EKU="${DISTRIBUTION_PROFILE_EKU}"
+    WK_WINDOWS_UPDATER_NEXT_PROFILE_EKU="${OPTIONAL_NEXT_DISTRIBUTION_PROFILE_EKU}"
     WK_WINDOWS_UPDATER_RELEASE_GATE_PUBLIC_KEY_XY="${RELEASE_GATE_PUBLIC_KEY_XY}"
     WK_WINDOWS_UPDATER_RELEASE_GATE_NEXT_PUBLIC_KEY_XY="${OPTIONAL_NEXT_RELEASE_GATE_PUBLIC_KEY_XY}"
     _WIN32_WINNT=0x0A00 WINVER=0x0A00)
@@ -190,15 +199,14 @@ target_link_libraries(${PROJECT_NAME}WindowsUpdater PRIVATE juce::juce_core
 `cmake/Updater.cmake` reads the product and both UpgradeCodes directly from
 `Installer/Windows/package-config.json`. The target architecture is the same
 Visual Studio `-A x64` or `-A ARM64EC` as its VST3 and MSI. With an empty
-`SUBLAB808_WINDOWS_UPDATER_SIGNER_SHA256` or
-`REVERSELAB_WINDOWS_UPDATER_SIGNER_SHA256`, CMake deliberately omits the
+`SUBLAB808_WINDOWS_UPDATER_PROFILE_EKU` or
+`REVERSELAB_WINDOWS_UPDATER_PROFILE_EKU`, CMake deliberately omits the
 production helper and leaves the editor button disabled. This required current
-value must be exactly 64 hexadecimal characters. The corresponding optional
-`*_WINDOWS_UPDATER_NEXT_SIGNER_SHA256` must be empty or a different 64-hex
-fingerprint. The production source independently enforces the same one- or
-two-pin contract. These are SHA-256 certificate fingerprints, not file digests.
+value must be a complete canonical Public Trust identity OID. The corresponding optional
+`*_WINDOWS_UPDATER_NEXT_PROFILE_EKU` must be empty or a different complete profile OID. The production source independently enforces the same one- or
+two-pin contract. These are durable Artifact Signing profile OIDs, not certificate fingerprints.
 The MSI pipeline signs the bridge's embedded PEs and enclosing MSI with the
-current certificate; the next certificate is only an acceptance pin for the
+current profile; the next profile is only an acceptance pin for the
 following rotation step.
 
 Production builds also require exactly 128 uppercase hexadecimal characters in
@@ -206,8 +214,7 @@ Production builds also require exactly 128 uppercase hexadecimal characters in
 `REVERSELAB_WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY`. This is the P-256 public point
 `X||Y`. The corresponding optional `*_WINDOWS_RELEASE_GATE_NEXT_PUBLIC_KEY_XY`
 must be empty or a distinct valid point. Current and optional next are compiled
-into the helper; only the current key's separate PKCS#8 private key may issue a
-transition authorization.
+into the helper. Only the active versioned, non-exportable P-256 EC-HSM key in Azure Key Vault may issue a transition authorization through OIDC.
 
 Before signing or packaging a staged production helper, the MSI packager executes
 its pure build-contract gate. The argument order and spellings are intentionally
@@ -215,7 +222,7 @@ fixed; the packager creates a cryptographically random 32-byte challenge and a
 separate random private named-pipe endpoint for every invocation:
 
 ```text
-ProductUpdater.exe --validate-build-contract --challenge 64-HEX --response-pipe WhykikiAudio.UpdaterBuildContract.32-HEX --parent-process-id DECIMAL-PID --product Product --version 1.2.3 --manufacturer "Whykiki Audio" --github-owner TheWhykiki --github-repository Product --architecture x64 --upgrade-code CURRENT-GUID --other-upgrade-code OTHER-GUID --current-signer-sha256 64-HEX-SHA256 --next-signer-sha256 EMPTY-OR-64-HEX-SHA256 --release-gate-public-key-xy 128-UPPER-HEX-X-THEN-Y --release-gate-next-public-key-xy EMPTY-OR-DISTINCT-128-UPPER-HEX
+ProductUpdater.exe --validate-build-contract --challenge 64-HEX --response-pipe WhykikiAudio.UpdaterBuildContract.32-HEX --parent-process-id DECIMAL-PID --product Product --version 1.2.3 --manufacturer "Whykiki Audio" --github-owner TheWhykiki --github-repository Product --architecture x64 --upgrade-code CURRENT-GUID --other-upgrade-code OTHER-GUID --current-profile-eku PROFILE-OID --next-profile-eku EMPTY-OR-NEXT-PROFILE-OID --release-gate-public-key-xy 128-UPPER-HEX-X-THEN-Y --release-gate-next-public-key-xy EMPTY-OR-DISTINCT-128-UPPER-HEX
 ```
 
 Use `arm64ec` (lowercase) for Windows on Arm. The WIN32-subsystem helper does not
@@ -225,7 +232,7 @@ JSON record ending in a single LF. Schema version 3 contains
 the exact fresh challenge, server PID, `buildMode=production`,
 `compileOnly=false`, and every compiled identity field: product, version,
 manufacturer, GitHub owner/repository, architecture, both UpgradeCodes, the
-exact current and optional-next certificate SHA-256 pins, and the exact current
+exact current and optional-next profile EKU pins, and the exact current
 and optional-next Release-Gate-Public-Keys.
 
 The packager owns a one-instance `CurrentUserOnly` byte-mode pipe and uses the OS

@@ -7,30 +7,41 @@ struct ToolOutput {
     let text: String
 }
 
-func runTool(_ executable: String, _ arguments: [String], timeout: TimeInterval = 60) throws -> ToolOutput {
-    let log = FileManager.default.temporaryDirectory.appendingPathComponent("whykiki-tool-" + UUID().uuidString)
-    FileManager.default.createFile(atPath: log.path, contents: nil, attributes: [.posixPermissions: 0o600])
+func runTool(_ executable: String, _ arguments: [String], timeout: TimeInterval = 60, maximumOutputBytes: Int = 256 * 1024) throws -> ToolOutput {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("whykiki-tool-" + UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try requirePrivateDirectory(directory)
+    let log = directory.appendingPathComponent("output")
+    try require(FileManager.default.createFile(atPath: log.path, contents: nil, attributes: [.posixPermissions: 0o600]), "Prüfprotokoll konnte nicht angelegt werden")
     let handle = try FileHandle(forWritingTo: log)
     defer { try? handle.close(); try? FileManager.default.removeItem(at: log) }
     let process = Process()
     process.executableURL = URL(fileURLWithPath: executable)
     process.arguments = arguments
-    process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C"]
+    process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C", "LC_ALL": "C"]
     process.standardOutput = handle
     process.standardError = handle
     try process.run()
     let deadline = Date().addingTimeInterval(timeout)
-    while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
+    while process.isRunning && Date() < deadline {
+        if (try log.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) > maximumOutputBytes { break }
+        Thread.sleep(forTimeInterval: 0.05)
+    }
     if process.isRunning {
         process.terminate()
         Thread.sleep(forTimeInterval: 0.2)
         if process.isRunning { kill(process.processIdentifier, SIGKILL) }
         process.waitUntilExit()
-        throw UpdateFailure("macOS hat die Paketprüfung nicht rechtzeitig abgeschlossen")
+        throw UpdateFailure("macOS hat die Paketprüfung nicht innerhalb der Zeit- oder Ausgabegrenze abgeschlossen")
     }
     process.waitUntilExit()
-    return ToolOutput(status: process.terminationStatus,
-                      text: String(data: try Data(contentsOf: log), encoding: .utf8) ?? "")
+    let reader = try FileHandle(forReadingFrom: log)
+    defer { try? reader.close() }
+    let output = try reader.read(upToCount: maximumOutputBytes + 1) ?? Data()
+    try require(output.count <= maximumOutputBytes, "Zu große Ausgabe der macOS-Paketprüfung")
+    guard let text = String(data: output, encoding: .utf8) else { throw UpdateFailure("Ungültige Textausgabe der Paketprüfung") }
+    return ToolOutput(status: process.terminationStatus, text: text)
 }
 
 func verifiedTool(_ executable: String, _ arguments: [String], message: String) throws {
@@ -122,13 +133,39 @@ struct PreparedPackage {
     let file: URL
     let candidate: UpdateCandidate
     let fingerprint: [String: String]
+    var installerSHA256: String = ""
+    var applicationSlices: [String: String] = [:]
 }
 
 enum PackageService {
+    static func installerSHA256(_ package: URL) throws -> String {
+        let output = try runTool("/usr/sbin/pkgutil", ["--check-signature", package.path], maximumOutputBytes: InstallerSignature.maximumOutputBytes)
+        try require(output.status == 0, "Das Paket hat keine gültige vertrauenswürdige Installer-Signatur")
+        return try InstallerSignature.leafSHA256(output.text)
+    }
+
+    static func revalidate(_ prepared: PreparedPackage) throws {
+        let policy = try SignerPolicy.embedded()
+        try policy.requireConfigured()
+        try requirePrivateDirectory(prepared.file.deletingLastPathComponent())
+        try rejectSymlinkAncestors(prepared.file)
+        try prepared.candidate.verifyDownload(prepared.file)
+        let signer = try installerSHA256(prepared.file)
+        try require(signer == prepared.installerSHA256, "Die Paketsignatur wurde nach der Prüfung verändert")
+        try policy.validate(installer: signer, applicationSlices: prepared.applicationSlices)
+        try prepared.candidate.verifyDownload(prepared.file)
+    }
+
     static func prepare(_ package: URL, candidate: UpdateCandidate, product: Product, workspace: URL) throws -> PreparedPackage {
+        let policy = try SignerPolicy.embedded()
+        try policy.requireConfigured()
+        try requirePrivateDirectory(workspace)
+        try require(package.deletingLastPathComponent().standardizedFileURL == workspace.standardizedFileURL,
+                    "Das Paket liegt außerhalb des privaten Update-Ordners")
+        try rejectSymlinkAncestors(package)
         try candidate.verifyDownload(package)
-        try verifiedTool("/usr/sbin/pkgutil", ["--check-signature", package.path],
-                         message: "Das Paket hat keine gültige vertrauenswürdige Installer-Signatur.")
+        let installer = try installerSHA256(package)
+        _ = try policy.pair(forInstaller: installer)
         try verifiedTool("/usr/sbin/spctl", ["--assess", "--type", "install", "--verbose=2", package.path],
                          message: "macOS hat dieses Installationspaket nicht freigegeben. Es wird nicht automatisch installiert.")
         let expanded = workspace.appendingPathComponent("expanded-" + UUID().uuidString, isDirectory: true)
@@ -152,10 +189,12 @@ enum PackageService {
         let binary = try FileHandle(forReadingFrom: expected.appendingPathComponent("Contents/MacOS/" + product.rawValue))
         defer { try? binary.close() }
         try product.validateMachO(binary.read(upToCount: 4096) ?? Data())
-        try verifiedTool("/usr/bin/codesign", ["--verify", "--deep", "--strict", expected.path], message: "Plugin-Signatur ist beschädigt")
+        let applicationSlices = try ApplicationSignature.sliceSHA256(expected)
+        try policy.validate(installer: installer, applicationSlices: applicationSlices)
         let fingerprint = try bundleFingerprint(expected)
         try candidate.verifyDownload(package) // The assessed bytes are also the bytes handed to Installer.
-        return PreparedPackage(file: package, candidate: candidate, fingerprint: fingerprint)
+        return PreparedPackage(file: package, candidate: candidate, fingerprint: fingerprint,
+                               installerSHA256: installer, applicationSlices: applicationSlices)
     }
 
     static func installed(_ prepared: PreparedPackage, product: Product) throws -> Bool {
@@ -165,7 +204,8 @@ enum PackageService {
               let info = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
               info["pkg-version"] as? String == prepared.candidate.version.description else { return false }
         try require(try bundleFingerprint(product.systemBundle) == prepared.fingerprint, "Die installierten Plugin-Dateien stimmen nicht mit dem geprüften Paket überein")
-        try verifiedTool("/usr/bin/codesign", ["--verify", "--deep", "--strict", product.systemBundle.path], message: "Die installierte Plugin-Signatur ist ungültig")
+        try SignerPolicy.embedded().validate(installer: prepared.installerSHA256,
+                                            applicationSlices: ApplicationSignature.sliceSHA256(product.systemBundle))
         return true
     }
 

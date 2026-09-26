@@ -11,13 +11,13 @@ Windows on Arm, damit JUCE die VST3-Metadaten mit seinem Zielsystem-Helper erzeu
 
 ## Lizenz und öffentliche Binärverteilung
 
-Der Projektcode steht unter der proprietären [LICENSE](LICENSE). Die eingebundenen
-JUCE-Module sind wahlweise unter AGPLv3 oder einer kommerziellen JUCE-Lizenz
-verfügbar. Vor einer öffentlichen Binärverteilung muss deshalb für genau den
-verwendeten JUCE-Stand entweder die passende kommerzielle Berechtigung dokumentiert
-oder eine mit AGPLv3 vereinbare Lizenzierung einschließlich der erforderlichen
-Hinweise und Quellcodebereitstellung gewählt werden. Das Repository selbst belegt
-keine kommerzielle JUCE-Berechtigung.
+Der eigene Projektcode und die 64 eigenen Factory-Presets stehen unter
+[AGPL-3.0-only](LICENSE). Die Rechte daran wurden vom Projekteigentümer bestätigt.
+Die JUCE-Module werden unter ihrer AGPLv3-Option verwendet; Drittanbieter behalten
+ihre jeweiligen Lizenzen und Hinweise. Siehe [Drittanbieterhinweise](THIRD_PARTY_NOTICES.md).
+Jeder neue öffentliche Binärrelease enthält ein reproduzierbares vollständiges
+Source-ZIP mit dem exakten JUCE-Stand, Build-Skripten, Presets und SPDX-Inventar.
+[Quellarchiv und Wiederaufbau](docs/SOURCE_RELEASE.md) beschreiben die Prüfung.
 
 ## Regler
 

@@ -8,3 +8,5 @@
 /SubLab808-preview.png
 
 /dist/
+__pycache__/
+*.py[cod]

@@ -1,5 +1,6 @@
 #pragma once
 #include "PresetBar.h"
+#include "LicensePanel.h"
 #include <JuceHeader.h>
 #include "PluginProcessor.h"
 
@@ -32,6 +33,8 @@ private:
     std::array<Dial*, 12> dials;
     wk::PresetBar presetBar;
     juce::TextButton updates;
+    juce::TextButton about { "About" };
+    wk::LicensePanel licensePanel;
     juce::ToggleButton oneShotButton { "ONE SHOT" };
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> oneShotAttachment;
     float meter = 0.0f;

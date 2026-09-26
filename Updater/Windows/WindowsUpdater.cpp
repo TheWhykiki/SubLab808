@@ -1,4 +1,5 @@
 #define NOMINMAX 1
+#include "Authenticode.h"
 #include "WindowsUpdater.h"
 #include "UpdaterPolicy.h"
 
@@ -79,14 +80,14 @@
 #define WK_WINDOWS_UPDATER_COMPILE_ONLY 0
 #endif
 
-#if ! WK_WINDOWS_UPDATER_TEST_MODE && ! defined(WK_WINDOWS_UPDATER_SIGNER_SHA256)
-#error "Production updater builds require WK_WINDOWS_UPDATER_SIGNER_SHA256"
+#if ! WK_WINDOWS_UPDATER_TEST_MODE && ! defined(WK_WINDOWS_UPDATER_PROFILE_EKU)
+#error "Production updater builds require WK_WINDOWS_UPDATER_PROFILE_EKU"
 #endif
-#ifndef WK_WINDOWS_UPDATER_SIGNER_SHA256
-#define WK_WINDOWS_UPDATER_SIGNER_SHA256 ""
+#ifndef WK_WINDOWS_UPDATER_PROFILE_EKU
+#define WK_WINDOWS_UPDATER_PROFILE_EKU ""
 #endif
-#ifndef WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256
-#define WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256 ""
+#ifndef WK_WINDOWS_UPDATER_NEXT_PROFILE_EKU
+#define WK_WINDOWS_UPDATER_NEXT_PROFILE_EKU ""
 #endif
 #ifndef WK_WINDOWS_UPDATER_RELEASE_GATE_PUBLIC_KEY_XY
 #error "Updater builds require WK_WINDOWS_UPDATER_RELEASE_GATE_PUBLIC_KEY_XY"
@@ -135,8 +136,8 @@ constexpr std::string_view kOwner = WK_WINDOWS_UPDATER_GITHUB_OWNER;
 constexpr std::string_view kRepository = WK_WINDOWS_UPDATER_GITHUB_REPOSITORY;
 constexpr std::string_view kUpgradeCode = WK_WINDOWS_UPDATER_UPGRADE_CODE;
 constexpr std::string_view kOtherUpgradeCode = WK_WINDOWS_UPDATER_OTHER_UPGRADE_CODE;
-constexpr std::string_view kCurrentSignerSha256 = WK_WINDOWS_UPDATER_SIGNER_SHA256;
-constexpr std::string_view kNextSignerSha256 = WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256;
+constexpr std::string_view kCurrentProfileEku = WK_WINDOWS_UPDATER_PROFILE_EKU;
+constexpr std::string_view kNextProfileEku = WK_WINDOWS_UPDATER_NEXT_PROFILE_EKU;
 constexpr std::string_view kReleaseGatePublicKeyXY =
     WK_WINDOWS_UPDATER_RELEASE_GATE_PUBLIC_KEY_XY;
 constexpr std::string_view kReleaseGateNextPublicKeyXY =
@@ -152,33 +153,12 @@ constexpr bool isUpperHex(char c)
     return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F');
 }
 
-constexpr bool pinsEqualInsensitive(std::string_view left, std::string_view right)
-{
-    if (left.size() != right.size())
-        return false;
-    for (std::size_t index = 0; index < left.size(); ++index)
-    {
-        const auto upper = [] (char c) constexpr
-        {
-            return c >= 'a' && c <= 'f' ? static_cast<char>(c - ('a' - 'A')) : c;
-        };
-        if (upper(left[index]) != upper(right[index])) return false;
-    }
-    return true;
-}
-
 constexpr bool compileTimePinsAreValid()
 {
-    if ((! kTestMode || ! kCurrentSignerSha256.empty())
-        && (kCurrentSignerSha256.size() != 64
-            || ! std::all_of(kCurrentSignerSha256.begin(), kCurrentSignerSha256.end(), isHex)))
+    if ((! kTestMode || ! kCurrentProfileEku.empty()) && ! wk::authenticode::validProfileEku(kCurrentProfileEku))
         return false;
-    if (! kNextSignerSha256.empty()
-        && (kNextSignerSha256.size() != 64
-            || ! std::all_of(kNextSignerSha256.begin(), kNextSignerSha256.end(), isHex)))
-        return false;
-    if (! kNextSignerSha256.empty()
-        && pinsEqualInsensitive(kCurrentSignerSha256, kNextSignerSha256))
+    if (! kNextProfileEku.empty() && (! wk::authenticode::validProfileEku(kNextProfileEku)
+                                     || kCurrentProfileEku == kNextProfileEku))
         return false;
     if (kReleaseGatePublicKeyXY.size() != 128
         || ! std::all_of(kReleaseGatePublicKeyXY.begin(),
@@ -1249,7 +1229,28 @@ int taskDialog(const std::wstring& title, const std::wstring& instruction,
 {
     TASKDIALOGCONFIG config{};
     config.cbSize = sizeof(config);
-    config.dwFlags = TDF_SIZE_TO_CONTENT | TDF_POSITION_RELATIVE_TO_WINDOW;
+    const auto sourceUrl = L"https://github.com/" + widen(kOwner) + L"/" + widen(kRepository)
+                         + L"/releases/tag/v" + widen(kInstalledVersion);
+    const auto license = widen(kProduct) + L" " + widen(kInstalledVersion)
+        + L"\nCopyright © Whykiki Audio\nGNU AGPL-3.0-only. Ohne Gewährleistung."
+        + L"\n<a href=\"https://www.gnu.org/licenses/agpl-3.0.html\">Lizenz lesen</a>"
+        + L"\n<a href=\"" + sourceUrl + L"\">Quellcode dieser Version</a>";
+    config.dwFlags = TDF_SIZE_TO_CONTENT | TDF_POSITION_RELATIVE_TO_WINDOW | TDF_ENABLE_HYPERLINKS;
+    config.pszExpandedControlText = L"Über / Lizenz und Quellcode";
+    config.pszCollapsedControlText = L"Lizenzdetails schließen";
+    config.pszExpandedInformation = license.c_str();
+    config.lpCallbackData = reinterpret_cast<LONG_PTR>(&sourceUrl);
+    config.pfCallback = [] (HWND window, UINT notification, WPARAM, LPARAM parameter, LONG_PTR data) -> HRESULT
+    {
+        if (notification == TDN_HYPERLINK_CLICKED && parameter != 0)
+        {
+            const std::wstring_view link(reinterpret_cast<const wchar_t*>(parameter));
+            const auto& source = *reinterpret_cast<const std::wstring*>(data);
+            if (link == source || link == L"https://www.gnu.org/licenses/agpl-3.0.html")
+                ShellExecuteW(window, L"open", reinterpret_cast<const wchar_t*>(parameter), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        return S_OK;
+    };
     config.dwCommonButtons = buttons;
     config.pszWindowTitle = title.c_str();
     config.pszMainInstruction = instruction.c_str();
@@ -1565,94 +1566,33 @@ void downloadMsi(const Release& release, const Path& finalPath)
     }
 }
 
-std::string certificateThumbprint(const Path& path)
-{
-    HCERTSTORE store{};
-    HCRYPTMSG message{};
-    DWORD encoding{}, content{}, format{};
-    const auto queried = CryptQueryObject(CERT_QUERY_OBJECT_FILE, path.c_str(),
-                                          CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
-                                          CERT_QUERY_FORMAT_FLAG_BINARY, 0,
-                                          &encoding, &content, &format, &store, &message, nullptr);
-    CertificateStore storeOwner(store);
-    CryptMessage messageOwner(message);
-    require(queried, winError("Cannot read Authenticode signer"));
-    DWORD signerBytes{};
-    require(CryptMsgGetParam(messageOwner.get(), CMSG_SIGNER_INFO_PARAM, 0, nullptr, &signerBytes),
-            winError("Cannot size Authenticode signer"));
-    std::vector<unsigned char> signerStorage(signerBytes);
-    require(CryptMsgGetParam(messageOwner.get(), CMSG_SIGNER_INFO_PARAM, 0,
-                             signerStorage.data(), &signerBytes),
-            winError("Cannot read Authenticode signer"));
-    auto* signer = reinterpret_cast<CMSG_SIGNER_INFO*>(signerStorage.data());
-    CERT_INFO certificateInfo{};
-    certificateInfo.Issuer = signer->Issuer;
-    certificateInfo.SerialNumber = signer->SerialNumber;
-    PCCERT_CONTEXT certificate = CertFindCertificateInStore(
-        storeOwner.get(), X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0, CERT_FIND_SUBJECT_CERT,
-        &certificateInfo, nullptr);
-    require(certificate != nullptr, winError("Cannot resolve Authenticode certificate"));
-    CertificateContext certificateOwner(certificate);
-    std::array<unsigned char, 32> digest{};
-    DWORD digestBytes = static_cast<DWORD>(digest.size());
-    const auto gotDigest = CertGetCertificateContextProperty(certificateOwner.get(), CERT_SHA256_HASH_PROP_ID,
-                                                              digest.data(), &digestBytes);
-    require(gotDigest && digestBytes == digest.size(), winError("Cannot hash Authenticode certificate"));
-    constexpr char alphabet[] = "0123456789ABCDEF";
-    std::string result;
-    result.reserve(64);
-    for (const auto byte : digest)
-    {
-        result.push_back(alphabet[byte >> 4]);
-        result.push_back(alphabet[byte & 0x0f]);
-    }
-    return result;
-}
-
 std::string trustedAuthenticodeSigner(const Path& path)
 {
-    WINTRUST_FILE_INFO fileInfo{};
-    fileInfo.cbStruct = sizeof(fileInfo);
-    fileInfo.pcwszFilePath = path.c_str();
-    WINTRUST_DATA trust{};
-    trust.cbStruct = sizeof(trust);
-    trust.dwUIChoice = WTD_UI_NONE;
-    trust.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN;
-    trust.dwUnionChoice = WTD_CHOICE_FILE;
-    trust.pFile = &fileInfo;
-    trust.dwStateAction = WTD_STATEACTION_VERIFY;
-    trust.dwProvFlags = WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT | WTD_SAFER_FLAG;
-    GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
-    const auto status = WinVerifyTrust(nullptr, &action, &trust);
-    trust.dwStateAction = WTD_STATEACTION_CLOSE;
-    WinVerifyTrust(nullptr, &action, &trust);
-    require(status == ERROR_SUCCESS, "WinVerifyTrust rejected " + narrow(path.wstring())
-                                      + " with status " + std::to_string(status));
     require(! kTestMode, "Test-mode binaries are never trusted for installation");
-    return upperAscii(certificateThumbprint(path));
+    return wk::authenticode::verify(path, kCurrentProfileEku, kNextProfileEku).profileEku;
 }
 
 bool isAllowedPayloadSigner(std::string_view signer)
 {
     return constantTimeEqual(upperAscii(std::string(signer)),
-                             upperAscii(std::string(kCurrentSignerSha256)))
-        || (! kNextSignerSha256.empty()
+                             upperAscii(std::string(kCurrentProfileEku)))
+        || (! kNextProfileEku.empty()
             && constantTimeEqual(upperAscii(std::string(signer)),
-                                 upperAscii(std::string(kNextSignerSha256))));
+                                 upperAscii(std::string(kNextProfileEku))));
 }
 
 void verifyAuthenticodeCurrentSigner(const Path& path)
 {
     require(constantTimeEqual(trustedAuthenticodeSigner(path),
-                              upperAscii(std::string(kCurrentSignerSha256))),
-            "Authenticode signer does not match the current updater certificate pin");
+                              upperAscii(std::string(kCurrentProfileEku))),
+            "Authenticode signer does not match the current updater profile EKU");
 }
 
 std::string verifyAuthenticodeAllowedPayload(const Path& path)
 {
     const auto signer = trustedAuthenticodeSigner(path);
     require(isAllowedPayloadSigner(signer),
-            "Authenticode signer is outside the updater payload certificate allowlist");
+            "Authenticode signer is outside the updater payload profile EKU allowlist");
     return signer;
 }
 
@@ -1940,20 +1880,15 @@ void verifyMsiDatabase(const Path& path, const SemVersion& version)
                     std::string("MSI contains a forbidden side-effect action in ") + sequenceTable);
     }
 
-    std::map<std::string, int> sequence;
+    std::vector<MsiSequenceRow> sequence;
     for (const auto& row : msiRows(database.get(),
-                                   L"SELECT `Action`, `Sequence` FROM `InstallExecuteSequence`"))
+            L"SELECT `Action`, `Condition`, `Sequence` FROM `InstallExecuteSequence`"))
     {
-        if (row.size() != 2) continue;
-        int value{};
-        const auto [end, error] = std::from_chars(row[1].data(), row[1].data() + row[1].size(), value);
-        if (error == std::errc{} && end == row[1].data() + row[1].size()) sequence[row[0]] = value;
+        require(row.size() == 3, "Malformed MSI execute sequence row");
+        sequence.push_back({ row[0], row[1], row[2] });
     }
-    require(sequence.contains("InstallInitialize") && sequence.contains("RemoveExistingProducts")
-                && sequence.contains("InstallFiles")
-                && sequence["RemoveExistingProducts"] > sequence["InstallInitialize"]
-                && sequence["RemoveExistingProducts"] < sequence["InstallFiles"],
-            "MSI major-upgrade sequence is not rollback-safe");
+    require(hasSafeMsiExecuteSequence(sequence),
+            "MSI detection/launch-condition/major-upgrade sequence is unsafe");
 }
 
 std::size_t msiPayloadFileCount(const Path& path)
@@ -2561,8 +2496,8 @@ bool compiledBuildIdentityMatches(std::string_view product,
                                   std::string_view architecture,
                                   std::string_view upgradeCode,
                                   std::string_view otherUpgradeCode,
-                                  std::string_view currentSignerSha256,
-                                  std::string_view nextSignerSha256,
+                                  std::string_view currentProfileEku,
+                                  std::string_view nextProfileEku,
                                   std::string_view releaseGatePublicKeyXY = kReleaseGatePublicKeyXY,
                                   std::string_view releaseGateNextPublicKeyXY = kReleaseGateNextPublicKeyXY)
 {
@@ -2574,12 +2509,12 @@ bool compiledBuildIdentityMatches(std::string_view product,
         && toString(*parsedVersion) == kInstalledVersion
         && isCanonicalGuid(kUpgradeCode) && isCanonicalGuid(kOtherUpgradeCode)
         && kUpgradeCode != kOtherUpgradeCode
-        && (kTestMode ? kCurrentSignerSha256.empty() || isSha256Hex(kCurrentSignerSha256)
-                      : isSha256Hex(kCurrentSignerSha256))
-        && (kNextSignerSha256.empty() || isSha256Hex(kNextSignerSha256))
-        && (kNextSignerSha256.empty()
-            || ! constantTimeEqual(upperAscii(std::string(kCurrentSignerSha256)),
-                                   upperAscii(std::string(kNextSignerSha256))))
+        && (kTestMode ? kCurrentProfileEku.empty() || wk::authenticode::validProfileEku(kCurrentProfileEku)
+                      : wk::authenticode::validProfileEku(kCurrentProfileEku))
+        && (kNextProfileEku.empty() || wk::authenticode::validProfileEku(kNextProfileEku))
+        && (kNextProfileEku.empty()
+            || ! constantTimeEqual(upperAscii(std::string(kCurrentProfileEku)),
+                                   upperAscii(std::string(kNextProfileEku))))
         && isP256PublicKeyXYHex(kReleaseGatePublicKeyXY)
         && p256PublicKeyIsOnCurve(kReleaseGatePublicKeyXY)
         && (kReleaseGateNextPublicKeyXY.empty()
@@ -2595,10 +2530,10 @@ bool compiledBuildIdentityMatches(std::string_view product,
         && architecture == architectureAssetSuffix(kArchitecture)
         && upgradeCode == kUpgradeCode
         && otherUpgradeCode == kOtherUpgradeCode
-        && upperAscii(std::string(currentSignerSha256))
-            == upperAscii(std::string(kCurrentSignerSha256))
-        && upperAscii(std::string(nextSignerSha256))
-            == upperAscii(std::string(kNextSignerSha256))
+        && upperAscii(std::string(currentProfileEku))
+            == upperAscii(std::string(kCurrentProfileEku))
+        && upperAscii(std::string(nextProfileEku))
+            == upperAscii(std::string(kNextProfileEku))
         && releaseGatePublicKeyXY == kReleaseGatePublicKeyXY
         && releaseGateNextPublicKeyXY == kReleaseGateNextPublicKeyXY;
 }
@@ -2611,8 +2546,8 @@ bool buildContractMatches(std::string_view product,
                           std::string_view architecture,
                           std::string_view upgradeCode,
                           std::string_view otherUpgradeCode,
-                          std::string_view currentSignerSha256,
-                          std::string_view nextSignerSha256,
+                          std::string_view currentProfileEku,
+                          std::string_view nextProfileEku,
                           std::string_view releaseGatePublicKeyXY = kReleaseGatePublicKeyXY,
                           std::string_view releaseGateNextPublicKeyXY = kReleaseGateNextPublicKeyXY)
 {
@@ -2621,8 +2556,8 @@ bool buildContractMatches(std::string_view product,
     return ! kTestMode && ! kCompileOnly
         && compiledBuildIdentityMatches(product, version, manufacturer, githubOwner,
                                         githubRepository, architecture, upgradeCode,
-                                        otherUpgradeCode, currentSignerSha256,
-                                        nextSignerSha256, releaseGatePublicKeyXY,
+                                        otherUpgradeCode, currentProfileEku,
+                                        nextProfileEku, releaseGatePublicKeyXY,
                                         releaseGateNextPublicKeyXY);
 }
 
@@ -2639,8 +2574,8 @@ std::string canonicalBuildContractResponse(std::string_view challenge, DWORD ser
         + "\",\"architecture\":\"" + architectureAssetSuffix(kArchitecture)
         + "\",\"upgradeCode\":\"" + std::string(kUpgradeCode)
         + "\",\"otherUpgradeCode\":\"" + std::string(kOtherUpgradeCode)
-        + "\",\"currentSignerSha256\":\"" + upperAscii(std::string(kCurrentSignerSha256))
-        + "\",\"nextSignerSha256\":\"" + upperAscii(std::string(kNextSignerSha256))
+        + "\",\"currentProfileEku\":\"" + upperAscii(std::string(kCurrentProfileEku))
+        + "\",\"nextProfileEku\":\"" + upperAscii(std::string(kNextProfileEku))
         + "\",\"releaseGatePublicKeyXY\":\"" + std::string(kReleaseGatePublicKeyXY)
         + "\",\"releaseGateNextPublicKeyXY\":\"" + std::string(kReleaseGateNextPublicKeyXY)
         + "\"}\n";
@@ -2683,7 +2618,7 @@ std::optional<int> validateBuildContractCommandLine() noexcept
             L"--challenge", L"--response-pipe", L"--parent-process-id",
             L"--product", L"--version", L"--manufacturer", L"--github-owner",
             L"--github-repository", L"--architecture", L"--upgrade-code",
-            L"--other-upgrade-code", L"--current-signer-sha256", L"--next-signer-sha256",
+            L"--other-upgrade-code", L"--current-profile-eku", L"--next-profile-eku",
             L"--release-gate-public-key-xy", L"--release-gate-next-public-key-xy"
         };
         if (count != 2 + static_cast<int>(flags.size()) * 2) return 2;
@@ -3063,12 +2998,12 @@ void validateConfiguration()
                 && kUpgradeCode != kOtherUpgradeCode,
             "Updater UpgradeCodes are missing, malformed or identical");
     if (! kTestMode)
-        require(isSha256Hex(kCurrentSignerSha256), "Production current signer pin is invalid");
-    require(kNextSignerSha256.empty() || isSha256Hex(kNextSignerSha256),
+        require(wk::authenticode::validProfileEku(kCurrentProfileEku), "Production current signer pin is invalid");
+    require(kNextProfileEku.empty() || wk::authenticode::validProfileEku(kNextProfileEku),
             "Optional next signer pin is invalid");
-    require(kNextSignerSha256.empty()
-                || ! constantTimeEqual(upperAscii(std::string(kCurrentSignerSha256)),
-                                       upperAscii(std::string(kNextSignerSha256))),
+    require(kNextProfileEku.empty()
+                || ! constantTimeEqual(upperAscii(std::string(kCurrentProfileEku)),
+                                       upperAscii(std::string(kNextProfileEku))),
             "Current and next signer pins must be distinct");
     require(isP256PublicKeyXYHex(kReleaseGatePublicKeyXY)
                 && p256PublicKeyIsOnCurve(kReleaseGatePublicKeyXY),
@@ -3387,6 +3322,18 @@ int runWindowsUpdater()
 }
 
 #if defined(WK_WINDOWS_UPDATER_TEST_MODE) && WK_WINDOWS_UPDATER_TEST_MODE
+int probeWindowsMsiDatabase(const wchar_t* path, const wchar_t* version)
+{
+    try
+    {
+        const auto parsed = parseVersion(narrow(version));
+        require(parsed.has_value(), "Invalid MSI probe version");
+        verifyMsiDatabase(Path(path), *parsed);
+        return 0;
+    }
+    catch (const std::exception&) { return 1; }
+}
+
 int runWindowsUpdaterSelfTests()
 {
     try
@@ -3396,79 +3343,79 @@ int runWindowsUpdaterSelfTests()
         require(compiledBuildIdentityMatches(kProduct, kInstalledVersion,
                                              kManufacturer, kOwner, kRepository,
                                              architectureAssetSuffix(kArchitecture), kUpgradeCode,
-                                             kOtherUpgradeCode, kCurrentSignerSha256,
-                                             kNextSignerSha256),
+                                             kOtherUpgradeCode, kCurrentProfileEku,
+                                             kNextProfileEku),
                 "Compiled build-contract identity does not match itself");
         require(! buildContractMatches(kProduct, kInstalledVersion,
                                        kManufacturer, kOwner, kRepository,
                                        architectureAssetSuffix(kArchitecture), kUpgradeCode,
-                                       kOtherUpgradeCode, kCurrentSignerSha256,
-                                       kNextSignerSha256),
+                                       kOtherUpgradeCode, kCurrentProfileEku,
+                                       kNextProfileEku),
                 "Test-mode executable was allowed to certify a distribution build");
         require(! compiledBuildIdentityMatches("WrongProduct", kInstalledVersion,
                                                kManufacturer, kOwner, kRepository,
                                                architectureAssetSuffix(kArchitecture), kUpgradeCode,
-                                               kOtherUpgradeCode, kCurrentSignerSha256,
-                                               kNextSignerSha256),
+                                               kOtherUpgradeCode, kCurrentProfileEku,
+                                               kNextProfileEku),
                 "Build-contract product mutation was accepted");
         require(! compiledBuildIdentityMatches(kProduct, kInstalledVersion,
                                                "Wrong Manufacturer", kOwner, kRepository,
                                                architectureAssetSuffix(kArchitecture), kUpgradeCode,
-                                               kOtherUpgradeCode, kCurrentSignerSha256,
-                                               kNextSignerSha256),
+                                               kOtherUpgradeCode, kCurrentProfileEku,
+                                               kNextProfileEku),
                 "Build-contract manufacturer mutation was accepted");
         require(! compiledBuildIdentityMatches(kProduct, kInstalledVersion,
                                                kManufacturer, "WrongOwner", kRepository,
                                                architectureAssetSuffix(kArchitecture), kUpgradeCode,
-                                               kOtherUpgradeCode, kCurrentSignerSha256,
-                                               kNextSignerSha256),
+                                               kOtherUpgradeCode, kCurrentProfileEku,
+                                               kNextProfileEku),
                 "Build-contract owner mutation was accepted");
         require(! compiledBuildIdentityMatches(kProduct, kInstalledVersion,
                                                kManufacturer, kOwner, "WrongRepository",
                                                architectureAssetSuffix(kArchitecture), kUpgradeCode,
-                                               kOtherUpgradeCode, kCurrentSignerSha256,
-                                               kNextSignerSha256),
+                                               kOtherUpgradeCode, kCurrentProfileEku,
+                                               kNextProfileEku),
                 "Build-contract repository mutation was accepted");
         require(! compiledBuildIdentityMatches(kProduct, kInstalledVersion,
                                                kManufacturer, kOwner, kRepository,
                                                architectureAssetSuffix(kArchitecture), kOtherUpgradeCode,
-                                               kUpgradeCode, kCurrentSignerSha256,
-                                               kNextSignerSha256),
+                                               kUpgradeCode, kCurrentProfileEku,
+                                               kNextProfileEku),
                 "Build-contract UpgradeCode mutation was accepted");
         require(! compiledBuildIdentityMatches(kProduct, "255.255.65535",
                                                kManufacturer, kOwner, kRepository,
                                                architectureAssetSuffix(kArchitecture), kUpgradeCode,
-                                               kOtherUpgradeCode, kCurrentSignerSha256,
-                                               kNextSignerSha256),
+                                               kOtherUpgradeCode, kCurrentProfileEku,
+                                               kNextProfileEku),
                 "Build-contract version mutation was accepted");
         require(! compiledBuildIdentityMatches(kProduct, kInstalledVersion,
                                                kManufacturer, kOwner, kRepository,
                                                kArchitecture == Architecture::x64 ? "arm64ec" : "x64",
                                                kUpgradeCode, kOtherUpgradeCode,
-                                               kCurrentSignerSha256, kNextSignerSha256),
+                                               kCurrentProfileEku, kNextProfileEku),
                 "Build-contract architecture mutation was accepted");
         require(! compiledBuildIdentityMatches(kProduct, kInstalledVersion,
                                                kManufacturer, kOwner, kRepository,
                                                architectureAssetSuffix(kArchitecture), kUpgradeCode,
-                                               kOtherUpgradeCode, "00", kNextSignerSha256),
+                                               kOtherUpgradeCode, "00", kNextProfileEku),
                 "Build-contract current-signer mutation was accepted");
         require(! compiledBuildIdentityMatches(kProduct, kInstalledVersion,
                                                kManufacturer, kOwner, kRepository,
                                                architectureAssetSuffix(kArchitecture), kUpgradeCode,
-                                               kOtherUpgradeCode, kCurrentSignerSha256, "00"),
+                                               kOtherUpgradeCode, kCurrentProfileEku, "00"),
                 "Build-contract next-signer mutation was accepted");
         require(! compiledBuildIdentityMatches(kProduct, kInstalledVersion,
                                                kManufacturer, kOwner, kRepository,
                                                architectureAssetSuffix(kArchitecture), kUpgradeCode,
-                                               kOtherUpgradeCode, kCurrentSignerSha256,
-                                               kNextSignerSha256, "00",
+                                               kOtherUpgradeCode, kCurrentProfileEku,
+                                               kNextProfileEku, "00",
                                                kReleaseGateNextPublicKeyXY),
                 "Build-contract release-gate current-key mutation was accepted");
         require(! compiledBuildIdentityMatches(kProduct, kInstalledVersion,
                                                kManufacturer, kOwner, kRepository,
                                                architectureAssetSuffix(kArchitecture), kUpgradeCode,
-                                               kOtherUpgradeCode, kCurrentSignerSha256,
-                                               kNextSignerSha256, kReleaseGatePublicKeyXY, "00"),
+                                               kOtherUpgradeCode, kCurrentProfileEku,
+                                               kNextProfileEku, kReleaseGatePublicKeyXY, "00"),
                 "Build-contract release-gate next-key mutation was accepted");
         require(p256PublicKeyIsOnCurve(kReleaseGatePublicKeyXY)
                     && (kReleaseGateNextPublicKeyXY.empty()

@@ -58,6 +58,14 @@ SubLab808Editor::SubLab808Editor(SubLab808Processor& p)
     addAndMakeVisible(presetBar);
     wk::configureUpdaterButton(updates, "SubLab808", SUBLAB808_VERSION_STRING);
     addAndMakeVisible(updates);
+    licensePanel.configure("SubLab808", SUBLAB808_VERSION_STRING);
+    addChildComponent(licensePanel);
+    about.onClick = [this] {
+        licensePanel.setVisible(true);
+        licensePanel.toFront(true);
+    };
+    about.setTooltip("Version, licence and complete source");
+    addAndMakeVisible(about);
     oneShotButton.setColour(juce::ToggleButton::textColourId, juce::Colour(0xffaab4bd));
     oneShotButton.setColour(juce::ToggleButton::tickColourId, juce::Colour(0xffff4f2e));
     oneShotButton.setTitle("One Shot playback mode");
@@ -122,6 +130,8 @@ void SubLab808Editor::resized()
 {
     presetBar.setBounds(30, 88, getWidth() - 60, 36);
     updates.setBounds(getWidth() - 120, getHeight() - 26, 90, 20);
+    about.setBounds(getWidth() - 192, getHeight() - 26, 64, 20);
+    licensePanel.setBounds(getLocalBounds().withSizeKeepingCentre(560, 300));
     oneShotButton.setBounds(getWidth() - 265, 31, 115, 28);
     auto area = getLocalBounds().reduced(36).withTrimmedTop(113).withTrimmedBottom(12);
     auto rowHeight = area.getHeight() / 2;

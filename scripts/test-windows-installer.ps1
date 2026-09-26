@@ -35,9 +35,9 @@ param(
     [string] $ExpectedOtherArchitectureUpgradeCode,
 
     [Parameter(Mandatory = $true)]
-    [string] $ExpectedSignerSha256,
+    [string] $ExpectedProfileEku,
 
-    [string] $ExpectedNextSignerSha256,
+    [string] $ExpectedNextProfileEku,
 
     [Parameter(Mandatory = $true)]
     [string] $ExpectedReleaseGatePublicKeyXY,
@@ -53,6 +53,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'artifact-signing.ps1')
 
 if (-not $IsWindows) {
     throw 'The installed-MSI acceptance gate must run on Windows.'
@@ -490,15 +491,15 @@ Assert-Condition ($normalizedExpectedUpgradeCode -cne $normalizedExpectedOtherUp
 $architectureMsiContract = if ($Architecture -ceq 'x64') { 'x64' } else { 'arm64' }
 Assert-Condition ($ExpectedMsiArchitecture -ceq $architectureMsiContract) `
     'ExpectedMsiArchitecture is inconsistent with the artifact architecture.'
-$expectedPin = $ExpectedSignerSha256.Replace(' ', '').ToUpperInvariant()
-Assert-Condition ($expectedPin -cmatch '^[0-9A-F]{64}$') `
-    'ExpectedSignerSha256 must be exactly 64 hexadecimal characters.'
-$expectedNextPin = ([string]$ExpectedNextSignerSha256).Replace(' ', '').ToUpperInvariant()
+$expectedPin = $ExpectedProfileEku.Replace(' ', '').ToUpperInvariant()
+Assert-Condition ((Test-ArtifactSigningProfileEku $expectedPin)) `
+    'ExpectedProfileEku must be a complete Public Trust identity OID.'
+$expectedNextPin = ([string]$ExpectedNextProfileEku).Replace(' ', '').ToUpperInvariant()
 Assert-Condition ([string]::IsNullOrEmpty($expectedNextPin) -or
-                  $expectedNextPin -cmatch '^[0-9A-F]{64}$') `
-    'ExpectedNextSignerSha256 must be empty or exactly 64 hexadecimal characters.'
+                  (Test-ArtifactSigningProfileEku $expectedNextPin)) `
+    'ExpectedNextProfileEku must be empty or a complete Public Trust identity OID.'
 Assert-Condition ([string]::IsNullOrEmpty($expectedNextPin) -or $expectedNextPin -cne $expectedPin) `
-    'ExpectedNextSignerSha256 must differ from ExpectedSignerSha256.'
+    'ExpectedNextProfileEku must differ from ExpectedProfileEku.'
 $expectedReleaseGatePublicKey = [string]$ExpectedReleaseGatePublicKeyXY
 Assert-Condition ($expectedReleaseGatePublicKey -cmatch '^[0-9A-F]{128}\z') `
     'ExpectedReleaseGatePublicKeyXY must be exactly 128 uppercase hexadecimal characters.'
@@ -553,7 +554,7 @@ try {
         [System.IO.FileAccess]::Read,
         [System.IO.FileShare]::Read)
     $evidence = Get-Content -LiteralPath $resolvedEvidence -Raw -Encoding utf8 | ConvertFrom-Json
-    Assert-Condition ($evidence.schemaVersion -eq 4) 'Unsupported Windows installer evidence schema.'
+    Assert-Condition ($evidence.schemaVersion -eq 5 -and $evidence.releaseContractVersion -eq 2) 'Unsupported Windows installer evidence schema.'
     Assert-Condition ([string]$evidence.artifactStatus -ceq 'SIGNED' -and
                       $evidence.signed -is [bool] -and $evidence.signed) `
         'Installed-MSI acceptance requires a signed production candidate.'
@@ -580,15 +581,16 @@ try {
         'Evidence ProductCode is not a canonical uppercase GUID.'
     $productCode = ([guid]$evidence.productCode).ToString('B').ToUpperInvariant()
 
-    $evidenceSigner = ([string]$evidence.signerCertificateSha256).Replace(' ', '').ToUpperInvariant()
-    $updaterPin = ([string]$evidence.updaterCurrentSignerSha256).Replace(' ', '').ToUpperInvariant()
-    $updaterNextPin = ([string]$evidence.updaterNextSignerSha256).Replace(' ', '').ToUpperInvariant()
+    $evidenceSigner = [string]$evidence.signingProfileEku
+    Assert-Condition ([string]$evidence.signerCertificateSha256 -cmatch '^[0-9A-F]{64}$') 'MSI leaf evidence is malformed.'
+    $updaterPin = ([string]$evidence.updaterCurrentProfileEku).Replace(' ', '').ToUpperInvariant()
+    $updaterNextPin = ([string]$evidence.updaterNextProfileEku).Replace(' ', '').ToUpperInvariant()
     $expectedAllowlist = if ([string]::IsNullOrEmpty($expectedNextPin)) {
         @($expectedPin)
     } else {
         @($expectedPin, $expectedNextPin)
     }
-    [string[]]$evidenceAllowlist = @($evidence.payloadSignerAllowlistSha256)
+    [string[]]$evidenceAllowlist = @($evidence.payloadProfileEkuAllowlist)
     $allowlistMatches = $evidenceAllowlist.Count -eq $expectedAllowlist.Count
     if ($allowlistMatches) {
         for ($index = 0; $index -lt $expectedAllowlist.Count; ++$index) {
@@ -647,16 +649,9 @@ try {
     Assert-Condition ([string]$evidence.msiSha256 -ceq $actualMsiHash) `
         'MSI bytes do not match the signed evidence.'
 
-    $signature = Get-AuthenticodeSignature -LiteralPath $resolvedMsi
-    Assert-Condition ($signature.Status -eq [System.Management.Automation.SignatureStatus]::Valid -and
-                      $null -ne $signature.SignerCertificate) `
-        "MSI Authenticode signature is invalid: $($signature.Status)"
-    Assert-Condition ($null -ne $signature.TimeStamperCertificate) `
-        'MSI has no inspectable Authenticode timestamp certificate.'
-    $actualSigner = $signature.SignerCertificate.GetCertHashString(
-        [System.Security.Cryptography.HashAlgorithmName]::SHA256).ToUpperInvariant()
-    Assert-Condition ($actualSigner -ceq $expectedPin) `
-        'MSI Authenticode signer does not match the configured SHA-256 leaf pin.'
+    $signature = Assert-ArtifactSigningIdentity $resolvedMsi $expectedPin
+    Assert-Condition ($signature.SignerSha256 -ceq [string]$evidence.signerCertificateSha256) `
+        'MSI signer leaf does not match the recorded release evidence.'
     $msiIdentity = Get-MsiIdentityContract $resolvedMsi $Product $Architecture `
         $ExpectedVersion $ExpectedManufacturer $normalizedExpectedUpgradeCode `
         $normalizedExpectedOtherUpgradeCode $ExpectedMsiArchitecture

@@ -20,6 +20,8 @@ import sys
 import tempfile
 import uuid
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from release_contract import ContractError, load_product, verify_product_projection
 
 class ReleaseError(RuntimeError):
     pass
@@ -110,6 +112,30 @@ def source_inputs(root):
     from their actual checked-out commits, not merely the parent gitlink.
     """
     files, repositories = {}, []
+    if not (root / ".git").exists():
+        # Corresponding-source ZIPs deliberately contain no Git internals. Their
+        # complete manifest replaces local Git metadata for unsigned rebuilds.
+        from source_release import MANIFEST, SourceError, strict_json, verify_tree
+        try:
+            archive_manifest = verify_tree(root)
+            for entry in archive_manifest["files"]:
+                data = (root / entry["path"]).read_bytes()
+                if len(data) != entry["size"] or digest(data) != entry["sha256"]:
+                    raise ReleaseError("Source archive changed while preparing the snapshot")
+                files[entry["path"]] = (data, entry["mode"])
+            manifest_bytes = (root / MANIFEST).read_bytes()
+            if strict_json(manifest_bytes) != archive_manifest:
+                raise ReleaseError("Source manifest changed while preparing the snapshot")
+            files[MANIFEST] = (manifest_bytes, 0o644)
+        except (SourceError, ContractError, OSError, KeyError) as error:
+            raise ReleaseError(f"A gitless build requires an intact corresponding-source archive: {error}") from error
+        repositories = [{"path": ".", "commit": archive_manifest["commit"], "dirty": False},
+                        {"path": "external/JUCE", "commit": archive_manifest["juceCommit"], "dirty": False}]
+        records = [{"path": name, "sha256": digest(data), "mode": oct(mode)}
+                   for name, (data, mode) in sorted(files.items())]
+        return files, {"schema": 1, "repositories": repositories, "files": records,
+                       "source_sha256": digest(json.dumps(records, sort_keys=True).encode()),
+                       "origin": "verified-source-archive", "archive_source_sha256": archive_manifest["sourceSha256"]}
 
     def collect(repo, prefix):
         repositories.append({"path": prefix or ".", "commit": git(repo, "rev-parse", "HEAD").strip(),
@@ -117,7 +143,7 @@ def source_inputs(root):
         tracked = git(repo, "ls-files", "--cached", "-z").split("\0")
         additional = git(repo, "ls-files", "--others", "--exclude-standard", "-z", "--",
                          "Source", "Tests", "scripts", "cmake", ".github", "CMakeLists.txt",
-                         "Presets", "Resources", "Assets", "Updater").split("\0")
+                         "Presets", "Resources", "Assets", "Updater", "release", "Installer").split("\0")
         for name in sorted(set(tracked + additional) - {""}):
             relative = Path(name)
             if relative.is_absolute() or ".." in relative.parts:
@@ -160,44 +186,63 @@ def snapshot_source(root, destination):
 def validate_options(root, configuration, version_override, environment):
     if configuration != "Release":
         raise ReleaseError("Distribution packaging accepts only the Release configuration")
-    match = re.search(r"^project\(SubLab808 VERSION ([0-9]+\.[0-9]+\.[0-9]+)\b",
-                      (root / "CMakeLists.txt").read_text(), re.MULTILINE)
-    if not match:
-        raise ReleaseError("Cannot determine the CMake project version")
-    version = match.group(1)
+    try:
+        product = verify_product_projection(root)
+    except (ContractError, OSError) as error:
+        raise ReleaseError(str(error)) from error
+    version = product["version"]
+    prefix = product["productName"].upper()
     if version_override and version_override != version:
         raise ReleaseError("Requested version must match CMakeLists.txt; change the project version first")
-    app = environment.get("SUBLAB808_APPLICATION_IDENTITY", "").strip()
-    installer = environment.get("SUBLAB808_INSTALLER_IDENTITY", "").strip()
-    notary = environment.get("SUBLAB808_NOTARY_PROFILE", "").strip()
-    notary_keychain_value = environment.get("SUBLAB808_NOTARY_KEYCHAIN", "").strip()
+    app = environment.get(prefix + "_APPLICATION_IDENTITY", "").strip()
+    installer = environment.get(prefix + "_INSTALLER_IDENTITY", "").strip()
+    notary = environment.get(prefix + "_NOTARY_PROFILE", "").strip()
+    notary_keychain_value = environment.get(prefix + "_NOTARY_KEYCHAIN", "").strip()
     if bool(app) != bool(installer) or (notary and not (app and installer)):
         raise ReleaseError("Signed/notarized releases require both application and installer identities")
     if bool(notary) != bool(notary_keychain_value):
         raise ReleaseError("Notarization requires both a profile and its explicit keychain path")
     if app == "-" or installer == "-":
         raise ReleaseError("For ad-hoc builds leave both identities unset; '-' is not a distribution identity")
+    signer_configuration(environment, required=bool(app or installer))
     notary_keychain = None
     if notary_keychain_value:
         candidate_keychain = Path(notary_keychain_value)
         if (not candidate_keychain.is_absolute() or candidate_keychain.is_symlink()
                 or not candidate_keychain.is_file()):
-            raise ReleaseError("SUBLAB808_NOTARY_KEYCHAIN must be an existing absolute regular file")
+            raise ReleaseError(prefix + "_NOTARY_KEYCHAIN must be an existing absolute regular file")
         notary_keychain = str(candidate_keychain.resolve(strict=True))
-    jobs = environment.get("SUBLAB808_BUILD_JOBS", "2")
+    jobs = environment.get(prefix + "_BUILD_JOBS", "2")
     if not jobs.isdigit() or not 1 <= int(jobs) <= 64:
-        raise ReleaseError("SUBLAB808_BUILD_JOBS must be an integer between 1 and 64")
+        raise ReleaseError(prefix + "_BUILD_JOBS must be an integer between 1 and 64")
     if (root / "dist").is_symlink():
         raise ReleaseError("Refusing a symlinked dist directory")
     return version, app, installer, notary, notary_keychain, jobs
 
 
-def validate_bundle(bundle, version, runner):
+def signer_configuration(environment, *, required=False):
+    variables = ("MACOS_DEVELOPER_ID_APPLICATION_CERT_SHA256", "MACOS_DEVELOPER_ID_INSTALLER_CERT_SHA256",
+                 "MACOS_NEXT_DEVELOPER_ID_APPLICATION_CERT_SHA256", "MACOS_NEXT_DEVELOPER_ID_INSTALLER_CERT_SHA256")
+    pins = [environment.get(variable, "").lower() for variable in variables]
+    if any(value and not re.fullmatch(r"[0-9a-f]{64}", value) for value in pins):
+        raise ReleaseError("macOS certificate pins must be exactly 64 hexadecimal characters")
+    app, installer, next_app, next_installer = pins
+    if bool(app) != bool(installer) or bool(next_app) != bool(next_installer) or (next_app and not app):
+        raise ReleaseError("macOS application/installer pins must be complete current and optional next pairs")
+    if next_app and (app, installer) == (next_app, next_installer):
+        raise ReleaseError("Next macOS signer pair must differ from the current pair")
+    if required and not app:
+        raise ReleaseError("Signed distribution requires embedded macOS application and installer certificate pins")
+    return dict(zip(("currentApplication", "currentInstaller", "nextApplication", "nextInstaller"), pins))
+
+
+def validate_bundle(bundle, version, runner, expected_pins=None):
+    product = bundle.stem
     with (bundle / "Contents/Info.plist").open("rb") as source:
         metadata = plistlib.load(source)
     if metadata.get("CFBundleShortVersionString") != version:
         raise ReleaseError("Built bundle version does not match the source snapshot")
-    binary = bundle / "Contents/MacOS/SubLab808"
+    binary = bundle / f"Contents/MacOS/{product}"
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise ReleaseError("Missing or non-executable VST3 binary")
     architectures = runner(["lipo", "-archs", binary], capture=True).stdout.split()
@@ -208,13 +253,15 @@ def validate_bundle(bundle, version, runner):
         if re.findall(r"\bminos\s+(\S+)", output) != ["11.0"]:
             raise ReleaseError(f"Unexpected deployment target for {architecture}")
     runner(["codesign", "--verify", "--deep", "--strict", bundle])
-    helper = bundle / "Contents/Helpers/SubLab808Updater.app"
+    helper = bundle / f"Contents/Helpers/{product}Updater.app"
     with (helper / "Contents/Info.plist").open("rb") as source:
         updater_info = plistlib.load(source)
     if (updater_info.get("CFBundleShortVersionString") != version
-            or updater_info.get("WKProduct") != "SubLab808"):
+            or updater_info.get("WKProduct") != product):
         raise ReleaseError("Embedded updater version/product does not match the plugin")
-    helper_binary = helper / "Contents/MacOS/SubLab808Updater"
+    if expected_pins is not None and updater_info.get("WKSignerPins") != expected_pins:
+        raise ReleaseError("Embedded updater signer pins differ from the release configuration")
+    helper_binary = helper / f"Contents/MacOS/{product}Updater"
     if not os.access(helper_binary, os.X_OK):
         raise ReleaseError("Missing executable updater")
     helper_architectures = runner(["lipo", "-archs", helper_binary], capture=True).stdout.split()
@@ -312,6 +359,11 @@ def package_release(root, configuration="Release", version_override=None, enviro
     version, app, installer, notary, notary_keychain, jobs = validate_options(
         root, configuration, version_override, environment
     )
+    config = load_product(root)
+    product = config["productName"]
+    pins = signer_configuration(environment, required=bool(app))
+    if (app or installer or notary) and not (root / ".git").exists():
+        raise ReleaseError("Signed releases require a Git checkout; source archives support unsigned rebuilds only")
     if platform.system() != "Darwin":
         raise ReleaseError("macOS distribution tools are required")
     required_tools = ["cmake", "ctest", "codesign", "ditto", "pkgbuild", "pkgutil", "lipo", "xcrun"]
@@ -339,7 +391,10 @@ def package_release(root, configuration="Release", version_override=None, enviro
         runner([sys.executable, "-I", source / "scripts/generate-presets.py", "--check"])
         build = stage / "build"
         diagnostics["step"] = "configure"
-        runner(["cmake", "-S", source, "-B", build, "-G", "Unix Makefiles", "-DCMAKE_BUILD_TYPE=Release"])
+        pin_arguments = [f"-DWK_MACOS_{name}_CERT_SHA256={pins[key]}" for name, key in (
+            ("APPLICATION", "currentApplication"), ("INSTALLER", "currentInstaller"),
+            ("NEXT_APPLICATION", "nextApplication"), ("NEXT_INSTALLER", "nextInstaller"))]
+        runner(["cmake", "-S", source, "-B", build, "-G", "Unix Makefiles", "-DCMAKE_BUILD_TYPE=Release", *pin_arguments])
         # Build the default target so every registered CTest executable is built,
         # including future preset/parameter tests added without editing this script.
         diagnostics["step"] = "build"
@@ -348,11 +403,11 @@ def package_release(root, configuration="Release", version_override=None, enviro
         diagnostics["step"] = "ctest"
         runner(["ctest", "--test-dir", build, "--output-on-failure", "--no-tests=error",
                 "--output-junit", test_report])
-        bundle = build / "SubLab808_artefacts/Release/VST3/SubLab808.vst3"
+        bundle = build / f"{product}_artefacts/Release/VST3/{product}.vst3"
         diagnostics["step"] = "validate_bundle"
-        built_hash = validate_bundle(bundle, version, runner)
+        built_hash = validate_bundle(bundle, version, runner, pins)
         payload = stage / "payload"
-        staged_bundle = payload / "Library/Audio/Plug-Ins/VST3/SubLab808.vst3"
+        staged_bundle = payload / f"Library/Audio/Plug-Ins/VST3/{product}.vst3"
         staged_bundle.parent.mkdir(parents=True)
         diagnostics["step"] = "stage_bundle"
         runner(["ditto", bundle, staged_bundle])
@@ -365,27 +420,36 @@ def package_release(root, configuration="Release", version_override=None, enviro
             print("Warning: ad-hoc VST3 and unsigned installer; no notarization claim.")
         # Sign nested code inside-out. Recursive --deep signing can hide missing
         # rules and is intentionally reserved for verification below.
-        runner(signing_options + [staged_bundle / "Contents/Helpers/SubLab808Updater.app"])
+        runner(signing_options + [staged_bundle / f"Contents/Helpers/{product}Updater.app"])
         runner(signing_options + [staged_bundle])
-        packaged_hash = validate_bundle(staged_bundle, version, runner)
+        packaged_hash = validate_bundle(staged_bundle, version, runner, pins)
         artifacts = stage / "artifacts"
         artifacts.mkdir()
         # Preserve auditable results before the temporary source/build is removed.
         # Missing reports are an error, never an unsubstantiated test-success claim.
         shutil.copy2(test_report, artifacts / "ctest-results.xml")
         shutil.copy2(build / "Testing/Temporary/LastTest.log", artifacts / "CTest-LastTest.log")
-        package = artifacts / f"SubLab808-{version}-macOS-universal.pkg"
+        package = artifacts / f"{product}-{version}-macOS-universal.pkg"
         components = stage / "components.plist"
         components.write_bytes(plistlib.dumps([{
-            "RootRelativeBundlePath": "Library/Audio/Plug-Ins/VST3/SubLab808.vst3",
+            "RootRelativeBundlePath": f"Library/Audio/Plug-Ins/VST3/{product}.vst3",
             "BundleIsRelocatable": False, "BundleIsVersionChecked": True,
             "BundleHasStrictIdentifier": True, "BundleOverwriteAction": "upgrade"}]))
-        command = ["pkgbuild", "--root", payload, "--identifier", "audio.whykiki.sublab808.pkg",
+        command = ["pkgbuild", "--root", payload, "--identifier", config["bundleId"] + ".pkg",
                    "--version", version, "--install-location", "/", "--component-plist", components]
         if installer:
             command += ["--sign", installer]
         diagnostics["step"] = "pkgbuild"
         runner(command + [package])
+        if app:
+            diagnostics["step"] = "verify_signer_pairs"
+            verifier_arguments = [sys.executable, "-B", source / "scripts/verify-macos-signers.py",
+                                  "--package", package, "--bundle", staged_bundle,
+                                  "--application-cert-sha256", pins["currentApplication"],
+                                  "--installer-cert-sha256", pins["currentInstaller"],
+                                  "--next-application-cert-sha256", pins["nextApplication"],
+                                  "--next-installer-cert-sha256", pins["nextInstaller"]]
+            run_and_log(verifier_arguments, artifacts / "signer-verification.json", runner)
         notary_submission_id = None
         if notary:
             diagnostics["step"] = "notary_submit"
@@ -412,22 +476,22 @@ def package_release(root, configuration="Release", version_override=None, enviro
             for target in (package, staged_bundle):
                 runner(["xcrun", "stapler", "staple", target])
                 runner(["xcrun", "stapler", "validate", target])
-        archive = artifacts / f"SubLab808-{version}-macOS-universal-VST3.zip"
+        archive = artifacts / f"{product}-{version}-macOS-universal-VST3.zip"
         diagnostics["step"] = "zip_roundtrip"
         runner(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", staged_bundle, archive])
         roundtrip = stage / "zip-roundtrip"
         runner(["ditto", "-x", "-k", archive, roundtrip])
-        restored = roundtrip / "SubLab808.vst3"
-        if validate_bundle(restored, version, runner) != packaged_hash:
+        restored = roundtrip / f"{product}.vst3"
+        if validate_bundle(restored, version, runner, pins) != packaged_hash:
             raise ReleaseError("ZIP-restored binary differs from the signed candidate")
-        host = build / "SubLab808HostTests_artefacts/Release/SubLab808HostTests"
+        host = build / f"{product}HostTests_artefacts/Release/{product}HostTests"
         diagnostics["step"] = "zip_host"
         runner([host, restored])
         expanded = stage / "package-roundtrip"
         diagnostics["step"] = "installer_roundtrip"
         runner(["pkgutil", "--expand-full", package, expanded])
-        installed = expanded / "Payload/Library/Audio/Plug-Ins/VST3/SubLab808.vst3"
-        if validate_bundle(installed, version, runner) != packaged_hash:
+        installed = expanded / f"Payload/Library/Audio/Plug-Ins/VST3/{product}.vst3"
+        if validate_bundle(installed, version, runner, pins) != packaged_hash:
             raise ReleaseError("Installer payload differs from the signed candidate")
         diagnostics["step"] = "installer_host"
         runner([host, installed])
@@ -449,12 +513,15 @@ def package_release(root, configuration="Release", version_override=None, enviro
                         "both_macos11_slices"]
         if notary:
             verification += ["notary_log_accepted", "gatekeeper_package", "gatekeeper_zip_vst3"]
+        if app:
+            verification += ["pinned_installer_and_both_application_slices"]
         manifest = {"schema": 1, "version": version, "configuration": configuration,
                     "commit": provenance["repositories"][0]["commit"],
                     "source_sha256": provenance["source_sha256"],
                     "dirty": any(repo["dirty"] for repo in provenance["repositories"]),
                     "built_binary_sha256": built_hash, "packaged_binary_sha256": packaged_hash,
                     "application_signed": bool(app), "installer_signed": bool(installer), "notarized": bool(notary),
+                    "macos_signer_pins": pins,
                     "verification": verification,
                     "artifacts": {path.name: file_hash(path) for path in sorted(artifacts.iterdir())}}
         if notary_submission_id is not None:
@@ -462,7 +529,7 @@ def package_release(root, configuration="Release", version_override=None, enviro
         write_json(artifacts / "release-manifest.json", manifest)
         checksums = "".join(f"{file_hash(path)}  {path.name}\n" for path in sorted(artifacts.iterdir()))
         (artifacts / "SHA256SUMS.txt").write_text(checksums)
-        name = (f"SubLab808-{version}-{manifest['commit'][:12]}-"
+        name = (f"{product}-{version}-{manifest['commit'][:12]}-"
                 f"{provenance['source_sha256'][:16]}-{packaged_hash[:12]}")
         diagnostics["step"] = "publish"
         destination = publish_candidate(artifacts, dist, name)

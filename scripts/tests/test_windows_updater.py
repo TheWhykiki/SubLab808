@@ -18,6 +18,7 @@ class WindowsUpdaterContractTests(unittest.TestCase):
         cls.source = (UPDATER / "WindowsUpdater.cpp").read_text(encoding="utf-8")
         cls.policy = (UPDATER / "UpdaterPolicy.cpp").read_text(encoding="utf-8")
         cls.header = (UPDATER / "UpdaterPolicy.h").read_text(encoding="utf-8")
+        cls.authenticode = (UPDATER / "Authenticode.h").read_text(encoding="utf-8")
 
     def test_portable_policy_executes(self):
         compiler = os.environ.get("CXX") or shutil.which("c++") or shutil.which("clang++")
@@ -48,10 +49,10 @@ class WindowsUpdaterContractTests(unittest.TestCase):
                         time.sleep(0.1)
 
     def test_production_build_requires_real_signer_pin(self):
-        self.assertIn("#if ! WK_WINDOWS_UPDATER_TEST_MODE && ! defined(WK_WINDOWS_UPDATER_SIGNER_SHA256)",
+        self.assertIn("#if ! WK_WINDOWS_UPDATER_TEST_MODE && ! defined(WK_WINDOWS_UPDATER_PROFILE_EKU)",
                       self.source)
         self.assertIn("static_assert(compileTimePinsAreValid()", self.source)
-        self.assertIn("WK_WINDOWS_UPDATER_NEXT_SIGNER_SHA256", self.source)
+        self.assertIn("WK_WINDOWS_UPDATER_NEXT_PROFILE_EKU", self.source)
         self.assertIn("Test mode cannot launch Windows Installer or request elevation", self.source)
         self.assertLess(
             self.source.index('require(! kTestMode, "Test mode cannot launch Windows Installer'),
@@ -73,7 +74,7 @@ class WindowsUpdaterContractTests(unittest.TestCase):
         self.assertNotIn("api.github.com/repos/" + "${", self.source)
 
     def test_msi_and_payload_are_checked_before_elevation(self):
-        implementation = self.source + "\n" + self.policy
+        implementation = self.source + "\n" + self.policy + "\n" + self.authenticode
         required = [
             "WinVerifyTrust", "CERT_SHA256_HASH_PROP_ID", "verifyMsiDatabase",
             "isForbiddenMsiSideEffectTable", "hasExactUpgradeContract",
@@ -203,8 +204,13 @@ class WindowsUpdaterContractTests(unittest.TestCase):
         self.assertIn("const auto packageSigner = verifyDownloadedMsi(expectedMsi, journal);", self.source)
         self.assertIn("MSI package signer changed during installation", self.source)
         self.assertIn("PE payload signer differs from the MSI package signer", self.source)
-        self.assertIn("certificateInfo.Issuer = signer->Issuer", self.source)
-        self.assertIn("certificateInfo.SerialNumber = signer->SerialNumber", self.source)
+        self.assertIn("WTHelperGetProvSignerFromChain", self.authenticode)
+        self.assertIn("CERT_FIND_EXT_ONLY_ENHKEY_USAGE_FLAG", self.authenticode)
+        self.assertIn('std::string_view(attribute.pszObjId) == "1.3.6.1.4.1.311.3.3.1"', self.authenticode)
+        self.assertIn("signer->csCounterSigners != 1", self.authenticode)
+        self.assertIn("CertVerifyTimeValidity", self.authenticode)
+        self.assertIn("wk::authenticode::verify(path, kCurrentProfileEku, kNextProfileEku).profileEku", self.source)
+        self.assertNotIn("certificateThumbprint(path)", self.source)
         self.assertNotIn("CertGetNameString", self.source)
         normal_start = self.source.index("int runWindowsUpdater()")
         self_check = self.source.index("verifyAuthenticodeCurrentSigner(self);", normal_start)
@@ -237,8 +243,8 @@ class WindowsUpdaterContractTests(unittest.TestCase):
             "--validate-build-contract", "--challenge", "--response-pipe",
             "--parent-process-id", "--product", "--version", "--manufacturer",
             "--github-owner", "--github-repository", "--architecture",
-            "--upgrade-code", "--other-upgrade-code", "--current-signer-sha256",
-            "--next-signer-sha256", "--release-gate-public-key-xy",
+            "--upgrade-code", "--other-upgrade-code", "--current-profile-eku",
+            "--next-profile-eku", "--release-gate-public-key-xy",
             "--release-gate-next-public-key-xy", r'\"schemaVersion\":3',
             r'\"releaseGatePublicKeyXY\"', r'\"releaseGateNextPublicKeyXY\"',
             "buildContractMatches", "WK_WINDOWS_UPDATER_COMPILE_ONLY",

@@ -17,10 +17,10 @@ import datetime as dt
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-PRODUCT = ROOT.name
+PRODUCT = json.loads((ROOT / "release/product.json").read_text(encoding="utf-8"))["productName"]
 CI_WORKFLOW = "build.yml" if PRODUCT == "SubLab808" else "ci.yml"
-SIGNER = "A1" * 32
-NEXT_SIGNER = "D5" * 32
+SIGNER = "1.3.6.1.4.1.311.97.100.200.300.400"
+NEXT_SIGNER = "1.3.6.1.4.1.311.97.101.201.301.401"
 RELEASE_GATE_PUBLIC_KEY = (
     "6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C2964"
     "FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5"
@@ -99,6 +99,20 @@ class WindowsReleaseContractTests(unittest.TestCase):
         )
         self.assertIn(f"group: {PRODUCT}-windows-release\n", self.release)
         self.assertNotIn("windows-release-${{ inputs.tag }}", self.release)
+
+    def test_protection_source_and_owner_gates_precede_publication(self) -> None:
+        self.assertEqual(self.release.count("scripts/validate-release-protection.py"), 3)
+        authorization = self.release[:self.release.index("  build-windows:")]
+        self.assertIn("scripts/validate-release-protection.py", authorization)
+        stage = self.release[self.release.index("  stage-release:"):self.release.index("  accept-windows-upgrade:")]
+        self.assertLess(stage.index("scripts/source-release.py verify"), stage.index("gh api --method POST"))
+        self.assertIn("source-release]", stage)
+        self.assertIn(f"release-assets/source/{PRODUCT}-$version-Source.zip", stage)
+        physical = self.release[self.release.index("  physical-daw-acceptance:"):self.release.index("  finalize-release:")]
+        self.assertIn('--evidence-directory "$gate_directory/evidence"', physical)
+        finalizer = self.release[self.release.index("  finalize-release:"):]
+        self.assertLess(finalizer.index("scripts/validate-owner-promotion.py"), finalizer.index("-F draft=false -F prerelease=false -f make_latest=true"))
+        self.assertIn('quarantine \'explicit owner promotion approval is missing or invalid\'', finalizer)
 
     def test_release_state_authorization_is_immutable_and_fail_closed(self) -> None:
         for token in (
@@ -218,8 +232,8 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "platform: ARM64EC",
             "artifact_arch: x64",
             "artifact_arch: arm64ec",
-            f"-D{PRODUCT.upper()}_WINDOWS_UPDATER_SIGNER_SHA256:STRING=$env:WK_SIGNER_SHA256",
-            f"-D{PRODUCT.upper()}_WINDOWS_UPDATER_NEXT_SIGNER_SHA256:STRING=$env:WK_NEXT_SIGNER_SHA256",
+            f"-D{PRODUCT.upper()}_WINDOWS_UPDATER_PROFILE_EKU:STRING=$env:WK_PROFILE_EKU",
+            f"-D{PRODUCT.upper()}_WINDOWS_UPDATER_NEXT_PROFILE_EKU:STRING=$env:WK_NEXT_PROFILE_EKU",
             f"{PRODUCT}_VST3 {PRODUCT}WindowsUpdater",
             f"Contents/Helpers/{PRODUCT}Updater.exe",
             "WindowsUpdaterPolicyTests",
@@ -230,48 +244,42 @@ class WindowsReleaseContractTests(unittest.TestCase):
             self.assertIn(token, self.release)
         self.assertIn("runs-on: ${{ matrix.runner }}\n    timeout-minutes: 120", self.release)
 
-    def test_pfx_is_ephemeral_and_leaf_pin_is_fail_closed(self) -> None:
+    def test_oidc_signing_is_non_exportable_and_profile_pinned(self) -> None:
         for token in (
-            "secrets.WINDOWS_CODE_SIGNING_PFX_BASE64",
-            "secrets.WINDOWS_CODE_SIGNING_PFX_PASSWORD",
-            "vars.WINDOWS_CODE_SIGNING_CERT_SHA256",
-            "vars.WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256",
-            "vars.WINDOWS_RFC3161_TIMESTAMP_URL",
-            "Import-PfxCertificate",
-            "X509EnhancedKeyUsageExtension",
-            "1.3.6.1.5.5.7.3.3",
-            "HashAlgorithmName]::SHA256",
-            "$actualPin -cne $env:WK_SIGNER_SHA256",
-            "$nextPin -and $nextPin -ceq $pin",
-            "PFX must contain exactly one private-key leaf certificate",
-            "SetAccessRuleProtection($true, $false)",
-            "FileSystemRights]::FullControl",
-            "if: always()",
-            "Remove-Item -LiteralPath $env:WK_PFX_PATH -Force",
-            "foreach ($certificate in @($store.Certificates)) { $store.Remove($certificate) }",
-            "if ($null -ne $store) { $store.Dispose() }",
-            "Ephemeral certificate store cleanup failed",
+            "environment: release-signing", "id-token: write", "azure/login@",
+            "vars.AZURE_CLIENT_ID", "vars.AZURE_TENANT_ID", "vars.AZURE_SUBSCRIPTION_ID",
+            "vars.WINDOWS_ARTIFACT_SIGNING_PROFILE_EKU",
+            "vars.WINDOWS_NEXT_ARTIFACT_SIGNING_PROFILE_EKU",
+            "Test-ArtifactSigningProfileEku", "scripts/setup-artifact-signing.ps1",
+            "http://timestamp.acs.microsoft.com/", "az account clear",
         ):
             self.assertIn(token, self.release)
-        self.assertNotIn("Write-Host $env:PFX", self.release)
+        for forbidden in ("WINDOWS_CODE_SIGNING_PFX", "Import-PfxCertificate",
+                          "WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64"):
+            self.assertNotIn(forbidden, self.release)
+        setup = (ROOT / "scripts/setup-artifact-signing.ps1").read_text()
+        for token in ("Get-FileHash", "SHA256", "SHA512", "ExcludeCredentials",
+                      "EnvironmentCredential", "ManagedIdentityCredential",
+                      "WK_SIGNING_DLIB_PATH", "DOTNET_ROOT_X64"):
+            self.assertIn(token.lower(), setup.lower())
 
     def test_packager_receives_complete_signed_production_contract(self) -> None:
         for token in (
             "scripts/build-windows-installer.ps1",
             "UpdaterPath = $updater",
             "SourceCommit = $env:WK_TAG_COMMIT",
-            "ExpectedSignerSha256 = $env:WK_SIGNER_SHA256",
-            "$buildArguments['ExpectedNextSignerSha256'] = $env:WK_NEXT_SIGNER_SHA256",
+            "ExpectedProfileEku = $env:WK_PROFILE_EKU",
+            "$buildArguments['ExpectedNextProfileEku'] = $env:WK_NEXT_PROFILE_EKU",
             "ExpectedReleaseGatePublicKeyXY = $env:WK_RELEASE_GATE_PUBLIC_KEY_XY",
             "$buildArguments['ExpectedReleaseGateNextPublicKeyXY'] =",
             "HostTestPath = $hostTest",
             "SignToolPath = $signTool",
-            "CertificateThumbprint = $env:WK_CERT_THUMBPRINT",
-            "CertificateStoreName = $env:WK_CERT_STORE_NAME",
+            "SigningDlibPath = $env:WK_SIGNING_DLIB_PATH",
+            "SigningMetadataPath = $env:WK_SIGNING_METADATA_PATH",
             "TimestampUrl = $env:TIMESTAMP_URL",
             "scripts/validate-windows-release-assets.py",
             "'--source-commit', $env:WK_TAG_COMMIT",
-            "@('--expected-next-signer-sha256', $env:WK_NEXT_SIGNER_SHA256)",
+            "@('--expected-next-profile-eku', $env:WK_NEXT_PROFILE_EKU)",
             "'--expected-release-gate-public-key-xy', $env:WK_RELEASE_GATE_PUBLIC_KEY_XY",
             "'--expected-release-gate-next-public-key-xy'",
         ):
@@ -279,7 +287,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
         self.assertNotIn("-AllowUnsigned", self.release)
 
     def test_empty_next_pin_is_omitted_from_native_argument_lists(self) -> None:
-        guard = "if (-not [string]::IsNullOrEmpty($env:WK_NEXT_SIGNER_SHA256))"
+        guard = "if (-not [string]::IsNullOrEmpty($env:WK_NEXT_PROFILE_EKU))"
         self.assertEqual(self.release.count(guard), 3)
         release_gate_guard = (
             "if (-not [string]::IsNullOrEmpty($env:WK_RELEASE_GATE_NEXT_PUBLIC_KEY_XY))"
@@ -291,8 +299,8 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "& ./scripts/test-windows-installer.ps1 @acceptanceArguments",
         ):
             self.assertIn(token, self.release)
-        self.assertNotIn("-ExpectedNextSignerSha256 $env:WK_NEXT_SIGNER_SHA256", self.release)
-        self.assertNotIn("--expected-next-signer-sha256 $env:WK_NEXT_SIGNER_SHA256", self.release)
+        self.assertNotIn("-ExpectedNextProfileEku $env:WK_NEXT_PROFILE_EKU", self.release)
+        self.assertNotIn("--expected-next-profile-eku $env:WK_NEXT_PROFILE_EKU", self.release)
         self.assertNotIn(
             "-ExpectedReleaseGateNextPublicKeyXY $env:WK_RELEASE_GATE_NEXT_PUBLIC_KEY_XY",
             self.release,
@@ -312,8 +320,8 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "ExpectedManufacturer = 'Whykiki Audio'",
             "ExpectedUpgradeCode = '${{ matrix.upgrade_code }}'",
             "ExpectedOtherArchitectureUpgradeCode = '${{ matrix.other_architecture_upgrade_code }}'",
-            "ExpectedSignerSha256 = $env:WK_SIGNER_SHA256",
-            "$acceptanceArguments['ExpectedNextSignerSha256'] = $env:WK_NEXT_SIGNER_SHA256",
+            "ExpectedProfileEku = $env:WK_PROFILE_EKU",
+            "$acceptanceArguments['ExpectedNextProfileEku'] = $env:WK_NEXT_PROFILE_EKU",
             "ExpectedReleaseGatePublicKeyXY = $env:WK_RELEASE_GATE_PUBLIC_KEY_XY",
             "$acceptanceArguments['ExpectedReleaseGateNextPublicKeyXY'] =",
         ):
@@ -343,7 +351,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
         end = self.release.index("\n  accept-windows-upgrade:", start)
         stage = self.release[start:end]
         for token in (
-            "needs: [authorize_windows_release, build-windows, build-macos, test-macos-intel-candidate]",
+            "needs: [authorize_windows_release, build-windows, build-macos, test-macos-intel-candidate, source-release]",
             "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
             "merge-multiple: true",
             "github.run_attempt",
@@ -415,7 +423,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
         build = self.release[build_start:build_end]
 
         key_preflight_start = build.index(
-            "- name: Verify active release-gate authorization key pair"
+            "- name: Verify non-exportable release-gate public key"
         )
         key_preflight_end = build.index(
             "- name: Prove the installed baseline authorizes the active release-gate key",
@@ -423,22 +431,12 @@ class WindowsReleaseContractTests(unittest.TestCase):
         )
         key_preflight = build[key_preflight_start:key_preflight_end]
         for token in (
-            "${{ secrets.WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64 }}",
-            "$privateText.Length -gt 8192",
-            "[Convert]::FromBase64String($privateText)",
-            "[Convert]::ToBase64String($privateBytes) -cne $privateText",
-            "$key.ImportPkcs8PrivateKey($privateBytes, [ref]$bytesRead)",
-            "$bytesRead -ne $privateBytes.Length",
-            "$key.ExportParameters($false)",
-            "$parameters.Q.X.Length -ne 32",
-            "$actualPublicKey -cne $env:WK_RELEASE_GATE_PUBLIC_KEY_XY",
-            "DSASignatureFormat]::IeeeP1363FixedFieldConcatenation",
-            "$key.VerifyData(",
-            "[Array]::Clear($privateBytes, 0, $privateBytes.Length)",
-            "$key.Dispose()",
-            "Remove-Item Env:WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64",
+            "scripts/verify-release-gate-key.ps1",
+            "-KeyId $env:RELEASE_GATE_KEY_VAULT_KEY_ID",
+            "-ExpectedPublicKeyXY $env:WK_RELEASE_GATE_PUBLIC_KEY_XY",
         ):
             self.assertIn(token, key_preflight)
+        self.assertNotIn("PRIVATE_KEY", key_preflight)
         self.assertLess(
             key_preflight_start,
             build.index("- name: Configure production updater pin"),
@@ -451,13 +449,13 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "if: needs.authorize_windows_release.outputs.mode == 'upgrade'",
             '"repos/$env:GITHUB_REPOSITORY/releases/$env:WK_BASELINE_RELEASE_ID"',
             "$release.immutable -isnot [bool] -or -not $release.immutable",
-            "@($release.assets).Count -ne 8",
+            "@($release.assets).Count -ne 9",
             'Windows-${{ matrix.artifact_arch }}.evidence.json',
             "$evidenceAssets.Count -ne 1",
             "$asset.digest -cnotmatch '^sha256:[0-9a-f]{64}$'",
             "$item.Length -ne [long]$asset.size",
             '"sha256:$actualDigest" -cne [string]$asset.digest',
-            "$evidence.schemaVersion -ne 4",
+            "$evidence.schemaVersion -ne 5",
             "$evidence.releaseGatePublicKeyXY",
             "$evidence.releaseGateNextPublicKeyXY",
             "$evidence.releaseGatePublicKeyAllowlistXY",
@@ -470,7 +468,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
         stage_end = self.release.index("\n  accept-windows-upgrade:", stage_start)
         stage = self.release[stage_start:stage_end]
         self.assertIn(
-            "needs: [authorize_windows_release, build-windows, build-macos, test-macos-intel-candidate]",
+            "needs: [authorize_windows_release, build-windows, build-macos, test-macos-intel-candidate, source-release]",
             stage,
         )
         for token in (
@@ -506,19 +504,16 @@ class WindowsReleaseContractTests(unittest.TestCase):
         ):
             self.assertIn(token, acceptance)
         self.assertIn("permissions:\n      contents: read", acceptance)
-        self.assertEqual(
-            acceptance.count(
-                "${{ secrets.WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64 }}"
-            ),
-            1,
-        )
+        self.assertIn("id-token: write", acceptance)
+        self.assertIn("ReleaseGateKeyVaultKeyId = $env:RELEASE_GATE_KEY_VAULT_KEY_ID", acceptance)
+        self.assertNotIn("PRIVATE_KEY_PKCS8", acceptance)
         self.assertNotIn("secrets.GITHUB_TOKEN", acceptance)
 
         for token in (
             "$script:Owner = 'TheWhykiki'",
             "X-GitHub-Api-Version' = '2026-03-10'",
             "$Release.immutable",
-            "Release does not contain exactly eight cross-platform assets.",
+            "Release does not contain exactly nine cross-platform assets.",
             "256MB",
             "8MB",
             "-TimeoutSec 600",
@@ -541,17 +536,6 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "Test-owned updater operation cleanup failed.",
             "productCleanup = $true",
             "[int] $UpdaterTimeoutSeconds = 3600",
-            "function Import-ReleaseGateSigningKey",
-            "ImportPkcs8PrivateKey",
-            "ExportParameters($false)",
-            "$parameters.Q.X.Length -eq 32",
-            "$actualPublicKeyXY -ceq $ExpectedPublicKeyXY",
-            "function New-LowSReleaseGateSignature",
-            "DSASignatureFormat]::IeeeP1363FixedFieldConcatenation",
-            "FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551",
-            "7FFFFFFF800000007FFFFFFFFFFFFFFFDE737D56D38BCF4279DCE5617E3192A8",
-            "if ($s -gt $halfOrder)",
-            "$order - $s",
             "$ExpiresAtUnixSeconds -le $nowUnixSeconds + 300",
             "$AuthorizationSignatureP1363 -cmatch '^[0-9A-F]{128}$'",
         ):
@@ -601,18 +585,14 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "function Remove-VerifiedOperationDirectories", invoke_start
         )
         invoke = self.transition[invoke_start:invoke_end]
-        self.assertIn(
-            "$startInfo.Environment.Remove('WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64')",
-            invoke,
-        )
+        self.assertIn("$startInfo.Environment.Remove('AZURE_CLIENT_SECRET')", invoke)
         self.assertNotIn("ReleaseGatePrivateKeyPkcs8Base64", invoke)
-        clear_environment = self.transition.index(
-            "Remove-Item Env:WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64"
-        )
-        gate_call = self.transition.rindex("$gateReceipt = Invoke-ReleaseGateUpdater")
-        clear_local = self.transition.rindex("$releaseGatePrivateKeyText = ''", 0, gate_call)
-        self.assertLess(clear_environment, gate_call)
-        self.assertLess(clear_local, gate_call)
+        key_helper = (ROOT / "scripts/release-gate-key.ps1").read_text()
+        for token in ("keyvault key show", "keyvault key sign", "EC-HSM",
+                      "ES256", "exportable", "New-LowSReleaseGateSignature",
+                      "VerifyData", "IeeeP1363FixedFieldConcatenation"):
+            self.assertIn(token, key_helper)
+        self.assertNotIn("ImportPkcs8PrivateKey", key_helper)
 
         journal_start = self.transition.index("function Remove-VerifiedOperationDirectories")
         journal_end = self.transition.index("if (-not $IsWindows)", journal_start)
@@ -639,7 +619,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "WK_PHYSICAL_RECEIPT_SHA256: ${{ needs.physical-daw-acceptance.outputs.receipt_sha256 }}",
             "WK_PHYSICAL_RECEIPT_BASE64: ${{ needs.physical-daw-acceptance.outputs.receipt_base64 }}",
             "physicalDawGate=$WK_PHYSICAL_ACCEPTANCE_RESULT",
-            "whykiki-physical-daw-receipt-v1",
+            "whykiki-physical-daw-receipt-v2",
             "WK_ASSET_MANIFEST_SHA256",
             "fail_unknown()",
             "quarantine()",
@@ -734,6 +714,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
             f"{PRODUCT}-{version}-macOS-universal.pkg",
             f"{PRODUCT}-{version}-macOS-universal-VST3.zip",
             f"{PRODUCT}-{version}-macOS-universal.evidence.json",
+            f"{PRODUCT}-{version}-Source.zip",
             f"{PRODUCT}-{version}-SHA256SUMS.txt",
         )
         assets = [
@@ -746,9 +727,32 @@ class WindowsReleaseContractTests(unittest.TestCase):
             }
             for index, name in enumerate(names, start=1)
         ]
+        by_name = {asset["name"]: asset for asset in assets}
+        binary_hashes = {"windows-x64-msi": "a" * 64, "windows-arm64ec-msi": "b" * 64,
+                         "macos-universal-pkg": "c" * 64, "macos-universal-zip": "c" * 64}
+        evidence_files = {}
+        for architecture, folder in (("x64", "x86_64-win"), ("arm64ec", "arm64ec-win")):
+            evidence = {
+                "product": PRODUCT, "version": version, "sourceCommit": TAG_COMMIT,
+                "artifactStatus": "SIGNED",
+                "msiSha256": by_name[f"{PRODUCT}-{version}-Windows-{architecture}.msi"]["digest"][7:],
+                "payloadFiles": [{"path": f"Contents\\{folder}\\{PRODUCT}.vst3",
+                                  "sha256": binary_hashes[f"windows-{architecture}-msi"]}],
+            }
+            evidence_files[f"{PRODUCT}-{version}-Windows-{architecture}.evidence.json"] = json.dumps(evidence).encode()
+        evidence_files[f"{PRODUCT}-{version}-macOS-universal.evidence.json"] = json.dumps({
+            "product": PRODUCT, "version": version, "commit": TAG_COMMIT,
+            "artifactStatus": "SIGNED-NOTARIZED",
+            "packageSha256": by_name[f"{PRODUCT}-{version}-macOS-universal.pkg"]["digest"][7:],
+            "vst3ZipSha256": by_name[f"{PRODUCT}-{version}-macOS-universal-VST3.zip"]["digest"][7:],
+            "vst3BinarySha256": binary_hashes["macos-universal-pkg"],
+        }).encode()
+        for name, encoded in evidence_files.items():
+            by_name[name]["digest"] = "sha256:" + hashlib.sha256(encoded).hexdigest()
+            by_name[name]["size"] = len(encoded)
         manifest_sha256 = self.physical_receipt._manifest_sha256(assets)
         receipt = {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "repository": f"TheWhykiki/{PRODUCT}",
             "product": PRODUCT,
             "runId": run_id,
@@ -769,26 +773,36 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "checks": [
                 {
                     "platform": platform,
+                    "cpuArchitecture": architecture,
+                    "hostProcessArchitecture": "arm64ec" if platform == "windows-arm64ec-msi" else architecture,
                     "host": host,
                     "hostVersion": "13.0.50" if host == "Cubase" else "7.50",
                     "osVersion": "Windows 11 24H2" if platform.startswith("windows") else "macOS 15.6",
-                    "machine": f"qa-{platform}",
+                    "machine": f"qa-{platform}-{architecture}",
                     "tester": "qa-operator",
                     "testedAt": "2026-09-08T12:00:00Z",
                     "result": "pass",
+                    "loadedVst3Path": (
+                        f"C:\\Program Files\\Common Files\\VST3\\{PRODUCT}.vst3\\Contents\\"
+                        + ("arm64ec-win" if architecture == "arm64" else "x86_64-win")
+                        + f"\\{PRODUCT}.vst3" if platform.startswith("windows")
+                        else f"/Library/Audio/Plug-Ins/VST3/{PRODUCT}.vst3/Contents/MacOS/{PRODUCT}"),
+                    "loadedVst3Sha256": binary_hashes[platform],
                 }
-                for platform in (
-                    "windows-x64-msi",
-                    "windows-arm64ec-msi",
-                    "macos-universal-pkg",
-                    "macos-universal-zip",
+                for platform, architectures in (
+                    ("windows-x64-msi", ("x86_64",)),
+                    ("windows-arm64ec-msi", ("arm64",)),
+                    ("macos-universal-pkg", ("x86_64", "arm64")),
+                    ("macos-universal-zip", ("x86_64", "arm64")),
                 )
+                for architecture in architectures
                 for host in ("Cubase", "Reaper")
             ],
         }
         environment = {
             "id": environment_id,
             "name": "physical-daw-release",
+            "can_admins_bypass": False,
             "deployment_branch_policy": {
                 "protected_branches": True,
                 "custom_branch_policies": False,
@@ -876,6 +890,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "tag": tag,
             "commit": TAG_COMMIT,
             "asset_manifest_sha256": manifest_sha256,
+            "evidence_files": evidence_files,
             "now": dt.datetime(2026, 9, 8, 13, 0, tzinfo=dt.timezone.utc),
         }
 
@@ -907,6 +922,10 @@ class WindowsReleaseContractTests(unittest.TestCase):
                 path.write_text(json.dumps(fixture[key]), encoding="utf-8")
                 paths[key] = path
             output = directory / "receipt.json"
+            evidence_directory = directory / "evidence"
+            evidence_directory.mkdir()
+            for name, encoded in fixture["evidence_files"].items():
+                (evidence_directory / name).write_bytes(encoded)
             command = [
                 "python3",
                 str(ROOT / "scripts" / "validate-physical-daw-release-receipt.py"),
@@ -927,6 +946,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
                 "--tag", str(fixture["tag"]),
                 "--commit", str(fixture["commit"]),
                 "--asset-manifest-sha256", str(fixture["asset_manifest_sha256"]),
+                "--evidence-directory", str(evidence_directory),
                 "--output", str(output),
             ]
             completed = subprocess.run(command, check=False, capture_output=True, text=True)
@@ -946,6 +966,17 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "extra-review",
             "missing-reaper",
             "digest",
+            "missing-cpu",
+            "rosetta",
+            "old-binary",
+            "wrong-loaded-path",
+            "old-schema",
+            "tampered-evidence",
+            "missing-evidence",
+            "admin-bypass",
+            "missing-admin-policy",
+            "mixed-environment-review",
+            "physical-id-name-mismatch",
         ):
             with self.subTest(mutation=mutation):
                 fixture = self._physical_receipt_fixture()
@@ -968,10 +999,35 @@ class WindowsReleaseContractTests(unittest.TestCase):
                     fixture["workflow_run"]["head_branch"] = "release-candidate"
                 elif mutation == "extra-review":
                     fixture["reviews"].append(json.loads(json.dumps(fixture["reviews"][0])))
+                elif mutation == "admin-bypass":
+                    fixture["environment"]["can_admins_bypass"] = True
+                elif mutation == "missing-admin-policy":
+                    del fixture["environment"]["can_admins_bypass"]
+                elif mutation == "mixed-environment-review":
+                    fixture["reviews"][0]["environments"].append({"id": 99, "name": "release-signing"})
+                elif mutation == "physical-id-name-mismatch":
+                    fixture["reviews"][0]["environments"][0]["name"] = "release-signing"
+                elif mutation == "tampered-evidence":
+                    name = next(iter(fixture["evidence_files"]))
+                    fixture["evidence_files"][name] += b" "
+                elif mutation == "missing-evidence":
+                    fixture["evidence_files"].pop(next(iter(fixture["evidence_files"])))
                 else:
                     receipt = json.loads(fixture["reviews"][0]["comment"])
                     if mutation == "missing-reaper":
                         receipt["checks"].pop()
+                    elif mutation == "missing-cpu":
+                        del receipt["checks"][0]["cpuArchitecture"]
+                    elif mutation == "rosetta":
+                        check = next(item for item in receipt["checks"] if item["platform"].startswith("macos")
+                                     and item["cpuArchitecture"] == "arm64")
+                        check["hostProcessArchitecture"] = "x86_64"
+                    elif mutation == "old-binary":
+                        receipt["checks"][0]["loadedVst3Sha256"] = "f" * 64
+                    elif mutation == "wrong-loaded-path":
+                        receipt["checks"][0]["loadedVst3Path"] = "relative/other.vst3"
+                    elif mutation == "old-schema":
+                        receipt["schemaVersion"] = 1
                     else:
                         first_name = next(iter(receipt["artifacts"]))
                         receipt["artifacts"][first_name] = f"sha256:{'f' * 64}"
@@ -979,12 +1035,24 @@ class WindowsReleaseContractTests(unittest.TestCase):
                 with self.assertRaises(self.physical_receipt.ContractError):
                     self.physical_receipt.validate(**fixture)
 
+    def test_physical_receipt_allows_separate_signing_approvals(self) -> None:
+        fixture = self._physical_receipt_fixture()
+        expected = self.physical_receipt.validate(**fixture)
+        signing_review = {
+            "state": "approved", "comment": "Sign the reviewed candidate",
+            "environments": [{"id": 99, "name": "release-signing"}],
+            "user": {"id": 42, "login": "qa-reviewer"},
+        }
+        fixture["reviews"].insert(0, signing_review)
+        fixture["reviews"].append(json.loads(json.dumps(signing_review)))
+        self.assertEqual(self.physical_receipt.validate(**fixture), expected)
+
     def test_macos_candidate_is_signed_notarized_and_required_for_publish(self) -> None:
         product_prefix = PRODUCT.upper()
         for token in (
             "build-macos:",
             "runs-on: macos-15",
-            "needs: [authorize_windows_release, build-windows, build-macos, test-macos-intel-candidate]",
+            "needs: [authorize_windows_release, build-windows, build-macos, test-macos-intel-candidate, source-release]",
             "secrets.MACOS_DEVELOPER_ID_APPLICATION_P12_BASE64",
             "secrets.MACOS_DEVELOPER_ID_APPLICATION_P12_PASSWORD",
             "secrets.MACOS_DEVELOPER_ID_INSTALLER_P12_BASE64",
@@ -1003,10 +1071,10 @@ class WindowsReleaseContractTests(unittest.TestCase):
             './scripts/package-release.sh Release "$WK_RELEASE_VERSION"',
             "scripts/macos-release-assets.py prepare",
             "scripts/macos-release-assets.py validate",
-            "pkgutil --check-signature",
-            "Signed with a trusted timestamp",
+            "scripts/verify-macos-signers.py",
+            '--next-installer-cert-sha256 "$NEXT_INSTALLER_SIGNER_SHA256"',
             "codesign --verify --deep --strict",
-            "--extract-certificates",
+            '--next-application-cert-sha256 "$NEXT_APPLICATION_SIGNER_SHA256"',
             "xcrun stapler validate",
             "spctl --assess --type install",
             "spctl --assess --type execute",
@@ -1022,9 +1090,9 @@ class WindowsReleaseContractTests(unittest.TestCase):
         ):
             self.assertIn(token, self.release)
         self.assertEqual(self.release.count("retention-days: 1"), 2)
-        self.assertEqual(self.release.count("APPLICATION_SIGNER_SHA256:"), 3)
-        self.assertEqual(self.release.count("INSTALLER_SIGNER_SHA256:"), 3)
-        self.assertEqual(self.release.count("\n      NEXT_SIGNER_SHA256:"), 3)
+        self.assertEqual(self.release.count("\n      APPLICATION_SIGNER_SHA256:"), 3)
+        self.assertEqual(self.release.count("\n      INSTALLER_SIGNER_SHA256:"), 3)
+        self.assertEqual(self.release.count("\n      NEXT_PROFILE_EKU:"), 3)
         self.assertGreaterEqual(self.release.count("timeout-minutes: 120"), 2)
         self.assertNotIn(f"{PRODUCT}-$version-Windows-SHA256SUMS.txt", self.release)
         self.assertLess(
@@ -1059,7 +1127,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
             f'package_bundle="$roundtrip/package/Payload/Library/Audio/Plug-Ins/VST3/{PRODUCT}.vst3"',
             "for source in zip package; do",
             'package) signed_bundle="$package_bundle" ;;',
-            'codesign -d --extract-certificates "$certificate_prefix" "$signed_bundle"',
+            'scripts/verify-macos-signers.py --package "$package" --bundle "$signed_bundle"',
             f'host="build-macos-intel-host/{PRODUCT}HostTests_artefacts/Release/{PRODUCT}HostTests"',
             '/usr/bin/arch -x86_64 "$host" "$zip_bundle"',
             '/usr/bin/arch -x86_64 "$host" "$package_bundle"',
@@ -1072,7 +1140,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
 
         stage = self.release[end:]
         for token in (
-            "needs: [authorize_windows_release, build-windows, build-macos, test-macos-intel-candidate]",
+            "needs: [authorize_windows_release, build-windows, build-macos, test-macos-intel-candidate, source-release]",
             "needs.test-macos-intel-candidate.result == 'success'",
             "WK_INTEL_TESTED_MACOS_CANDIDATE_SHA256: ${{ needs.test-macos-intel-candidate.outputs.candidate_sha256 }}",
             'tested_candidate_digest="$WK_INTEL_TESTED_MACOS_CANDIDATE_SHA256"',
@@ -1136,7 +1204,8 @@ class WindowsReleaseContractTests(unittest.TestCase):
         )
         other_architecture = "arm64ec" if architecture == "x64" else "x64"
         evidence = {
-            "schemaVersion": 4,
+            "schemaVersion": 5,
+            "releaseContractVersion": 2,
             "artifactStatus": "SIGNED",
             "product": PRODUCT,
             "version": version,
@@ -1152,10 +1221,20 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "msiFile": msi.name,
             "msiSha256": hashlib.sha256(msi.read_bytes()).hexdigest().upper(),
             "signed": True,
-            "signerCertificateSha256": SIGNER,
-            "updaterCurrentSignerSha256": SIGNER,
-            "updaterNextSignerSha256": next_signer or None,
-            "payloadSignerAllowlistSha256": [SIGNER] + ([next_signer] if next_signer else []),
+            "signerCertificateSha256": "A1" * 32,
+            "signingProfileEku": SIGNER,
+            "timestampCertificateSha256": "C4" * 32,
+            "payloadSigningEvidence": [
+                {"path": path, "profileEku": SIGNER, "signerCertificateSha256": "A1" * 32,
+                 "timestampCertificateSha256": "C4" * 32}
+                for path in [
+                    f"Contents\\Helpers\\{PRODUCT}Updater.exe",
+                    f"Contents\\{'x86_64-win' if architecture == 'x64' else 'arm64ec-win'}\\{PRODUCT}.vst3",
+                ]
+            ],
+            "updaterCurrentProfileEku": SIGNER,
+            "updaterNextProfileEku": next_signer or None,
+            "payloadProfileEkuAllowlist": [SIGNER] + ([next_signer] if next_signer else []),
             "releaseGatePublicKeyXY": RELEASE_GATE_PUBLIC_KEY,
             "releaseGateNextPublicKeyXY": next_release_gate_public_key or None,
             "releaseGatePublicKeyAllowlistXY": [RELEASE_GATE_PUBLIC_KEY]
@@ -1227,6 +1306,17 @@ class WindowsReleaseContractTests(unittest.TestCase):
             ],
             "validation": {
                 "policyMutationTests": 12,
+                "sequenceMutationTests": 14,
+                "nativeUpdaterSequenceMutationTests": 14,
+                "architectureMutationTests": 1,
+                "nativeUpdaterArchitectureMutationTests": 1,
+                "installExecuteSequence": [
+                    {"action": action, "condition": "", "sequence": str(number)}
+                    for action, number in (
+                        ("FindRelatedProducts", 50), ("LaunchConditions", 100),
+                        ("MigrateFeatureStates", 1200), ("InstallInitialize", 1500),
+                        ("RemoveExistingProducts", 1501), ("InstallFiles", 4000))
+                ],
                 "moduleInfoIdentityValidated": True,
                 "pluginVersionResourceValidated": True,
                 "updaterVersionResourceValidated": True,
@@ -1281,6 +1371,30 @@ class WindowsReleaseContractTests(unittest.TestCase):
                     RELEASE_GATE_PUBLIC_KEY, RELEASE_GATE_NEXT_PUBLIC_KEY, ("x64",)
                 )
 
+    def test_asset_validator_rejects_unsafe_recorded_msi_sequences(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            evidence_path = self._write_candidate(directory, "x64")
+            baseline = json.loads(evidence_path.read_text(encoding="utf-8"))
+            sequence = baseline["validation"]["installExecuteSequence"]
+            mutants = [sequence[1:], sequence + [sequence[0]]]
+            for field, value in (("condition", "0"), ("sequence", ""), ("sequence", "0"),
+                                 ("sequence", "-1"), ("sequence", None), ("sequence", "4001")):
+                mutant = json.loads(json.dumps(sequence))
+                mutant[0][field] = value
+                mutants.append(mutant)
+            migration = json.loads(json.dumps(sequence))
+            migration[2]["sequence"] = "1"
+            mutants.append(migration)
+            for index, mutant in enumerate(mutants):
+                with self.subTest(mutant=index):
+                    baseline["validation"]["installExecuteSequence"] = mutant
+                    evidence_path.write_text(json.dumps(baseline), encoding="utf-8")
+                    with self.assertRaises(self.validator.ContractError):
+                        self.validator.validate_assets(
+                            directory, PRODUCT, "1.2.3", TAG_COMMIT, SIGNER, NEXT_SIGNER,
+                            RELEASE_GATE_PUBLIC_KEY, RELEASE_GATE_NEXT_PUBLIC_KEY, ("x64",))
+
     def test_asset_validator_rejects_missing_other_architecture(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = pathlib.Path(temporary)
@@ -1314,6 +1428,9 @@ class WindowsReleaseContractTests(unittest.TestCase):
     def test_asset_validator_rejects_incomplete_updater_and_msi_policy_evidence(self) -> None:
         mutations = (
             ("updaterVersionResource", "originalFilename", "WrongUpdater.exe"),
+            ("validation", "nativeUpdaterSequenceMutationTests", 0),
+            ("validation", "nativeUpdaterArchitectureMutationTests", 0),
+            ("validation", "installExecuteSequence", []),
             ("validation", "msiDeploymentCompliant", "0"),
             ("validation", "secureCustomProperties", ["WIX_UPGRADE_DETECTED"]),
             (
@@ -1351,7 +1468,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
             directory = pathlib.Path(temporary)
             evidence_path = self._write_candidate(directory, "x64")
             evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-            evidence["payloadSignerAllowlistSha256"] = [NEXT_SIGNER, SIGNER]
+            evidence["payloadProfileEkuAllowlist"] = [NEXT_SIGNER, SIGNER]
             evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
             with self.assertRaises(self.validator.ContractError):
                 self.validator.validate_assets(
@@ -1545,10 +1662,10 @@ class WindowsReleaseContractTests(unittest.TestCase):
 
     def test_documentation_names_required_configuration_and_no_release_claim(self) -> None:
         for token in (
-            "WINDOWS_CODE_SIGNING_PFX_BASE64",
-            "WINDOWS_CODE_SIGNING_PFX_PASSWORD",
-            "WINDOWS_CODE_SIGNING_CERT_SHA256",
-            "WINDOWS_RFC3161_TIMESTAMP_URL",
+            "WINDOWS_ARTIFACT_SIGNING_PROFILE_EKU",
+            "AZURE_CLIENT_ID",
+            "WINDOWS_RELEASE_GATE_KEY_VAULT_KEY_ID",
+            "http://timestamp.acs.microsoft.com/",
             "MACOS_DEVELOPER_ID_APPLICATION_P12_BASE64",
             "MACOS_DEVELOPER_ID_INSTALLER_P12_BASE64",
             "MACOS_NOTARY_PRIVATE_KEY_P8_BASE64",

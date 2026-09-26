@@ -40,6 +40,17 @@ class ContractError(RuntimeError):
     """Raised when a release candidate violates the public asset contract."""
 
 
+def _profile_eku(value: str) -> bool:
+    prefix = "1.3.6.1.4.1.311.97."
+    if not value.startswith(prefix) or value.startswith(prefix + "1."):
+        return False
+    arcs = value[len(prefix):].split(".")
+    return len(arcs) == 4 and all(
+        re.fullmatch(r"(0|[1-9][0-9]{0,9})", arc) is not None and int(arc) <= 0xFFFFFFFF
+        for arc in arcs
+    )
+
+
 def _sha256(path: pathlib.Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -188,8 +199,8 @@ def validate_assets(
     product: str,
     version: str,
     source_commit: str,
-    expected_signer_sha256: str,
-    expected_next_signer_sha256: str,
+    expected_profile_eku: str,
+    expected_next_profile_eku: str,
     expected_release_gate_public_key_xy: str,
     expected_release_gate_next_public_key_xy: str,
     architectures: tuple[str, ...],
@@ -199,12 +210,12 @@ def validate_assets(
     _validate_version(version)
     _require(COMMIT_RE.fullmatch(source_commit) is not None,
              "Source commit must be exactly 40 lowercase hexadecimal characters")
-    signer = expected_signer_sha256.replace(" ", "").upper()
-    _require(SHA256_RE.fullmatch(signer) is not None, "Expected signer must be exactly 64 hexadecimal characters")
-    next_signer = expected_next_signer_sha256.replace(" ", "").upper()
+    signer = expected_profile_eku
+    _require(_profile_eku(signer), "Expected signer must be a complete Artifact Signing Public Trust identity EKU")
+    next_signer = expected_next_profile_eku
     _require(
-        not next_signer or SHA256_RE.fullmatch(next_signer) is not None,
-        "Expected next signer must be empty or exactly 64 hexadecimal characters",
+        not next_signer or _profile_eku(next_signer),
+        "Expected next signer must be empty or a complete Artifact Signing Public Trust identity EKU",
     )
     _require(not next_signer or next_signer != signer, "Expected current and next signers must be distinct")
     signer_allowlist = [signer] + ([next_signer] if next_signer else [])
@@ -249,7 +260,8 @@ def validate_assets(
         _require(msi.stat().st_size <= 256 * 1024 * 1024, f"MSI exceeds updater size policy: {msi.name}")
         evidence = _load_evidence(evidence_path)
         expected_values = {
-            "schemaVersion": 4,
+            "schemaVersion": 5,
+            "releaseContractVersion": 2,
             "artifactStatus": "SIGNED",
             "product": product,
             "version": version,
@@ -258,10 +270,10 @@ def validate_assets(
             "msiArchitecture": ARCHITECTURES[architecture],
             "msiFile": msi.name,
             "signed": True,
-            "signerCertificateSha256": signer,
-            "updaterCurrentSignerSha256": signer,
-            "updaterNextSignerSha256": next_signer or None,
-            "payloadSignerAllowlistSha256": signer_allowlist,
+            "signingProfileEku": signer,
+            "updaterCurrentProfileEku": signer,
+            "updaterNextProfileEku": next_signer or None,
+            "payloadProfileEkuAllowlist": signer_allowlist,
             "releaseGatePublicKeyXY": release_gate_public_key,
             "releaseGateNextPublicKeyXY": release_gate_next_public_key or None,
             "releaseGatePublicKeyAllowlistXY": release_gate_public_key_allowlist,
@@ -271,6 +283,22 @@ def validate_assets(
                 key in evidence and evidence[key] == expected,
                 f"Evidence field {key!r} is invalid for {architecture}",
             )
+        _require(SHA256_RE.fullmatch(str(evidence.get("signerCertificateSha256", ""))) is not None,
+                 "MSI signer leaf evidence is missing")
+        _require(SHA256_RE.fullmatch(str(evidence.get("timestampCertificateSha256", ""))) is not None,
+                 "MSI timestamp signer evidence is missing")
+        signing = evidence.get("payloadSigningEvidence")
+        _require(isinstance(signing, list) and len(signing) >= 2, "Payload signing evidence is missing")
+        signing_paths = set()
+        for record in signing:
+            _require(isinstance(record, dict) and record.get("profileEku") == signer
+                     and SHA256_RE.fullmatch(str(record.get("signerCertificateSha256", ""))) is not None
+                     and SHA256_RE.fullmatch(str(record.get("timestampCertificateSha256", ""))) is not None
+                     and isinstance(record.get("path"), str) and record["path"] not in signing_paths,
+                     "Payload signer evidence is malformed or duplicated")
+            signing_paths.add(record["path"])
+        expected_signing_paths = set(evidence.get("payloadClassification", {}).get("portableExecutablePaths", []))
+        _require(signing_paths == expected_signing_paths, "Payload signer evidence does not cover every PE")
         config = json.loads(
             (pathlib.Path(__file__).resolve().parents[1] / "Installer/Windows/package-config.json").read_text(
                 encoding="utf-8"
@@ -307,6 +335,37 @@ def validate_assets(
                  f"Forbidden side-effect tables are present for {architecture}")
         _require(validation.get("forbiddenSequenceActions") == 0,
                  f"Forbidden sequence actions are present for {architecture}")
+        _require(validation.get("sequenceMutationTests") == 14,
+                 "MSI sequence mutation tests did not pass")
+        _require(validation.get("nativeUpdaterSequenceMutationTests") == 14,
+                 "Native updater did not reject the actual MSI sequence mutants")
+        _require(validation.get("architectureMutationTests") == 1
+                 and validation.get("nativeUpdaterArchitectureMutationTests") == 1,
+                 "Packager and native updater did not reject the foreign-architecture MSI mutant")
+        sequence = validation.get("installExecuteSequence")
+        _require(isinstance(sequence, list) and 5 <= len(sequence) <= 512,
+                 "Actual MSI InstallExecuteSequence evidence is missing")
+        actions = {}
+        for row in sequence:
+            _require(isinstance(row, dict) and set(row) == {"action", "condition", "sequence"}
+                     and all(isinstance(value, str) for value in row.values()),
+                     "Malformed MSI execute sequence evidence row")
+            _require(row["action"] not in actions, "Duplicate MSI execute sequence evidence action")
+            actions[row["action"]] = row
+        previous = 0
+        for action in ("FindRelatedProducts", "LaunchConditions", "InstallInitialize",
+                       "RemoveExistingProducts", "InstallFiles"):
+            row = actions.get(action, {})
+            number = row.get("sequence", "")
+            _require(row.get("condition") == "" and re.fullmatch(r"[1-9][0-9]{0,4}", number)
+                     and previous < int(number) <= 32767,
+                     f"Unsafe actual MSI execute sequence: {action}")
+            previous = int(number)
+        if "MigrateFeatureStates" in actions:
+            row = actions["MigrateFeatureStates"]
+            _require(row["condition"] == "" and re.fullmatch(r"[1-9][0-9]{0,4}", row["sequence"])
+                     and int(actions["FindRelatedProducts"]["sequence"]) < int(row["sequence"]) <= 32767,
+                     "Unsafe MSI feature migration ordering")
         _require(isinstance(validation.get("policyMutationTests"), int) and
                  validation["policyMutationTests"] >= 12,
                  f"Installer policy mutation tests did not pass for {architecture}")
@@ -347,8 +406,8 @@ def main() -> int:
     parser.add_argument("--product", required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--source-commit", required=True)
-    parser.add_argument("--expected-signer-sha256", required=True)
-    parser.add_argument("--expected-next-signer-sha256", default="")
+    parser.add_argument("--expected-profile-eku", required=True)
+    parser.add_argument("--expected-next-profile-eku", default="")
     parser.add_argument("--expected-release-gate-public-key-xy", required=True)
     parser.add_argument("--expected-release-gate-next-public-key-xy", default="")
     parser.add_argument("--architecture", choices=tuple(ARCHITECTURES), action="append")
@@ -360,8 +419,8 @@ def main() -> int:
             args.product,
             args.version,
             args.source_commit,
-            args.expected_signer_sha256,
-            args.expected_next_signer_sha256,
+            args.expected_profile_eku,
+            args.expected_next_profile_eku,
             args.expected_release_gate_public_key_xy,
             args.expected_release_gate_next_public_key_xy,
             architectures,

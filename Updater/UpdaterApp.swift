@@ -41,6 +41,7 @@ final class UpdaterApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 .resolvingSymlinksInPath().appendingPathComponent("Whykiki Audio/Updates/" + product.rawValue, isDirectory: true)
             try rejectSymlinkAncestors(cache)
             try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try requirePrivateDirectory(cache)
             lockDescriptor = open(cache.appendingPathComponent("update.lock").path, O_RDWR | O_CREAT | O_NOFOLLOW, 0o600)
             try require(lockDescriptor >= 0 && flock(lockDescriptor, LOCK_EX | LOCK_NB) == 0, "Für dieses Plugin ist bereits ein Updater geöffnet.")
             store = InstallationStore(root: cache, product: product)
@@ -64,6 +65,7 @@ final class UpdaterApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 host = running
             }
             window.title = product.rawValue + " Update"
+            try SignerPolicy.embedded().requireConfigured()
             detail.stringValue = "Installiert: \(current!) · Installationsziel: /Library/Audio/Plug-Ins/VST3\nDer Updater bleibt beim Schließen der DAW geöffnet."
             if let pending = pending {
                 record = pending
@@ -84,6 +86,8 @@ final class UpdaterApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let menu = NSMenu()
         let applicationItem = NSMenuItem()
         let applicationMenu = NSMenu()
+        applicationMenu.addItem(withTitle: "Über diesen Updater / Lizenz", action: #selector(showLicense), keyEquivalent: "")
+        applicationMenu.addItem(.separator())
         applicationMenu.addItem(withTitle: "Updater beenden", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         applicationItem.submenu = applicationMenu
         menu.addItem(applicationItem)
@@ -131,6 +135,19 @@ final class UpdaterApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     var criticalOperation: Bool { checkingInstallation || (busy && step == .install) }
+    @objc func showLicense() {
+        let name = (Bundle.main.object(forInfoDictionaryKey: "WKProduct") as? String) ?? "Whykiki Audio"
+        let version = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "0.0.0"
+        let alert = NSAlert()
+        alert.messageText = "\(name) Updater \(version)"
+        alert.informativeText = "Copyright © 2026 Whykiki Audio\nAGPL-3.0-only · Ohne Gewährleistung\nQuellcode und Lizenz dieser Version:\nhttps://github.com/TheWhykiki/\(name)/tree/v\(version)"
+        alert.addButton(withTitle: "Schließen")
+        alert.addButton(withTitle: "Quellcode und Lizenz öffnen")
+        if alert.runModal() == .alertSecondButtonReturn,
+           let product = Product(rawValue: name), let parsedVersion = try? Version(version) {
+            NSWorkspace.shared.open(URL(string: "https://github.com/TheWhykiki/\(product.rawValue)/tree/v\(parsedVersion)")!)
+        }
+    }
     @objc func closeWindow() {
         if record != nil { window?.performClose(nil) }
         else { NSApp.terminate(nil) }
@@ -324,7 +341,7 @@ final class UpdaterApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let ready = Result {
                 try self.operations.rejectDowngrade(product, prepared.candidate.version)
                 try require(try self.operations.usersOfPlugin(product).isEmpty, "Eine weitere Anwendung verwendet dieses Plugin. Bitte alle DAWs schließen.")
-                do { try prepared.candidate.verifyDownload(prepared.file) }
+                do { try self.operations.revalidate(prepared) }
                 catch { throw DownloadIntegrityFailure(underlying: error) }
             }
             DispatchQueue.main.async {
@@ -338,6 +355,8 @@ final class UpdaterApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     self.closeButton.title = "Fenster schließen"
                     // Recheck after the asynchronous preparation; another Installer may have opened.
                     try require(!self.operations.installerRunning(), "macOS-Installer wurde inzwischen geöffnet. Bitte zuerst diese Installation abschließen.")
+                    do { try prepared.candidate.verifyDownload(prepared.file) }
+                    catch { throw DownloadIntegrityFailure(underlying: error) }
                     self.operations.openInstaller(prepared.file) { error in
                         DispatchQueue.main.async {
                             self.busy = false
@@ -452,6 +471,7 @@ final class UpdaterApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 // Explicit boundaries let the tests drive the real AppKit controller without
 // opening Installer, touching installed plugins or contacting the network.
 struct UpdaterOperations {
+    var revalidate: (PreparedPackage) throws -> Void = PackageService.revalidate
     var httpConfiguration: () -> URLSessionConfiguration = { .ephemeral }
     var confirmDeferredCompletion: (URL) -> Bool = { recoveryApp in
         let alert = NSAlert()
@@ -469,7 +489,7 @@ struct UpdaterOperations {
         }
         let info = try PropertyListSerialization.propertyList(from: Data(contentsOf: destination.appendingPathComponent("Contents/Info.plist")), format: nil) as? [String: Any]
         try require(info?["WKProduct"] as? String == product.rawValue, "Gesicherter Updater gehört zu einem anderen Plugin")
-        try verifiedTool("/usr/bin/codesign", ["--verify", "--deep", "--strict", destination.path], message: "Der Updater für die Wiederaufnahme konnte nicht gesichert werden")
+        try SignerPolicy.embedded().validateApplication(ApplicationSignature.sliceSHA256(destination))
     }
     var prepare: (URL, UpdateCandidate, Product, URL) throws -> PreparedPackage = {
         try PackageService.prepare($0, candidate: $1, product: $2, workspace: $3)

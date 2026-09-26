@@ -4,7 +4,11 @@ if(CMAKE_HOST_APPLE)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version" FORCE)
     set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "Universal macOS build" FORCE)
 endif()
-project(SubLab808 VERSION 1.4.0 LANGUAGES C CXX)
+include(cmake/ReleaseProduct.cmake)
+project(SubLab808 VERSION ${WK_PRODUCT_VERSION} LANGUAGES C CXX)
+if(NOT PROJECT_NAME STREQUAL WK_PRODUCT_NAME)
+    message(FATAL_ERROR "release/product.json does not identify this project")
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,12 +20,21 @@ endif()
 
 include(FetchContent)
 set(SUBLAB808_JUCE_PATH "" CACHE PATH "Optional path to a local JUCE checkout")
-set(SUBLAB808_JUCE_COMMIT "91ad83ae34a81e0833b1a2b0866f54846370ae53")
+set(SUBLAB808_JUCE_COMMIT "${WK_JUCE_COMMIT}")
+if(NOT SUBLAB808_JUCE_PATH AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/JUCE/CMakeLists.txt")
+    set(SUBLAB808_JUCE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/external/JUCE")
+endif()
 if (SUBLAB808_JUCE_PATH AND EXISTS "${SUBLAB808_JUCE_PATH}/CMakeLists.txt")
-    execute_process(COMMAND git -C "${SUBLAB808_JUCE_PATH}" rev-parse HEAD
-        OUTPUT_VARIABLE SUBLAB808_LOCAL_JUCE_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE)
-    if (NOT SUBLAB808_LOCAL_JUCE_COMMIT STREQUAL SUBLAB808_JUCE_COMMIT)
-        message(FATAL_ERROR "SUBLAB808_JUCE_PATH must point to JUCE commit ${SUBLAB808_JUCE_COMMIT}")
+    if(EXISTS "${SUBLAB808_JUCE_PATH}/.git")
+        execute_process(COMMAND git -C "${SUBLAB808_JUCE_PATH}" rev-parse HEAD
+            OUTPUT_VARIABLE SUBLAB808_LOCAL_JUCE_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(NOT SUBLAB808_LOCAL_JUCE_COMMIT STREQUAL SUBLAB808_JUCE_COMMIT)
+            message(FATAL_ERROR "SUBLAB808_JUCE_PATH must point to JUCE commit ${SUBLAB808_JUCE_COMMIT}")
+        endif()
+    elseif(SUBLAB808_JUCE_PATH STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}/external/JUCE")
+        wk_validate_source_juce("${CMAKE_CURRENT_SOURCE_DIR}")
+    else()
+        message(FATAL_ERROR "Unversioned external JUCE is accepted only from a verified source archive")
     endif()
     add_subdirectory("${SUBLAB808_JUCE_PATH}" JUCE)
 else()
@@ -78,12 +91,12 @@ endif()
 include(cmake/JuceVST3ManifestHelperPlatform.cmake)
 
 juce_add_plugin(SubLab808
-    COMPANY_NAME "Whykiki Audio"
-    BUNDLE_ID "audio.whykiki.sublab808"
-    PLUGIN_MANUFACTURER_CODE Wkik
-    PLUGIN_CODE Sl08
+    COMPANY_NAME "${WK_PRODUCT_MANUFACTURER}"
+    BUNDLE_ID "${WK_PRODUCT_BUNDLE_ID}"
+    PLUGIN_MANUFACTURER_CODE "${WK_PLUGIN_MANUFACTURER_CODE}"
+    PLUGIN_CODE "${WK_PLUGIN_CODE}"
     FORMATS VST3
-    PRODUCT_NAME "SubLab808"
+    PRODUCT_NAME "${WK_PRODUCT_NAME}"
     IS_SYNTH TRUE
     NEEDS_MIDI_INPUT TRUE
     VST3_CATEGORIES Instrument Synth
@@ -297,3 +310,12 @@ add_test(NAME SubLab808WindowsReleaseBootstrap COMMAND "${Python3_EXECUTABLE}" -
     -s "${CMAKE_CURRENT_SOURCE_DIR}/scripts/tests" -p "test_windows_release_bootstrap.py")
 add_test(NAME SubLab808WindowsReleaseState COMMAND "${Python3_EXECUTABLE}" -B -m unittest discover
     -s "${CMAKE_CURRENT_SOURCE_DIR}/scripts/tests" -p "test_windows_release_state.py")
+
+# Shared release policy and corresponding-source archive verification.
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME SubLab808SharedReleaseContract COMMAND "${Python3_EXECUTABLE}" -B -m unittest discover
+    -s "${CMAKE_CURRENT_SOURCE_DIR}/scripts/tests" -p "test_source_release.py")
+foreach(contract_suite owner_promotion release_protection release_gate_key)
+    add_test(NAME SubLab808_${contract_suite} COMMAND "${Python3_EXECUTABLE}" -B -m unittest discover
+        -s "${CMAKE_CURRENT_SOURCE_DIR}/scripts/tests" -p "test_${contract_suite}.py")
+endforeach()

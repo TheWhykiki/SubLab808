@@ -93,6 +93,14 @@ struct MsiUpgradeRow
     std::string actionProperty;
 };
 
+struct MsiSequenceRow
+{
+    std::string action;
+    std::string condition;
+    std::string sequence;
+};
+bool hasSafeMsiExecuteSequence(const std::vector<MsiSequenceRow>& rows);
+
 bool isForbiddenMsiSideEffectTable(std::string_view table);
 bool isForbiddenMsiSequenceAction(std::string_view action);
 bool isForbiddenMsiProperty(std::string_view property);

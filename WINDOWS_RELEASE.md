@@ -31,7 +31,7 @@ Releases nachträglich; der Workflow prüft sie deshalb vor Authorization, Stage
 Finalize jeweils fail-closed über das separate Administration-Read-Token.
 
 Unter **Settings → Environments** muss außerdem vor dem ersten Lauf das
-Environment `physical-daw-release` angelegt werden. Es braucht mindestens einen
+Environments `release-signing` und `physical-daw-release` angelegt werden. Es braucht mindestens einen
 expliziten Benutzer als **Required reviewer** (keine Teams), aktiviertes **Prevent self-review** und
 deaktiviertes **Allow administrators to bypass configured protection rules**.
 Seine Deployment-Branches werden auf **Protected branches only** begrenzt; der
@@ -53,15 +53,15 @@ nicht exakt passender Review-Kommentar verhindert die Promotion.
 
 | Typ | Name | Inhalt |
 | --- | --- | --- |
-| Secret | `WINDOWS_CODE_SIGNING_PFX_BASE64` | Base64-kodierte PFX-Datei mit genau einem privaten Code-Signing-Schlüssel |
-| Secret | `WINDOWS_CODE_SIGNING_PFX_PASSWORD` | Passwort der PFX-Datei |
-| Secret | `WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64` | Kanonisches Base64 einer separaten ECDSA-P-256-PKCS#8-Private-Key-Datei; signiert ausschließlich kurzlebige N→N+1-Abnahmefreigaben |
-| Secret | `IMMUTABLE_RELEASES_ADMIN_READ_TOKEN` | Eng begrenztes Fine-grained-PAT oder GitHub-App-Token mit ausschließlich Repository-Administration-Lesezugriff zur fail-closed Prüfung von `immutable-releases.enabled=true`; nie an Build- oder Acceptance-Jobs übergeben |
-| Variable | `WINDOWS_CODE_SIGNING_CERT_SHA256` | Öffentlicher, 64-stelliger SHA-256-Fingerprint des aktuellen Windows-Leaf-Zertifikats |
-| Variable | `WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256` | Optionaler, vom aktuellen Pin verschiedener 64-stelliger SHA-256-Fingerprint des nächsten Windows-Leaf-Zertifikats |
-| Variable | `WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY` | Zum Private Key gehöriger P-256-Public-Key als exakt 128 Großhex-Zeichen `X||Y` |
-| Variable | `WINDOWS_RELEASE_GATE_NEXT_PUBLIC_KEY_XY` | Optionaler, verschiedener nächster P-256-Public-Key im selben Format für eine vorbereitete Gate-Key-Rotation |
-| Variable | `WINDOWS_RFC3161_TIMESTAMP_URL` | Absolute HTTPS-URL des RFC-3161-Zeitstempeldienstes |
+| Variable | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` | GitHub-OIDC-Föderation für das geschützte Signing-Environment |
+| Variable | `WINDOWS_ARTIFACT_SIGNING_ENDPOINT` | Regionaler HTTPS-Endpunkt `https://<region>.codesigning.azure.net` |
+| Variable | `WINDOWS_ARTIFACT_SIGNING_ACCOUNT`, `WINDOWS_ARTIFACT_SIGNING_PROFILE` | Validierter Public-Trust-Account und Zertifikatsprofil |
+| Variable | `WINDOWS_ARTIFACT_SIGNING_PROFILE_EKU` | Vollständiger dauerhafter Profil-EKU `1.3.6.1.4.1.311.97.<vier Identitäts-Arcs>` |
+| Variable | `WINDOWS_NEXT_ARTIFACT_SIGNING_PROFILE_EKU` | Optionaler verschiedener nächster Profil-EKU für eine Bridge-Rotation |
+| Variable | `WINDOWS_RELEASE_GATE_KEY_VAULT_KEY_ID` | Exakte versionierte HTTPS-Key-ID eines nicht exportierbaren, aktivierten EC-HSM/P-256-Schlüssels |
+| Variable | `WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY` | Aktueller P-256-Public-Key als 128 Großhex-Zeichen `X||Y` |
+| Variable | `WINDOWS_RELEASE_GATE_NEXT_PUBLIC_KEY_XY` | Optionaler verschiedener nächster P-256-Public-Key |
+| Secret | `IMMUTABLE_RELEASES_ADMIN_READ_TOKEN` | Eng begrenztes Administration-Read-Token zum Prüfen von Schutz und Release-Immutability |
 | Secret | `MACOS_DEVELOPER_ID_APPLICATION_P12_BASE64` | Base64-kodiertes Developer-ID-Application-Zertifikat samt privatem Schlüssel |
 | Secret | `MACOS_DEVELOPER_ID_APPLICATION_P12_PASSWORD` | Passwort der Application-P12-Datei |
 | Secret | `MACOS_DEVELOPER_ID_INSTALLER_P12_BASE64` | Base64-kodiertes Developer-ID-Installer-Zertifikat samt privatem Schlüssel |
@@ -74,28 +74,27 @@ nicht exakt passender Review-Kommentar verhindert die Promotion.
 | Variable | `MACOS_NOTARY_KEY_ID` | Zehnstellige App-Store-Connect-Key-ID |
 | Variable | `MACOS_NOTARY_ISSUER_ID` | App-Store-Connect-Issuer-UUID |
 
-Die SHA-256-Pins sind absichtlich öffentliche Repository-Variablen. Der aktuelle
-Windows-Pin wird vor dem Build exakt in Updater und Plug-in-Launcher kompiliert.
-Nur der Updater erhält zusätzlich den optionalen nächsten Pin als eng begrenzte
-Payload-Allowlist für einen Zertifikatswechsel; der Launcher und die
-Selbstprüfung des Updaters akzeptieren weiterhin ausschließlich den aktuellen
-Pin. Beide Pins müssen eindeutig und jeweils exakt 64 Hex-Zeichen lang sein.
+Windows vertraut dauerhaften Profil-EKUs. `WinVerifyTrust`, Code-Signing-EKU,
+Public-Trust-Marker und authentifizierter RFC3161-Zeitstempel sind zusätzliche
+Pflichtprüfungen. Der aktuelle Pin schützt Launcher und Selbstprüfung; aktueller
+und optional nächster Pin autorisieren Payloads. Die täglich erneuerten
+Leaf-Zertifikate werden ausschließlich in der Evidence dokumentiert.
 
-Die Release-Gate-Autorisierung verwendet absichtlich ein davon unabhängiges
-ECDSA-P-256-Schlüsselpaar. Der Workflow importiert den privaten PKCS#8-Key nur
-in den eng begrenzten Verifikations- und Acceptance-Schritten, leitet daraus
-den Public Key ab und verlangt bytegenaue Übereinstimmung mit
-`WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY`. Der Private Key wird weder an Build-,
-Packaging-, Stage- noch Finalize-Prozesse vererbt. Der aktuelle und optional
-nächste Public Key werden dagegen in den Updater kompiliert und in der Evidence
-gebunden, damit eine Rotation über genau einen Bridge-Release möglich bleibt.
+`azure/login` nutzt GitHub OIDC und eine auf das geschützte Environment gebundene
+Federated Identity. Die Rolle `Artifact Signing Certificate Profile Signer`
+wird ausschließlich dem passenden Profil zugeordnet. Der gepinnte Microsoft-SDK-
+Client und x64-SignTool signieren über Azure; keine Windows-PFX und kein privater
+Gate-Key verlassen den Dienst. RFC3161 verwendet ausschließlich
+`http://timestamp.acs.microsoft.com/`; der Zeitstempel selbst wird kryptografisch
+validiert. Build- und Hosttest bleiben auf Windows on Arm nativ, SignTool+dlib
+laufen im unterstützten x64-Modus.
 
-Die Windows-PFX wird in einen zufälligen laufbezogenen `CurrentUser`-Store
-importiert. Eine restriktive Datei-ACL gibt nur dem Runner-Benutzer Zugriff. Der
-Workflow verlangt genau ein gültiges privates Leaf-Zertifikat mit
-Code-Signing-EKU und vergleicht dessen SHA-256-Fingerprint bytegenau mit der
-Variable. Ein `if: always()`-Schritt entfernt PFX und genau diesen Store; der Job
-scheitert, falls der Store danach noch existiert.
+Der unabhängige Release-Gate-Key liegt als nicht exportierbarer EC-HSM/P-256-Key
+in Azure Key Vault. OIDC erhält nur die erforderlichen Get-/Sign-Rechte für den
+exakten Key. Der Helper prüft Key-Version, öffentlichen Punkt, aktivierten Status,
+`exportable=false` und fehlende Release-Policy. Die Signatur wird lokal gegen den
+eingebetteten Public Key geprüft und auf Low-S normalisiert. Aktueller und
+optional nächster Public Key bleiben in Helper und Evidence gebunden.
 
 Auf macOS liegen beide P12-Dateien und der Notary-P8-Schlüssel ausschließlich in
 einem zufälligen Verzeichnis mit Modus 0700. Beide Zertifikate werden in einen
@@ -117,25 +116,19 @@ Windows baut und testet in getrennten nativen Jobs:
   `-A ARM64EC`.
 
 CMake erhält bereits vor dem Build exakt
-`SUBLAB808_WINDOWS_UPDATER_SIGNER_SHA256`, optional den davon verschiedenen
-`SUBLAB808_WINDOWS_UPDATER_NEXT_SIGNER_SHA256`, den exakt 128-stelligen
+`SUBLAB808_WINDOWS_UPDATER_PROFILE_EKU`, optional den davon verschiedenen
+`SUBLAB808_WINDOWS_UPDATER_NEXT_PROFILE_EKU`, den exakt 128-stelligen
 `SUBLAB808_WINDOWS_RELEASE_GATE_PUBLIC_KEY_XY` und optional den davon
 verschiedenen `SUBLAB808_WINDOWS_RELEASE_GATE_NEXT_PUBLIC_KEY_XY`. Die
 Production-VST3 enthält genau den Updater unter
 `Contents\Helpers\SubLab808Updater.exe`. Der MSI-Packager
-erhält den exakten Updaterpfad, nativen Hosttest, `SignTool`, Zeitstempel-URL,
-Zertifikats-Store/-Thumbprint, `ExpectedSignerSha256` und optional
-`ExpectedNextSignerSha256`. Die PFX und sämtliche tatsächlich erzeugten
-Signaturen müssen immer dem aktuellen Pin entsprechen; der nächste Pin erteilt
-keine Berechtigung zum Signieren dieses Builds. Entsprechend muss der aktive
-Release-Gate-Private-Key exakt zum aktuellen Gate-Public-Key gehören; der
-nächste Gate-Key darf noch keine Autorisierung ausstellen. Der Packager signiert sämtliche
-PE-Dateien im Payload, prüft die administrativ extrahierte MSI-Nutzlast mit dem
-Hosttest und signiert zuletzt das MSI. Die Windows-Evidence in Schema 4 bindet
-aktuellen Pin, optionalen nächsten Pin und die daraus geordnete Payload-Allowlist
-`[current]` beziehungsweise `[current, next]`. Evidence-Schema 4 bindet außerdem
-`releaseGatePublicKeyXY`, den optionalen `releaseGateNextPublicKeyXY` und die
-geordneten `releaseGatePublicKeyAllowlistXY` nach demselben Current/Next-Prinzip.
+erhält den exakten Updaterpfad, nativen Hosttest, x64-SignTool, gepinnten dlib-Pfad
+samt SHA-256, OIDC-Metadaten und `ExpectedProfileEku` / `ExpectedNextProfileEku`.
+Alle Payload-PEs und MSI gehören zum aktuellen Profil. Der Packager prüft die
+MSI-Sequenz und 14 reale Tabellenmutationen, signiert die Artefakte und validiert
+die extrahierte Nutzlast im nativen Host. Evidence-Schema 5 mit
+`releaseContractVersion=2` bindet Profil-Allowlist, tatsächliche Leaf- und
+Timestamp-Fingerprints je signierter Datei, beide Gate-Public-Keys und ihre Allowlist.
 Sie enthält zusätzlich den exakten
 40-stelligen Tag-Commit. Der Stage-Job akzeptiert x64 und ARM64EC nur, wenn
 beide Commitwerte mit seinem erneut von `origin` geprüften Tag übereinstimmen.
@@ -158,7 +151,7 @@ ausschließlich die ProductCode-genaue MSI-Deinstallation.
 
 Der Autorisierungsjob liest die vollständige öffentliche Release-Liste über
 `gh api --paginate --slurp` mit API-Version `2026-03-10`. Der Resolver akzeptiert
-nur exakte, immutable stabile Releases mit dem vollständigen Set aus acht
+nur exakte, immutable stabile Releases mit dem vollständigen Set aus neun
 Cross-Platform-Assets oder vollständige immutable Prereleases als dauerhaft
 sichtbare Quarantänen.
 Er bindet Produkt, Candidate-Tag, Baseline-ID/-Tag/-Commit und einen kanonischen
@@ -245,9 +238,13 @@ Ein vollständiger Release enthält exakt diese Plattformdateien:
 - `SubLab808-<Version>-macOS-universal.pkg`
 - `SubLab808-<Version>-macOS-universal-VST3.zip`
 - `SubLab808-<Version>-macOS-universal.evidence.json`
+- `SubLab808-<Version>-Source.zip`
 - `SubLab808-<Version>-SHA256SUMS.txt`
 
 ## Physische Cubase-/Reaper-Freigabe
+
+Die Receipt verwendet `macos-universal-pkg` und `macos-universal-zip` als
+Artefaktkennungen; jede wird getrennt auf `x86_64` und `arm64` geprüft.
 
 Es gibt bewusst keinen angeblichen automatischen Cubase- oder Reaper-Test:
 GitHub-hosted Runner enthalten diese DAWs nicht, und das Repository setzt keine
@@ -255,13 +252,14 @@ nicht vorhandene Self-hosted-DAW-Farm voraus. Nach den automatischen Gates warte
 der Job `physical-daw-acceptance` deshalb ohne belegten Runner im geschützten
 Environment. Die prüfende Person lädt die Dateien aus der im Job verlinkten,
 öffentlichen immutable Prerelease-ID, vergleicht deren SHA-256-Werte mit den
-serverseitigen `digest`-Feldern und führt auf physischer Hardware diese acht
+serverseitigen `digest`-Feldern und führt auf physischer Hardware diese zwölf
 Abnahmen aus:
 
 - Windows x64 MSI in Cubase und Reaper;
 - Windows ARM64EC MSI in Cubase und Reaper;
-- macOS universal in Cubase und Reaper, jeweils für den PKG-installierten und
-  den aus dem ZIP bereitgestellten VST3-Pfad.
+- macOS auf physischem Intel und nativem Apple Silicon jeweils in Cubase und
+  Reaper, jeweils für den PKG-installierten und den aus dem ZIP bereitgestellten
+  VST3-Pfad. CPU und Host-Prozessarchitektur werden separat dokumentiert.
 
 Jede Abnahme umfasst Installation beziehungsweise Kopie, Plug-in-Rescan,
 Instanziierung, Audioverarbeitung, State-Save/-Reload, Downgrade-Ablehnung auf
@@ -271,52 +269,30 @@ gestapelten Notarisierungstickets aktiv. `machine` ist nur ein nicht geheimes
 Inventar-Alias, niemals Seriennummer, Benutzername oder sonstiges Geheimnis.
 
 Erst danach darf ein anderer Required Reviewer den wartenden Environment-Job
-freigeben. Sein Kommentar muss ausschließlich ein JSON-Objekt nach Schema 1
+freigeben. Sein Kommentar muss ausschließlich ein JSON-Objekt nach Schema 2
 enthalten; Markdown-Fences oder Begleittext sind nicht zulässig. Die exakten
 Werte für `runId`, `runAttempt`, `releaseId`, `tag`, `commit`,
 `assetManifestSha256` und die vier Digests stehen in der Zusammenfassung von
 `stage-release`. Vor dem Einfügen werden alle Platzhalter ersetzt:
 
-```json
-{
-  "schemaVersion": 1,
-  "repository": "TheWhykiki/SubLab808",
-  "product": "SubLab808",
-  "runId": 123456789,
-  "runAttempt": 1,
-  "releaseId": 987654321,
-  "tag": "v1.4.1",
-  "commit": "0000000000000000000000000000000000000000",
-  "assetManifestSha256": "0000000000000000000000000000000000000000000000000000000000000000",
-  "artifacts": {
-    "SubLab808-1.4.1-Windows-x64.msi": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-    "SubLab808-1.4.1-Windows-arm64ec.msi": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-    "SubLab808-1.4.1-macOS-universal.pkg": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-    "SubLab808-1.4.1-macOS-universal-VST3.zip": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-  },
-  "checks": [
-    {"platform":"windows-x64-msi","host":"Cubase","hostVersion":"13.0.50","osVersion":"Windows 11 24H2","machine":"qa-win-x64-01","tester":"qa-operator","testedAt":"2026-09-08T12:00:00Z","result":"pass"},
-    {"platform":"windows-x64-msi","host":"Reaper","hostVersion":"7.50","osVersion":"Windows 11 24H2","machine":"qa-win-x64-01","tester":"qa-operator","testedAt":"2026-09-08T12:10:00Z","result":"pass"},
-    {"platform":"windows-arm64ec-msi","host":"Cubase","hostVersion":"13.0.50","osVersion":"Windows 11 24H2 ARM64","machine":"qa-win-arm-01","tester":"qa-operator","testedAt":"2026-09-08T12:20:00Z","result":"pass"},
-    {"platform":"windows-arm64ec-msi","host":"Reaper","hostVersion":"7.50","osVersion":"Windows 11 24H2 ARM64","machine":"qa-win-arm-01","tester":"qa-operator","testedAt":"2026-09-08T12:30:00Z","result":"pass"},
-    {"platform":"macos-universal-pkg","host":"Cubase","hostVersion":"13.0.50","osVersion":"macOS 15.6","machine":"qa-mac-01","tester":"qa-operator","testedAt":"2026-09-08T12:40:00Z","result":"pass"},
-    {"platform":"macos-universal-pkg","host":"Reaper","hostVersion":"7.50","osVersion":"macOS 15.6","machine":"qa-mac-01","tester":"qa-operator","testedAt":"2026-09-08T12:50:00Z","result":"pass"},
-    {"platform":"macos-universal-zip","host":"Cubase","hostVersion":"13.0.50","osVersion":"macOS 15.6","machine":"qa-mac-01","tester":"qa-operator","testedAt":"2026-09-08T13:00:00Z","result":"pass"},
-    {"platform":"macos-universal-zip","host":"Reaper","hostVersion":"7.50","osVersion":"macOS 15.6","machine":"qa-mac-01","tester":"qa-operator","testedAt":"2026-09-08T13:10:00Z","result":"pass"}
-  ]
-}
-```
+Die vollständige [Receipt-Vorlage](release/physical-daw-receipt.example.json)
+enthält alle zwölf Prüfungen mit Status `not-run`. Erst tatsächliche erfolgreiche
+Läufe auf `pass` setzen. `cpuArchitecture`, `hostProcessArchitecture`,
+`loadedVst3Path` und `loadedVst3Sha256` identifizieren die geladene Binärdatei.
+Die [Abnahmeanleitung](scripts/acceptance/RELEASE_ACCEPTANCE.md) beschreibt die
+Pflichtfälle und die Preset-/Audio-Prüfungen.
 
 Nach der Freigabe liest der Job über den dokumentierten REST-Endpunkt
 `GET /repos/{owner}/{repo}/actions/runs/{run_id}/approvals` die Review-Historie.
-Er akzeptiert genau einen Eintrag: `state` muss exakt `approved` sein,
+Er wählt genau einen Eintrag für das physische Environment; separate
+`release-signing`-Reviews sind erlaubt. `state` muss exakt `approved` sein,
 `environments` muss ausschließlich ID und Name des aktuellen
 `physical-daw-release` enthalten, `user.id` und `user.login` müssen exakt einen
 direkt im Environment konfigurierten Benutzer benennen, dieser darf weder per
 stabiler User-ID noch per Login ursprünglicher Workflow-Aktor oder Re-run-Aktor
 sein und `comment` muss das obige Receipt
-erfüllen. Zusätzliche, abgelehnte, unklare oder zu einem anderen Versuch
-gehörende Review-Einträge sind fail-closed. Zusätzlich werden das Environment
+erfüllen. Doppelte, gemischte, abgelehnte oder unklare physische Reviews sind
+fail-closed. Das Environment muss `can_admins_bypass=false` melden. Zusätzlich werden das Environment
 über `GET /repos/{owner}/{repo}/environments/physical-daw-release`, der Run über
 `GET /repos/{owner}/{repo}/actions/runs/{run_id}`, der aktuelle Default Branch
 über `GET /repos/{owner}/{repo}/branches/{branch}` und der Candidate über seine
@@ -326,12 +302,16 @@ Receipt-Umschlag übernommen. Zwei Compare-API-Antworten müssen zusätzlich
 `status=ahead|identical` liefern und Candidate- sowie Workflow-Commit jeweils
 als exakten Merge-Base des beobachteten Tips belegen.
 
-Der Validator verlangt die vollständige Cubase-/Reaper-Matrix mit acht
+Der Validator verlangt die vollständige Cubase-/Reaper-Matrix mit zwölf
 `result=pass`, nachvollziehbaren DAW-/OS-Versionen, Maschinen-Alias, Tester und
 UTC-Zeitpunkt nach Veröffentlichung des Candidates. Das Receipt bindet zudem
-Run-ID und -Attempt, Release-ID, Tag-Commit, den kanonischen Digest aller acht
+Run-ID und -Attempt, Release-ID, Tag-Commit, den kanonischen Digest aller neun
 Asset-Metadaten und die serverseitigen Digests der vier installierbaren
-Artefakte. Der validierte kanonische Receipt-Umschlag wird 90 Tage als
+Artefakte. Die drei Evidence-JSON-Dateien werden über ihre unveränderlichen
+Asset-Digests gebunden; die darin belegten Payload-Hashes müssen mit jeder
+`loadedVst3Sha256` übereinstimmen. Eine alte installierte Plugin-Kopie oder ein
+Rosetta-Prozess erfüllen die native Apple-Silicon-Prüfung nicht.
+Der validierte kanonische Receipt-Umschlag wird 90 Tage als
 Actions-Artefakt aufbewahrt; SHA-256 und Base64-Inhalt werden zusätzlich in
 die bei der Promotion gesetzten Release Notes geschrieben. Reviewer-Login und
 stabile GitHub-User-ID sowie Environment-ID bleiben darin dauerhaft gebunden,
@@ -365,7 +345,7 @@ API-Version `2026-03-10`.
 
 `stage-release` besitzt `contents: write`, verweigert vorhandene Releases zum
 Candidate-Tag, erstellt einen Draft und merkt sich sofort dessen exakte ID.
-Alle acht Dateien werden über den ID-spezifischen Upload-Endpunkt angehängt.
+Alle neun Dateien werden über den ID-spezifischen Upload-Endpunkt angehängt.
 Vor Sichtbarkeit müssen der Draft per ID, Tag, explizit beim POST gespeicherten
 40-hex `target_commitish`, Run-Marker, vollständigem Namenssatz, Größen,
 Asset-IDs und serverseitigen SHA-256-Digests übereinstimmen. Der Workflow prüft
@@ -382,7 +362,7 @@ Release-Gate-Private-Key; ohne eine dazu passende kurzlebige Signatur kann kein
 lokaler Prozess einen quarantänisierten Prerelease in den UAC-Pfad treiben. Der
 anschließende Environment-Job erhält keine Signing- oder Notary-Secrets. Nur
 wenn beide nativen Gates und das oben beschriebene physische Receipt erfolgreich
-sind und Release-ID, acht
+sind und Release-ID, neun
 Asset-Metadaten, Immutability, Origin-Tag, Baseline, gesamte übrige Historie und
 vorheriges Latest nochmals unverändert sind, setzt `finalize-release` dieselbe
 ID auf `prerelease=false` und `make_latest=true`. Titel und Notes werden dabei
@@ -412,45 +392,23 @@ Environment-Freigabe Pflicht. GitHub Actions validiert nur Identität, Umfang un
 Bindung der menschlichen Attestation; es behauptet nicht, diese Abnahmen selbst
 ausgeführt zu haben.
 
-## Windows-Zertifikatswechsel
+## Windows-Profilwechsel
 
-Ein Zertifikatswechsel von A nach B verwendet einen expliziten Bridge-Release:
+Ein täglicher Leaf-Wechsel innerhalb desselben Artifact-Signing-Profils benötigt
+keinen Release. Ein Wechsel des dauerhaften Profil-EKUs A→B benötigt eine Bridge:
 
-1. Solange A noch gültig und verfügbar ist, bleiben PFX und
-   `WINDOWS_CODE_SIGNING_CERT_SHA256` auf A. Zusätzlich wird
-   `WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256` auf B gesetzt. Der so gebaute
-   Bridge-Release ist vollständig mit A signiert; nur sein Updater akzeptiert
-   für ein später heruntergeladenes MSI A oder B.
-2. Der Bridge-Release wird veröffentlicht und auf beiden Windows-Architekturen
-   installiert sowie als Updatequelle geprüft. A bleibt aktueller Pin und B
-   bleibt nächster Pin, bis die vorgesehene Client-Population sicher auf dieser
-   Bridge-Version oder neuer angekommen ist. Der nächste Pin darf nicht vorher
-   aus der Release-Konfiguration zurückgenommen werden.
-3. Erst danach wechseln PFX und `WINDOWS_CODE_SIGNING_CERT_SHA256` gemeinsam auf
-   B. Für den ersten vollständig mit B signierten Release wird
-   `WINDOWS_NEXT_CODE_SIGNING_CERT_SHA256` geleert, sofern nicht bereits ein
-   davon verschiedener Pin C für die nächste geplante Rotation benötigt wird.
-   Das Leeren verändert den bereits veröffentlichten, unveränderlichen
-   A/B-Bridge-Updater nicht.
-4. Der A/B-Bridge-Release bleibt dauerhaft als stabiler Release verfügbar. Er
-   darf weder gelöscht noch als Draft oder Prerelease umklassifiziert werden,
-   solange ältere Installationen noch existieren können.
+1. Aktuelles Profil und `WINDOWS_ARTIFACT_SIGNING_PROFILE_EKU` bleiben A;
+   `WINDOWS_NEXT_ARTIFACT_SIGNING_PROFILE_EKU` wird B. Die Bridge wird mit A signiert.
+2. Die Bridge wird auf beiden Architekturen installiert und als Updatequelle geprüft.
+3. Erst danach wechseln Signing-Profil und aktueller Profil-EKU gemeinsam auf B.
+   Next wird geleert oder auf ein vorbereitetes C gesetzt.
+4. Die immutable A/B-Bridge bleibt für ältere Installationen verfügbar.
 
-Der Windows-Updater fragt dafür höchstens 100 veröffentlichte Releases ab und
-wählt den semantisch kleinsten stabilen Release, der neuer als seine installierte
-Version ist. So erreicht auch ein länger offline gewesener A-Client zuerst die
-A/B-Bridge und erst beim folgenden Update einen B-signierten Release. Liefert die
-API exakt 100 Einträge, fehlt die Bridge in dieser begrenzten Historie, ist die
-Versionsfolge mehrdeutig oder schlägt eine Signaturprüfung fehl, beendet der
-Updater den Vorgang fail-closed. Dann ist eine manuelle Installation eines
-vertrauenswürdig bezogenen, signierten Pakets erforderlich.
-
-Launcher und Updater-Selbstprüfung bleiben in jedem Release auf den jeweiligen
-aktuellen Pin festgelegt. Nur das heruntergeladene MSI darf current oder next
-verwenden. Nach dessen Prüfung müssen MSI und ausnahmslos alle PE-Dateien des
-Payloads denselben tatsächlich ermittelten Leaf-Fingerprint besitzen. Es gibt
-keinen Subject-/Issuer-Fallback und keine gemischten Signer innerhalb eines
-Pakets.
+Der Updater wählt innerhalb der begrenzten Historie den kleinsten neueren Stable-
+Release und überspringt so keine Bridge. Fehlende Bridge, mehrdeutige Historie
+oder ungültige Signatur erfordern eine manuelle vertrauenswürdige Neuinstallation.
+MSI und alle enthaltenen PEs müssen dasselbe Profil verwenden; unterschiedliche
+tagesaktuelle Leaf-Zertifikate desselben Profils sind zulässig und werden attestiert.
 
 ## Windows-Release-Gate-Keywechsel
 
@@ -470,7 +428,8 @@ eigenen Bridge-Release:
    enthaltenen Key blockiert vor dem Staging.
 
 Public Keys sind exakt 128 Großhex-Zeichen `X||Y` auf der NIST-P-256-Kurve.
-Private Keys sind kanonisches Base64 einer PKCS#8-Struktur. Signaturen sind
+Private Keys bleiben nicht exportierbar in Azure Key Vault; bei Rotation wechseln
+versionierte Key-ID und öffentlicher Pin gemeinsam. Signaturen sind
 SHA-256/ECDSA im festen 64-Byte-IEEE-P1363-Format und werden vor Übergabe auf
 Low-S normalisiert. Current und Next müssen verschieden sein; der aktive
 Private Key muss immer exakt Current entsprechen.

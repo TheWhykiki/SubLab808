@@ -162,11 +162,8 @@ import CryptoKit
             let package = temporary.appendingPathComponent("unsigned.pkg")
             try verifiedTool("/usr/bin/pkgbuild", ["--root", temporary.appendingPathComponent("backup").path,
                 "--identifier", "audio.whykiki.reverselab.pkg", "--version", "1.2.0", package.path], message: "Test package could not be built")
-            let bytes = try Data(contentsOf: package)
-            let unsigned = UpdateCandidate(version: candidate.version, url: candidate.url,
-                sha256: SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined(), size: bytes.count)
             do {
-                _ = try PackageService.prepare(package, candidate: unsigned, product: .reverse, workspace: temporary)
+                _ = try PackageService.installerSHA256(package)
                 throw UpdateFailure("Unsigned package unexpectedly accepted")
             } catch let error as UpdateFailure {
                 try require(error.message.contains("Installer-Signatur"), "Unsigned package failed at the wrong gate: " + error.message)

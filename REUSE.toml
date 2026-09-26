@@ -1,0 +1,10 @@
+version = 1
+
+# Original code and original presets only. Dependency trees keep upstream terms.
+[[annotations]]
+path = ["Source/**", "Tests/**", "Updater/**", "scripts/**", "cmake/**",
+        "Installer/**", "Presets/**", "release/**", "CMakeLists.txt",
+        ".github/**", ".config/**"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Whykiki Audio"
+SPDX-License-Identifier = "AGPL-3.0-only"

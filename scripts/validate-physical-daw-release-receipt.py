@@ -147,6 +147,7 @@ def validate(
     tag: str,
     commit: str,
     asset_manifest_sha256: str,
+    evidence_files: dict[str, bytes],
     now: dt.datetime | None = None,
 ) -> dict[str, Any]:
     if (
@@ -165,6 +166,8 @@ def validate(
     environment_id = _require_positive_int(environment.get("id"), "environment.id")
     if environment.get("name") != environment_name:
         _error("Environment response names a different environment")
+    if environment.get("can_admins_bypass") is not False:
+        _error("Physical acceptance environment must forbid admin bypass")
     rules = environment.get("protection_rules")
     if not isinstance(rules, list):
         _error("Environment protection rules are missing")
@@ -261,9 +264,28 @@ def validate(
     ):
         _error("Workflow-run actor identities are malformed")
 
-    if not isinstance(reviews, list) or len(reviews) != 1:
-        _error("Workflow run must contain exactly one deployment review")
-    review = _require_object(reviews[0], "Deployment review")
+    if not isinstance(reviews, list) or not reviews or len(reviews) > 100:
+        _error("Workflow run deployment review history is missing or oversized")
+    physical_reviews = []
+    for entry in reviews:
+        entry = _require_object(entry, "Deployment review")
+        environments = entry.get("environments")
+        if not isinstance(environments, list) or not environments:
+            _error("Deployment review environment identities are missing")
+        for reviewed in environments:
+            reviewed = _require_object(reviewed, "Deployment review environment")
+            _require_positive_int(reviewed.get("id"), "reviewed environment id")
+            if not isinstance(reviewed.get("name"), str) or not reviewed["name"]:
+                _error("Deployment review environment name is missing")
+        # Signing and physical acceptance are separate environments in the same
+        # run. An ID OR name match is relevant, so inconsistent identities cannot
+        # hide a duplicate/ambiguous physical review among signing approvals.
+        if any(reviewed["id"] == environment_id or reviewed["name"] == environment_name
+               for reviewed in environments):
+            physical_reviews.append(entry)
+    if len(physical_reviews) != 1:
+        _error("Workflow run must contain exactly one physical acceptance review")
+    review = physical_reviews[0]
     if review.get("state") != "approved":
         _error("Deployment review is not approved")
     reviewed_environments = review.get("environments")
@@ -290,7 +312,7 @@ def validate(
     }:
         _error("Workflow initiator or re-run initiator cannot attest acceptance")
     comment = review.get("comment")
-    if not isinstance(comment, str) or not comment or len(comment.encode("utf-8")) > 16384:
+    if not isinstance(comment, str) or not comment or len(comment.encode("utf-8")) > 24576:
         _error("Deployment review comment is missing or too large")
     receipt = _require_object(_parse_json(comment, "Deployment review comment"), "Receipt")
 
@@ -309,8 +331,8 @@ def validate(
     ):
         _error("Release is not the exact immutable staged candidate")
     assets_value = release.get("assets")
-    if not isinstance(assets_value, list) or len(assets_value) != 8:
-        _error("Release must contain exactly eight assets")
+    if not isinstance(assets_value, list) or len(assets_value) != 9:
+        _error("Release must contain exactly nine assets")
     assets: list[dict[str, Any]] = []
     for index, item in enumerate(assets_value):
         asset = _require_object(item, f"release.assets[{index}]")
@@ -336,6 +358,7 @@ def validate(
         f"{product}-{version}-macOS-universal.pkg",
         f"{product}-{version}-macOS-universal-VST3.zip",
         f"{product}-{version}-macOS-universal.evidence.json",
+        f"{product}-{version}-Source.zip",
         f"{product}-{version}-SHA256SUMS.txt",
     }
     if {asset["name"] for asset in assets} != expected_asset_names:
@@ -358,7 +381,7 @@ def validate(
     }
     _require_exact_keys(receipt, receipt_keys, "Receipt")
     expected_identity = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "repository": repository,
         "product": product,
         "runId": run_id,
@@ -386,20 +409,70 @@ def validate(
         if artifacts[name] != asset_by_name[name]["digest"]:
             _error(f"Receipt digest does not match release asset: {name}")
 
+    # Evidence bytes are bound to immutable GitHub asset digests before we use
+    # their payload hashes. A human-entered hash alone cannot attest the candidate.
+    expected_evidence = {
+        f"{product}-{version}-Windows-x64.evidence.json",
+        f"{product}-{version}-Windows-arm64ec.evidence.json",
+        f"{product}-{version}-macOS-universal.evidence.json",
+    }
+    if set(evidence_files) != expected_evidence:
+        _error("Physical acceptance requires the exact three release evidence files")
+    binary_hashes: dict[str, str] = {}
+    for name, encoded in evidence_files.items():
+        if not isinstance(encoded, bytes) or not 0 < len(encoded) <= 4 * 1024 * 1024:
+            _error("Release evidence bytes are missing or oversized")
+        if "sha256:" + hashlib.sha256(encoded).hexdigest() != asset_by_name[name]["digest"]:
+            _error("Physical evidence does not match the immutable release asset digest")
+        try:
+            evidence = _require_object(_parse_json(encoded.decode("utf-8"), name), name)
+        except UnicodeDecodeError as exc:
+            raise ContractError("Release evidence is not UTF-8") from exc
+        if evidence.get("product") != product or evidence.get("version") != version:
+            _error("Physical evidence names a different product or version")
+        if "-Windows-" in name:
+            architecture = "arm64ec" if "-arm64ec." in name else "x64"
+            if evidence.get("sourceCommit") != commit or evidence.get("artifactStatus") != "SIGNED":
+                _error("Windows evidence is not the signed candidate commit")
+            msi_name = f"{product}-{version}-Windows-{architecture}.msi"
+            if "sha256:" + str(evidence.get("msiSha256", "")).lower() != asset_by_name[msi_name]["digest"]:
+                _error("Windows evidence does not bind the installer digest")
+            folder = "arm64ec-win" if architecture == "arm64ec" else "x86_64-win"
+            relative = f"Contents\\{folder}\\{product}.vst3"
+            payload = evidence.get("payloadFiles")
+            if not isinstance(payload, list):
+                _error("Windows evidence has no payload inventory")
+            entries = [item for item in payload if isinstance(item, dict) and item.get("path") == relative]
+            if len(entries) != 1:
+                _error("Windows evidence lacks the exact plugin binary")
+            binary_hashes[f"windows-{architecture}-msi"] = str(entries[0].get("sha256", "")).lower()
+        else:
+            if evidence.get("commit") != commit or evidence.get("artifactStatus") != "SIGNED-NOTARIZED":
+                _error("macOS evidence is not the signed candidate commit")
+            for suffix, key in (("pkg", "packageSha256"), ("VST3.zip", "vst3ZipSha256")):
+                asset_name = f"{product}-{version}-macOS-universal{'.' if suffix == 'pkg' else '-'}{suffix}"
+                if "sha256:" + str(evidence.get(key, "")).lower() != asset_by_name[asset_name]["digest"]:
+                    _error("macOS evidence does not bind the delivery artifact digest")
+            for platform in ("macos-universal-pkg", "macos-universal-zip"):
+                binary_hashes[platform] = str(evidence.get("vst3BinarySha256", "")).lower()
+    if not all(HEX_SHA256.fullmatch(value) for value in binary_hashes.values()):
+        _error("Evidence plugin binary SHA-256 is missing or malformed")
+
     checks = receipt.get("checks")
-    if not isinstance(checks, list) or len(checks) != 8:
-        _error("Receipt must contain exactly eight physical DAW checks")
+    if not isinstance(checks, list) or len(checks) != 12:
+        _error("Receipt must contain exactly twelve physical DAW checks")
     expected_checks = {
-        (platform, host)
-        for platform in (
-            "windows-x64-msi",
-            "windows-arm64ec-msi",
-            "macos-universal-pkg",
-            "macos-universal-zip",
+        (platform, architecture, host)
+        for platform, architectures in (
+            ("windows-x64-msi", ("x86_64",)),
+            ("windows-arm64ec-msi", ("arm64",)),
+            ("macos-universal-pkg", ("x86_64", "arm64")),
+            ("macos-universal-zip", ("x86_64", "arm64")),
         )
+        for architecture in architectures
         for host in ("Cubase", "Reaper")
     }
-    actual_checks: set[tuple[str, str]] = set()
+    actual_checks: set[tuple[str, str, str]] = set()
     published_at = _parse_time(release.get("published_at"), "release.published_at")
     current_time = now or dt.datetime.now(dt.timezone.utc)
     if current_time.tzinfo is None:
@@ -408,22 +481,39 @@ def validate(
         check = _require_object(item, f"Receipt check {index}")
         _require_exact_keys(
             check,
-            {
-                "platform",
-                "host",
-                "hostVersion",
-                "osVersion",
-                "machine",
-                "tester",
-                "testedAt",
-                "result",
-            },
+            {"platform", "cpuArchitecture", "hostProcessArchitecture", "host",
+             "hostVersion", "osVersion", "machine", "tester", "testedAt", "result",
+             "loadedVst3Path", "loadedVst3Sha256"},
             f"Receipt check {index}",
         )
-        pair = (check.get("platform"), check.get("host"))
-        if pair not in expected_checks or pair in actual_checks:
+        identity = (check.get("platform"), check.get("cpuArchitecture"), check.get("host"))
+        if identity not in expected_checks or identity in actual_checks:
             _error("Receipt DAW matrix has a missing, duplicate, or unknown entry")
-        actual_checks.add(pair)
+        actual_checks.add(identity)
+        platform, architecture, _ = identity
+        allowed_processes = {"x86_64", "arm64ec"} if platform == "windows-arm64ec-msi" else {architecture}
+        if check.get("hostProcessArchitecture") not in allowed_processes:
+            _error("Host process architecture does not prove the required native slice or supported ABI")
+        loaded_path = check.get("loadedVst3Path")
+        if not isinstance(loaded_path, str) or not 0 < len(loaded_path) <= 1024 or any(
+            ord(character) < 32 or ord(character) == 127 for character in loaded_path
+        ):
+            _error("Loaded VST3 binary path is missing or unsafe")
+        if platform.startswith("windows"):
+            windows_path = pathlib.PureWindowsPath(loaded_path)
+            folder = "arm64ec-win" if architecture == "arm64" else "x86_64-win"
+            expected_tail = (f"{product}.vst3", "Contents", folder, f"{product}.vst3")
+            valid_path = windows_path.is_absolute() and ".." not in windows_path.parts and (
+                tuple(part.casefold() for part in windows_path.parts[-4:])
+                == tuple(part.casefold() for part in expected_tail))
+        else:
+            posix_path = pathlib.PurePosixPath(loaded_path)
+            valid_path = posix_path.is_absolute() and ".." not in posix_path.parts and (
+                posix_path.parts[-4:] == (f"{product}.vst3", "Contents", "MacOS", product))
+        if not valid_path:
+            _error("Loaded VST3 path is not the expected plugin binary")
+        if check.get("loadedVst3Sha256") != binary_hashes[platform]:
+            _error("Loaded VST3 binary does not match the signed release payload")
         if check.get("result") != "pass":
             _error("Every physical DAW check must explicitly pass")
         for field in ("hostVersion", "osVersion", "machine", "tester"):
@@ -434,10 +524,10 @@ def validate(
         if tested_at < published_at or tested_at > current_time + dt.timedelta(minutes=5):
             _error("Physical DAW check timestamp is outside the candidate lifetime")
     if actual_checks != expected_checks:
-        _error("Receipt does not cover Cubase and Reaper for every delivery artifact")
+        _error("Receipt does not cover Cubase and Reaper on every required CPU and delivery artifact")
 
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "environment": environment_name,
         "environmentId": environment_id,
         "branchProtection": {
@@ -482,6 +572,7 @@ def main() -> int:
     parser.add_argument("--tag", required=True)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--asset-manifest-sha256", required=True)
+    parser.add_argument("--evidence-directory", type=pathlib.Path, required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
     try:
@@ -507,6 +598,8 @@ def main() -> int:
             tag=args.tag,
             commit=args.commit,
             asset_manifest_sha256=args.asset_manifest_sha256,
+            evidence_files={path.name: path.read_bytes() for path in args.evidence_directory.glob("*.evidence.json")
+                            if path.is_file() and not path.is_symlink() and path.stat().st_size <= 4 * 1024 * 1024},
         )
         encoded = json.dumps(
             envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")

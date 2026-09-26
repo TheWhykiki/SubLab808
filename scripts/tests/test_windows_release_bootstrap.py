@@ -10,7 +10,7 @@ import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-PRODUCT = ROOT.name
+PRODUCT = json.loads((ROOT / "release/product.json").read_text(encoding="utf-8"))["productName"]
 SCRIPT = ROOT / "scripts" / "check-windows-release-bootstrap.py"
 SPEC = importlib.util.spec_from_file_location("windows_release_bootstrap", SCRIPT)
 if SPEC is None or SPEC.loader is None:

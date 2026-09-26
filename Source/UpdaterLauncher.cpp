@@ -2,6 +2,7 @@
 
 #if JUCE_WINDOWS && WK_UPDATER_ENABLED
 
+#include "../Updater/Windows/Authenticode.h"
 #include <windows.h>
 #include <softpub.h>
 #include <wincrypt.h>
@@ -14,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-#ifndef WK_WINDOWS_UPDATER_SIGNER_SHA256
+#ifndef WK_WINDOWS_UPDATER_PROFILE_EKU
 #error "Enabled Windows updater launcher requires its exact distribution signer SHA-256"
 #endif
 
@@ -22,17 +23,10 @@ namespace wk
 {
 namespace
 {
-constexpr std::string_view expectedSigner = WK_WINDOWS_UPDATER_SIGNER_SHA256;
+constexpr std::string_view expectedSigner = WK_WINDOWS_UPDATER_PROFILE_EKU;
 
-constexpr bool validSignerPin()
-{
-    if (expectedSigner.size() != 64) return false;
-    for (const auto c : expectedSigner)
-        if (! ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
-            return false;
-    return true;
-}
-static_assert(validSignerPin(), "Windows updater launcher signer pin must be 64 hexadecimal characters");
+static_assert(wk::authenticode::validProfileEku(expectedSigner),
+              "Windows updater launcher requires the full Artifact Signing identity EKU");
 
 class Handle
 {
@@ -109,83 +103,15 @@ juce::Result finalPathFromHandle(HANDLE file, std::filesystem::path& finalPath)
 
 juce::Result verifySigner(const std::filesystem::path& helper)
 {
-    WINTRUST_FILE_INFO fileInfo{};
-    fileInfo.cbStruct = sizeof(fileInfo);
-    fileInfo.pcwszFilePath = helper.c_str();
-    WINTRUST_DATA trust{};
-    trust.cbStruct = sizeof(trust);
-    trust.dwUIChoice = WTD_UI_NONE;
-    // Keep the DAW UI path strictly local: validate the signed bytes, timestamp
-    // and locally available certificate chain, then bind the exact leaf below.
-    // Requiring revocation data from a cache would reject valid first-run/offline
-    // systems when no CRL/OCSP response has been cached yet. The standalone
-    // updater repeats WinVerifyTrust with online whole-chain revocation before it
-    // copies itself, downloads anything or starts Windows Installer.
-    trust.fdwRevocationChecks = WTD_REVOKE_NONE;
-    trust.dwUnionChoice = WTD_CHOICE_FILE;
-    trust.pFile = &fileInfo;
-    trust.dwStateAction = WTD_STATEACTION_VERIFY;
-    trust.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL
-                      | WTD_DISABLE_MD2_MD4;
-    trust.dwUIContext = WTD_UICONTEXT_EXECUTE;
-    GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
-    const auto nonInteractive = reinterpret_cast<HWND>(INVALID_HANDLE_VALUE);
-    const auto status = WinVerifyTrust(nonInteractive, &action, &trust);
-    trust.dwStateAction = WTD_STATEACTION_CLOSE;
-    WinVerifyTrust(nonInteractive, &action, &trust);
-    if (status != ERROR_SUCCESS)
-        return juce::Result::fail(windowsError(
-            "Windows rejected the updater's local Authenticode signature or certificate chain",
-            static_cast<DWORD>(status)));
-
-    DWORD encoding{}, content{}, format{};
-    CertificateStore store;
-    CryptMessage message;
-    if (! CryptQueryObject(CERT_QUERY_OBJECT_FILE, helper.c_str(),
-                           CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
-                           CERT_QUERY_FORMAT_FLAG_BINARY, 0, &encoding, &content, &format,
-                           &store.value, &message.value, nullptr))
-        return juce::Result::fail(windowsError("The updater signer could not be read"));
-
-    DWORD signerBytes{};
-    if (! CryptMsgGetParam(message.value, CMSG_SIGNER_INFO_PARAM, 0, nullptr, &signerBytes))
-        return juce::Result::fail(windowsError("The updater signer could not be sized"));
-    std::vector<unsigned char> signerStorage(signerBytes);
-    if (! CryptMsgGetParam(message.value, CMSG_SIGNER_INFO_PARAM, 0, signerStorage.data(), &signerBytes))
-        return juce::Result::fail(windowsError("The updater signer could not be read"));
-    const auto* signer = reinterpret_cast<const CMSG_SIGNER_INFO*>(signerStorage.data());
-    CERT_INFO certificateInfo{};
-    certificateInfo.Issuer = signer->Issuer;
-    certificateInfo.SerialNumber = signer->SerialNumber;
-    Certificate certificate;
-    certificate.value = CertFindCertificateInStore(store.value,
-        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0, CERT_FIND_SUBJECT_CERT, &certificateInfo, nullptr);
-    if (certificate.value == nullptr)
-        return juce::Result::fail(windowsError("The updater certificate could not be resolved"));
-
-    std::array<unsigned char, 32> digest{};
-    DWORD digestBytes = static_cast<DWORD>(digest.size());
-    if (! CertGetCertificateContextProperty(certificate.value, CERT_SHA256_HASH_PROP_ID,
-                                             digest.data(), &digestBytes)
-        || digestBytes != digest.size())
-        return juce::Result::fail(windowsError("The updater certificate could not be hashed"));
-
-    constexpr char alphabet[] = "0123456789ABCDEF";
-    std::array<char, 64> actual{};
-    for (std::size_t index = 0; index < digest.size(); ++index)
+    try
     {
-        actual[index * 2] = alphabet[digest[index] >> 4];
-        actual[index * 2 + 1] = alphabet[digest[index] & 0x0f];
+        (void) wk::authenticode::verify(helper, expectedSigner, {}, false);
+        return juce::Result::ok();
     }
-    unsigned int mismatch{};
-    for (std::size_t index = 0; index < actual.size(); ++index)
+    catch (const std::exception& error)
     {
-        auto expected = expectedSigner[index];
-        if (expected >= 'a' && expected <= 'f') expected = static_cast<char>(expected - ('a' - 'A'));
-        mismatch |= static_cast<unsigned char>(actual[index] ^ expected);
+        return juce::Result::fail(juce::String(error.what()));
     }
-    return mismatch == 0 ? juce::Result::ok()
-                         : juce::Result::fail("The updater signer does not match this plugin's pinned certificate.");
 }
 }
 

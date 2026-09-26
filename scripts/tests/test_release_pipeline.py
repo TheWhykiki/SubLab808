@@ -17,6 +17,8 @@ SPEC.loader.exec_module(pipeline)
 NOTARY_ID = "00000000-0000-4000-8000-000000000001"
 DISTRIBUTION_ENV = {"SUBLAB808_APPLICATION_IDENTITY": "app",
                     "SUBLAB808_INSTALLER_IDENTITY": "installer",
+                    "MACOS_DEVELOPER_ID_APPLICATION_CERT_SHA256": "A" * 64,
+                    "MACOS_DEVELOPER_ID_INSTALLER_CERT_SHA256": "B" * 64,
                     "SUBLAB808_NOTARY_PROFILE": "profile"}
 
 
@@ -37,6 +39,8 @@ class FakeTools:
              "statusCode": 0 if notary_status == "Accepted" else 4000, "issues": []})
             if notary_log_output is None else notary_log_output)
         self.source = self.payload = self.archived = None
+        self.snapshot_manifest = None
+        self.pins = {}
 
     def __call__(self, command, *, cwd=None, capture=False):
         parts = [str(value) for value in command]
@@ -54,6 +58,13 @@ class FakeTools:
             return subprocess.run(parts, cwd=cwd, check=True, text=True, capture_output=True)
         if tool == "cmake" and "-S" in parts:
             self.source = Path(parts[parts.index("-S") + 1])
+            source_manifest = self.source / "SOURCE-MANIFEST.json"
+            self.snapshot_manifest = (json.loads(source_manifest.read_text())
+                                      if source_manifest.is_file() else None)
+            self.pins = {key: next(part.split("=", 1)[1] for part in parts
+                                  if part.startswith(f"-DWK_MACOS_{name}_CERT_SHA256="))
+                         for name, key in (("APPLICATION", "currentApplication"), ("INSTALLER", "currentInstaller"),
+                                           ("NEXT_APPLICATION", "nextApplication"), ("NEXT_INSTALLER", "nextInstaller"))}
         elif tool == "cmake" and "--build" in parts:
             build = Path(parts[2])
             bundle = build / "SubLab808_artefacts/Release/VST3/SubLab808.vst3"
@@ -68,7 +79,7 @@ class FakeTools:
             helper_binary.write_bytes(b"test updater")
             helper_binary.chmod(0o755)
             (helper / "Contents/Info.plist").write_bytes(plistlib.dumps({
-                "CFBundleShortVersionString": self.version, "WKProduct": "SubLab808"}))
+                "CFBundleShortVersionString": self.version, "WKProduct": "SubLab808", "WKSignerPins": self.pins}))
         elif tool == "ctest":
             Path(parts[parts.index("--output-junit") + 1]).write_text('<testsuite tests="1" failures="0"/>\n')
             test_log = Path(parts[parts.index("--test-dir") + 1]) / "Testing/Temporary/LastTest.log"
@@ -121,10 +132,14 @@ class ReleasePipelineTests(unittest.TestCase):
         (self.root / "CMakeLists.txt").write_text("project(SubLab808 VERSION 1.0.4 LANGUAGES C CXX)\n")
         (self.root / "Source/processor.cpp").write_text("current source\n")
         repository = Path(__file__).resolve().parents[2]
-        for relative in ("scripts/generate-presets.py", "Presets/FactoryPresets.json", "Source/FactoryBank.h"):
+        for relative in ("scripts/generate-presets.py", "Presets/FactoryPresets.json", "Source/FactoryBank.h",
+                         "release/product.json", "Installer/Windows/package-config.json"):
             target = self.root / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(repository / relative, target)
+        configuration = json.loads((self.root / "release/product.json").read_text())
+        configuration["version"] = "1.0.4"
+        (self.root / "release/product.json").write_text(json.dumps(configuration))
         (self.root / ".gitignore").write_text("/dist/\n/.release-candidate-*/\n")
         for command in (["git", "init", "-q"], ["git", "add", "."],
                         ["git", "-c", "user.name=Pipeline Test", "-c", "user.email=pipeline@example.invalid",
@@ -146,6 +161,59 @@ class ReleasePipelineTests(unittest.TestCase):
     def package(self, tools=None, environment=None, **options):
         return pipeline.package_release(self.root, runner=tools or FakeTools(),
                                         environment=environment or {}, **options)
+
+    def make_gitless_source_fixture(self):
+        import source_release
+        commit = pipeline.git(self.root, "rev-parse", "HEAD").strip()
+        vendor = self.root / "external/JUCE"
+        vendor.mkdir(parents=True)
+        (vendor / "CMakeLists.txt").write_text("project(JUCE)\n")
+        (vendor / "LICENSE.md").write_text("Unmodified upstream fixture licence\n")
+        files, _ = pipeline.source_inputs(self.root)
+        for path in vendor.iterdir():
+            files[path.relative_to(self.root).as_posix()] = (path.read_bytes(), 0o644)
+        config = pipeline.load_product(self.root)
+        files[source_release.SBOM] = (source_release.canonical_json(source_release.sbom(config, commit, files)), 0o644)
+        manifest = source_release.make_manifest(config, commit, files, [])
+        (self.root / source_release.SBOM).write_bytes(files[source_release.SBOM][0])
+        (self.root / source_release.MANIFEST).write_bytes(source_release.canonical_json(manifest))
+        shutil.rmtree(self.root / ".git")  # Test-owned temporary fixture only.
+        return manifest
+
+    def test_gitless_source_archive_rebuilds_unsigned_package_with_original_provenance(self):
+        source_manifest = self.make_gitless_source_fixture()
+        tools = FakeTools()
+        candidate = self.package(tools)
+        result = json.loads((candidate / "source-manifest.json").read_text())
+        self.assertEqual(result["origin"], "verified-source-archive")
+        self.assertEqual(result["repositories"], [
+            {"path": ".", "commit": source_manifest["commit"], "dirty": False},
+            {"path": "external/JUCE", "commit": source_manifest["juceCommit"], "dirty": False}])
+        self.assertTrue(any(Path(command[0]).name == "pkgbuild" for command in tools.commands))
+        self.assertFalse(json.loads((candidate / "release-manifest.json").read_text())["application_signed"])
+        self.assertEqual(tools.snapshot_manifest, source_manifest)
+
+    def test_gitless_archive_cannot_sign_a_distribution(self):
+        self.make_gitless_source_fixture()
+        tools = FakeTools()
+        with self.assertRaisesRegex(pipeline.ReleaseError, "Signed releases require a Git checkout"):
+            self.package(tools, self.distribution_env)
+        self.assertEqual(tools.commands, [])
+        self.assertPreviousPreserved()
+
+    def test_gitless_archive_rejects_changed_source_and_additional_build_inputs(self):
+        self.make_gitless_source_fixture()
+        for path, value in (("Source/processor.cpp", b"changed source\n"),
+                            ("scripts/injected.py", b"# added source\n")):
+            target = self.root / path
+            previous = target.read_bytes() if target.exists() else None
+            target.write_bytes(value)
+            with self.subTest(path=path), self.assertRaisesRegex(pipeline.ReleaseError, "intact corresponding-source archive"):
+                pipeline.source_inputs(self.root)
+            if previous is None:
+                target.unlink()
+            else:
+                target.write_bytes(previous)
 
     def assertPreviousPreserved(self):
         self.assertEqual(self.previous.read_bytes(), b"keep previous release")
@@ -226,7 +294,7 @@ class ReleasePipelineTests(unittest.TestCase):
     def test_failure_report_does_not_record_signing_or_notary_arguments(self):
         with self.assertRaises(subprocess.CalledProcessError):
             self.package(FakeTools(fail="pkgbuild"),
-                         {"SUBLAB808_APPLICATION_IDENTITY": "private-app-identity-marker",
+                         {**DISTRIBUTION_ENV, "SUBLAB808_APPLICATION_IDENTITY": "private-app-identity-marker",
                           "SUBLAB808_INSTALLER_IDENTITY": "private-installer-identity-marker",
                           "SUBLAB808_NOTARY_PROFILE": "private-notary-profile-marker",
                           "SUBLAB808_NOTARY_KEYCHAIN": str(self.notary_keychain)})
@@ -254,6 +322,48 @@ class ReleasePipelineTests(unittest.TestCase):
                     self.package(tools, environment, **options)
                 self.assertEqual(tools.commands, [])
                 self.assertPreviousPreserved()
+
+    def test_signed_builds_require_complete_embedded_current_and_next_pins(self):
+        cases = [
+            {"MACOS_DEVELOPER_ID_APPLICATION_CERT_SHA256": ""},
+            {"MACOS_DEVELOPER_ID_INSTALLER_CERT_SHA256": ""},
+            {"MACOS_DEVELOPER_ID_APPLICATION_CERT_SHA256": "G" * 64},
+            {"MACOS_NEXT_DEVELOPER_ID_APPLICATION_CERT_SHA256": "C" * 64},
+            {"MACOS_NEXT_DEVELOPER_ID_APPLICATION_CERT_SHA256": "A" * 64,
+             "MACOS_NEXT_DEVELOPER_ID_INSTALLER_CERT_SHA256": "B" * 64},
+        ]
+        for change in cases:
+            tools = FakeTools()
+            with self.subTest(change=change), self.assertRaises(pipeline.ReleaseError):
+                self.package(tools, {**self.distribution_env, **change})
+            self.assertEqual(tools.commands, [])
+        self.assertPreviousPreserved()
+
+    def test_built_updater_must_embed_exact_release_pins(self):
+        tools = FakeTools()
+
+        def altered_build(command, **options):
+            result = tools(command, **options)
+            parts = list(map(str, command))
+            if parts[:2] == ["cmake", "--build"]:
+                helper = next(Path(parts[2]).glob("*_artefacts/Release/VST3/*.vst3/Contents/Helpers/*.app/Contents/Info.plist"))
+                info = plistlib.loads(helper.read_bytes())
+                info["WKSignerPins"]["currentInstaller"] = "c" * 64
+                helper.write_bytes(plistlib.dumps(info))
+            return result
+
+        with self.assertRaisesRegex(pipeline.ReleaseError, "signer pins differ"):
+            self.package(altered_build, self.distribution_env)
+        self.assertFalse(any(Path(command[0]).name == "pkgbuild" for command in tools.commands))
+        self.assertPreviousPreserved()
+
+    def test_signer_verification_precedes_notarization(self):
+        tools = FakeTools()
+        self.package(tools, self.distribution_env)
+        verify = next(i for i, command in enumerate(tools.commands)
+                      if any(Path(part).name == "verify-macos-signers.py" for part in command))
+        notary = next(i for i, command in enumerate(tools.commands) if command[1:3] == ["notarytool", "submit"])
+        self.assertLess(verify, notary)
 
     def test_cmake_embeds_then_signs_helper_and_root_inside_out(self):
         repository = Path(__file__).resolve().parents[2]

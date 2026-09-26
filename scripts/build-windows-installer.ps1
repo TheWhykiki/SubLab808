@@ -16,17 +16,17 @@ param(
     [string] $SourceCommit,
     [string] $OutputDirectory = (Join-Path $PSScriptRoot '..\dist\windows'),
     [string[]] $UpdaterPath = @(),
-    [string] $ExpectedSignerSha256,
-    [string] $ExpectedNextSignerSha256,
+    [string] $ExpectedProfileEku,
+    [string] $ExpectedNextProfileEku,
     [string] $ExpectedReleaseGatePublicKeyXY,
     [string] $ExpectedReleaseGateNextPublicKeyXY,
     [string] $HostTestPath,
+    [string] $UpdaterTestPath,
     [string] $DumpbinPath,
     [string] $SignToolPath,
-    [string] $CertificateThumbprint,
-    [string] $CertificateSubject,
-    [string] $CertificateStoreName = 'My',
-    [switch] $UseMachineCertificateStore,
+    [string] $SigningDlibPath,
+    [string] $SigningDlibSha256,
+    [string] $SigningMetadataPath,
     [string] $TimestampUrl,
     [ValidateRange(1, 3600)]
     [int] $AdministrativeExtractionTimeoutSeconds = 300,
@@ -38,6 +38,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+. (Join-Path $PSScriptRoot 'artifact-signing.ps1')
 
 if (-not $IsWindows) {
     throw 'Windows MSI packages must be built and validated on Windows.'
@@ -775,9 +776,9 @@ function Resolve-SignTool {
         $parsed = [version]'0.0'
         [version]::TryParse($_.Name, [ref] $parsed)
     } | Sort-Object { [version] $_.Name } -Descending)
-    $nativeArm = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq
-                 [System.Runtime.InteropServices.Architecture]::Arm64
-    $toolArchitectures = if ($nativeArm) { @('arm64', 'x64') } else { @('x64') }
+    # Artifact Signing Client currently ships x64/x86 dlibs, not ARM64.
+    # Use x64 SignTool under emulation on Arm; the payload remains native ARM64EC.
+    $toolArchitectures = @('x64')
     foreach ($versionDirectory in $versions) {
         foreach ($toolArchitecture in $toolArchitectures) {
             $candidate = Join-Path $versionDirectory.FullName "$toolArchitecture\signtool.exe"
@@ -789,52 +790,26 @@ function Resolve-SignTool {
     throw 'signtool.exe was not found in the Windows SDK; pass -SignToolPath explicitly.'
 }
 
-function Resolve-SigningCertificate {
-    param(
-        [string] $Thumbprint,
-        [string] $Subject,
-        [string] $StoreName,
-        [bool] $MachineStore
-    )
-
-    Assert-Condition ($StoreName -match '^[A-Za-z0-9._-]+$') 'Unsafe CertificateStoreName.'
-    $storeLocation = if ($MachineStore) { 'LocalMachine' } else { 'CurrentUser' }
-    $storePath = "Cert:\$storeLocation\$StoreName"
-    Assert-Condition (Test-Path -LiteralPath $storePath -PathType Container) `
-        "Certificate store was not found: $storePath"
-    $certificates = @(Get-ChildItem -LiteralPath $storePath | Where-Object {
-        $_ -is [System.Security.Cryptography.X509Certificates.X509Certificate2]
-    })
-
-    if ($Thumbprint) {
-        $requestedThumbprint = $Thumbprint.Replace(' ', '').ToUpperInvariant()
-        Assert-Condition ($requestedThumbprint -match '^[0-9A-F]{40}$') `
-            'CertificateThumbprint must be 40 hexadecimal SHA-1 characters.'
-        $matches = @($certificates | Where-Object {
-            $_.Thumbprint.Replace(' ', '').ToUpperInvariant() -ceq $requestedThumbprint
-        })
-    } else {
-        $matches = @($certificates | Where-Object { ([string] $_.Subject) -ceq $Subject })
-    }
-
-    Assert-Condition ($matches.Count -eq 1) `
-        'Signing identity must resolve to exactly one certificate in the selected store.'
-    $certificate = $matches[0]
-    Assert-Condition ($certificate.HasPrivateKey) 'Signing certificate has no accessible private key.'
-    $now = [DateTime]::UtcNow
-    Assert-Condition ($certificate.NotBefore.ToUniversalTime() -le $now -and
-                      $certificate.NotAfter.ToUniversalTime() -ge $now) `
-        'Signing certificate is outside its validity period.'
-    $resolvedThumbprint = $certificate.Thumbprint.Replace(' ', '').ToUpperInvariant()
-    $sha256 = $certificate.GetCertHashString(
-        [System.Security.Cryptography.HashAlgorithmName]::SHA256).ToUpperInvariant()
-    [string[]] $certificateArguments = @('/sha1', $resolvedThumbprint, '/s', $StoreName)
-    if ($MachineStore) { $certificateArguments += '/sm' }
-    return [pscustomobject]@{
-        Thumbprint = $resolvedThumbprint
-        Sha256 = $sha256
-        Arguments = $certificateArguments
-    }
+function Resolve-ArtifactSigning {
+    param([string] $DlibPath, [string] $DlibSha256, [string] $MetadataPath)
+    $dlib = Resolve-ExistingFile $DlibPath 'Artifact Signing SDK dlib'
+    $metadata = Resolve-ExistingFile $MetadataPath 'Artifact Signing metadata'
+    Assert-Condition ($DlibSha256 -cmatch '^[0-9A-Fa-f]{64}$' -and
+        (Get-FileHash -LiteralPath $dlib -Algorithm SHA256).Hash -ieq $DlibSha256) `
+        'Artifact Signing SDK dlib does not match the pinned SHA-256.'
+    $config = Get-Content -LiteralPath $metadata -Raw | ConvertFrom-Json
+    Assert-Condition ([string]$config.Endpoint -cmatch '^https://[a-z0-9-]+\.codesigning\.azure\.net/?$' -and
+        [string]$config.CodeSigningAccountName -cmatch '^[A-Za-z0-9-]{3,63}$' -and
+        [string]$config.CertificateProfileName -cmatch '^[A-Za-z0-9-]{1,100}$') `
+        'Artifact Signing metadata must identify an Azure endpoint, account and profile.'
+    # azure/login OIDC establishes Azure CLI credentials. Exclude all alternative
+    # credential sources so developer secrets or a managed identity cannot win.
+    $requiredExclusions = @('EnvironmentCredential', 'WorkloadIdentityCredential', 'ManagedIdentityCredential',
+        'SharedTokenCacheCredential', 'VisualStudioCredential', 'VisualStudioCodeCredential',
+        'AzurePowerShellCredential', 'AzureDeveloperCliCredential', 'InteractiveBrowserCredential')
+    Assert-Condition ((@($config.ExcludeCredentials | Sort-Object) -join ',') -ceq
+        (@($requiredExclusions | Sort-Object) -join ',')) 'Only AzureCliCredential may sign.'
+    return @('/dlib', $dlib, '/dmdf', $metadata)
 }
 
 function Assert-PeArchitecture {
@@ -856,7 +831,7 @@ function Invoke-AuthenticodeSign {
         [string] $Path,
         [string] $SignTool,
         [string[]] $CertificateArguments,
-        [string] $ExpectedSignerThumbprint,
+        [string] $ExpectedProfile,
         [uri] $Timestamp
     )
     $arguments = @('sign', '/fd', 'SHA256', '/td', 'SHA256', '/tr', $Timestamp.AbsoluteUri) +
@@ -870,17 +845,7 @@ function Invoke-AuthenticodeSign {
     $verifyOutput | ForEach-Object { Write-Host $_ }
     Assert-Condition ($verifyExitCode -eq 0) "Authenticode verification failed: $Path"
 
-    $signature = Get-AuthenticodeSignature -LiteralPath $Path
-    Assert-Condition ($null -ne $signature.SignerCertificate) `
-        "Signed file has no inspectable signer certificate: $Path"
-    Assert-Condition ($null -ne $signature.TimeStamperCertificate) `
-        "Signed file has no inspectable RFC3161 timestamp certificate: $Path"
-    $actualThumbprint = $signature.SignerCertificate.Thumbprint.Replace(' ', '').ToUpperInvariant()
-    Assert-Condition ($actualThumbprint -ceq $ExpectedSignerThumbprint) `
-        "Unexpected signer certificate after signing: $Path"
-    $actualSha256 = $signature.SignerCertificate.GetCertHashString(
-        [System.Security.Cryptography.HashAlgorithmName]::SHA256).ToUpperInvariant()
-    return [pscustomobject]@{ SignerSha256 = $actualSha256 }
+    return Assert-ArtifactSigningIdentity $Path $ExpectedProfile
 }
 
 function Invoke-ComMethod {
@@ -1215,15 +1180,34 @@ function Test-MsiContract {
             'MSI LaunchCondition table is not the exact downgrade/architecture contract.'
 
         $sequences = @{}
-        foreach ($row in @(Get-MsiRows $database 'SELECT `Action`, `Sequence` FROM `InstallExecuteSequence`')) {
-            $sequences[$row.Fields[0]] = [int]($row.Fields[1])
+        $executeSequenceEvidence = [System.Collections.Generic.List[object]]::new()
+        $requiredSequence = @('FindRelatedProducts', 'LaunchConditions', 'InstallInitialize',
+                              'RemoveExistingProducts', 'InstallFiles')
+        foreach ($row in @(Get-MsiRows $database 'SELECT `Action`, `Condition`, `Sequence` FROM `InstallExecuteSequence`')) {
+            Assert-Condition ($row.Fields.Count -eq 3) 'Malformed MSI execute sequence row.'
+            $action = $row.Fields[0]
+            $executeSequenceEvidence.Add([ordered]@{
+                action = $action
+                condition = $row.Fields[1]
+                sequence = $row.Fields[2]
+            })
+            if ($requiredSequence -cnotcontains $action -and $action -cne 'MigrateFeatureStates') { continue }
+            $value = 0
+            Assert-Condition ([string]::IsNullOrEmpty($row.Fields[1]) -and
+                              [int]::TryParse($row.Fields[2], [ref]$value) -and $value -gt 0 -and
+                              -not $sequences.ContainsKey($action)) `
+                "MSI sequence action must be unique, unconditional and positive: $action"
+            $sequences.Add($action, $value)
         }
-        foreach ($action in @('InstallInitialize', 'RemoveExistingProducts', 'InstallFiles')) {
-            Assert-Condition ($sequences.ContainsKey($action)) "MSI sequence action is missing: $action"
+        $previous = 0
+        foreach ($action in $requiredSequence) {
+            Assert-Condition ($sequences.ContainsKey($action) -and $sequences[$action] -gt $previous) `
+                "MSI detection/launch-condition/major-upgrade sequence is unsafe: $action"
+            $previous = $sequences[$action]
         }
-        Assert-Condition ($sequences['RemoveExistingProducts'] -gt $sequences['InstallInitialize'] -and
-                          $sequences['RemoveExistingProducts'] -lt $sequences['InstallFiles']) `
-            'RemoveExistingProducts is not rollback-safe after InstallInitialize and before InstallFiles.'
+        Assert-Condition (-not $sequences.ContainsKey('MigrateFeatureStates') -or
+                          $sequences['MigrateFeatureStates'] -gt $sequences['FindRelatedProducts']) `
+            'FindRelatedProducts must run before MigrateFeatureStates.'
 
         $forbiddenSequenceActions = @(
             # MsiConfigureServices is harmless after both of its data tables were rejected.
@@ -1247,6 +1231,7 @@ function Test-MsiContract {
             FileRows = $fileRows.Count
             ComponentRows = $componentRows.Count
             RemoveExistingProductsSequence = $sequences['RemoveExistingProducts']
+            InstallExecuteSequence = @($executeSequenceEvidence.ToArray() | Sort-Object { $_.action })
             ProductName = $properties['ProductName']
             Manufacturer = $properties['Manufacturer']
             ProductLanguage = $properties['ProductLanguage']
@@ -1324,6 +1309,92 @@ namespace WhykikiAudio
         "Build-contract pipe client PID $clientProcessId is not the staged updater PID $($ExpectedProcess.Id)."
 }
 
+function Invoke-MsiDatabaseProbe {
+    param([string] $Probe, [string] $MsiPath, [string] $Version, [int] $ExpectedExitCode)
+    $start = [System.Diagnostics.ProcessStartInfo]::new($Probe)
+    $start.UseShellExecute = $false
+    foreach ($argument in @('--validate-msi-database', $MsiPath, $Version)) {
+        $start.ArgumentList.Add($argument)
+    }
+    $process = [System.Diagnostics.Process]::Start($start)
+    Assert-Condition ($null -ne $process) 'Native MSI policy probe did not start.'
+    if (-not $process.WaitForExit(60000)) {
+        Stop-TimedOutProcess $process 'Native MSI policy probe' 60
+    }
+    $result = $process.ExitCode
+    $process.Dispose()
+    Assert-Condition ($result -eq $ExpectedExitCode) "Native MSI policy probe returned $result, expected $ExpectedExitCode."
+}
+
+function Invoke-MsiSequenceMutationTests {
+    param([string] $MsiPath, [string] $WorkRoot, [scriptblock] $Validate,
+          [string] $Probe, [string] $Version)
+    $mutations = [System.Collections.Generic.List[string]]::new()
+    foreach ($action in @('FindRelatedProducts', 'LaunchConditions')) {
+        $mutations.Add("DELETE FROM ``InstallExecuteSequence`` WHERE ``Action`` = '$action'")
+        $mutations.Add("UPDATE ``InstallExecuteSequence`` SET ``Condition`` = '0' WHERE ``Action`` = '$action'")
+        foreach ($sequence in @('NULL', '0', '-1')) {
+            $mutations.Add("UPDATE ``InstallExecuteSequence`` SET ``Sequence`` = $sequence WHERE ``Action`` = '$action'")
+        }
+    }
+    $mutations.Add("UPDATE ``InstallExecuteSequence`` SET ``Sequence`` = 1400 WHERE ``Action`` = 'FindRelatedProducts'")
+    $mutations.Add("UPDATE ``InstallExecuteSequence`` SET ``Sequence`` = 1 WHERE ``Action`` = 'MigrateFeatureStates'")
+    $mutations.Add("UPDATE ``InstallExecuteSequence`` SET ``Sequence`` = 1 WHERE ``Action`` = 'RemoveExistingProducts'")
+    $mutations.Add("UPDATE ``InstallExecuteSequence`` SET ``Sequence`` = 1 WHERE ``Action`` = 'InstallFiles'")
+    $index = 0
+    foreach ($query in $mutations) {
+        $copy = Join-Path $WorkRoot ("sequence-mutant-{0}.msi" -f $index)
+        Copy-Item -LiteralPath $MsiPath -Destination $copy
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        $database = $null
+        $view = $null
+        try {
+            $database = Invoke-ComMethod $installer 'OpenDatabase' @($copy, 1)
+            $view = Invoke-ComMethod $database 'OpenView' @($query)
+            [void](Invoke-ComMethod $view 'Execute')
+            [void](Invoke-ComMethod $view 'Close')
+            [void](Invoke-ComMethod $database 'Commit')
+        } finally {
+            if ($null -ne $view) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) }
+            if ($null -ne $database) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($database) }
+            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer)
+        }
+        $rejected = $false
+        try { & $Validate $copy | Out-Null } catch { $rejected = $true }
+        Assert-Condition $rejected "MSI sequence mutant was accepted: $query"
+        if ($Probe) { Invoke-MsiDatabaseProbe $Probe $copy $Version 1 }
+        Remove-Item -LiteralPath $copy
+        ++$index
+    }
+    return $index
+}
+
+function Invoke-MsiArchitectureMutationTest {
+    param([string] $MsiPath, [string] $WorkRoot, [scriptblock] $Validate,
+          [string] $Probe, [string] $Version)
+    $copy = Join-Path $WorkRoot 'architecture-mutant.msi'
+    Copy-Item -LiteralPath $MsiPath -Destination $copy
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    $summary = $null
+    try {
+        $summary = Get-ComProperty $installer 'SummaryInformation' @($copy, 1)
+        $current = [string](Get-ComProperty $summary 'Property' @(7))
+        $wrong = if ($current.Split(';')[0] -in @('x64', 'Intel64')) { 'Arm64;1033' } else { 'x64;1033' }
+        [void]$summary.GetType().InvokeMember('Property',
+            [System.Reflection.BindingFlags]::SetProperty, $null, $summary, @(7, $wrong))
+        [void](Invoke-ComMethod $summary 'Persist')
+    } finally {
+        if ($null -ne $summary) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($summary) }
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer)
+    }
+    $rejected = $false
+    try { & $Validate $copy | Out-Null } catch { $rejected = $true }
+    Assert-Condition $rejected 'MSI foreign architecture mutant was accepted.'
+    if ($Probe) { Invoke-MsiDatabaseProbe $Probe $copy $Version 1 }
+    Remove-Item -LiteralPath $copy
+    return 1
+}
+
 function Invoke-UpdaterBuildContract {
     param(
         [string] $Updater,
@@ -1335,8 +1406,8 @@ function Invoke-UpdaterBuildContract {
         [string] $PayloadArchitecture,
         [string] $CurrentUpgradeCode,
         [string] $OtherUpgradeCode,
-        [string] $CurrentSignerSha256,
-        [string] $NextSignerSha256,
+        [string] $CurrentProfileEku,
+        [string] $NextProfileEku,
         [string] $ReleaseGatePublicKeyXY,
         [string] $ReleaseGateNextPublicKeyXY
     )
@@ -1354,8 +1425,8 @@ function Invoke-UpdaterBuildContract {
         '"architecture":"' + $PayloadArchitecture + '",' +
         '"upgradeCode":"' + $CurrentUpgradeCode + '",' +
         '"otherUpgradeCode":"' + $OtherUpgradeCode + '",' +
-        '"currentSignerSha256":"' + $CurrentSignerSha256 + '",' +
-        '"nextSignerSha256":"' + $NextSignerSha256 + '",' +
+        '"currentProfileEku":"' + $CurrentProfileEku + '",' +
+        '"nextProfileEku":"' + $NextProfileEku + '",' +
         '"releaseGatePublicKeyXY":"' + $ReleaseGatePublicKeyXY + '",' +
         '"releaseGateNextPublicKeyXY":"' + $ReleaseGateNextPublicKeyXY + '"}' + "`n"
     [byte[]] $expectedBytes = [System.Text.UTF8Encoding]::new($false).GetBytes($expectedResponse)
@@ -1393,8 +1464,8 @@ function Invoke-UpdaterBuildContract {
             '--architecture', $PayloadArchitecture,
             '--upgrade-code', $CurrentUpgradeCode,
             '--other-upgrade-code', $OtherUpgradeCode,
-            '--current-signer-sha256', $CurrentSignerSha256,
-            '--next-signer-sha256', $NextSignerSha256,
+            '--current-profile-eku', $CurrentProfileEku,
+            '--next-profile-eku', $NextProfileEku,
             '--release-gate-public-key-xy', $ReleaseGatePublicKeyXY,
             '--release-gate-next-public-key-xy', $ReleaseGateNextPublicKeyXY
         )) {
@@ -1558,9 +1629,9 @@ foreach ($updater in $UpdaterPath) {
 $updaterRelativePaths = @($updaterRelativePaths.ToArray() | Sort-Object -Unique)
 
 if ($AllowUnsigned) {
-    Assert-Condition (-not $CertificateThumbprint -and -not $CertificateSubject -and -not $TimestampUrl -and
-                      -not $SignToolPath -and -not $UseMachineCertificateStore -and
-                      -not $ExpectedSignerSha256 -and -not $ExpectedNextSignerSha256 -and
+    Assert-Condition (-not $SigningDlibPath -and -not $SigningDlibSha256 -and -not $SigningMetadataPath -and
+                      -not $TimestampUrl -and -not $SignToolPath -and
+                      -not $ExpectedProfileEku -and -not $ExpectedNextProfileEku -and
                       -not $ExpectedReleaseGatePublicKeyXY -and
                       -not $ExpectedReleaseGateNextPublicKeyXY) `
         'Do not pass signing options together with -AllowUnsigned.'
@@ -1569,22 +1640,12 @@ if ($AllowUnsigned) {
         'Production mode requires -SourceCommit as exactly 40 lowercase hexadecimal characters.'
     Assert-Condition (-not [string]::IsNullOrWhiteSpace($HostTestPath)) `
         'Production mode requires -HostTestPath.'
-    Assert-Condition (($CertificateThumbprint -xor $CertificateSubject)) `
-        'Production mode requires exactly one of -CertificateThumbprint or -CertificateSubject.'
-    Assert-Condition (-not [string]::IsNullOrWhiteSpace($TimestampUrl)) `
-        'Production mode requires -TimestampUrl.'
-    Assert-Condition (-not [string]::IsNullOrWhiteSpace($ExpectedSignerSha256)) `
-        'Production mode requires -ExpectedSignerSha256.'
-    $ExpectedSignerSha256 = $ExpectedSignerSha256.Replace(' ', '').ToUpperInvariant()
-    Assert-Condition ($ExpectedSignerSha256 -match '^[0-9A-F]{64}$') `
-        'Production mode requires the exact 64-hex -ExpectedSignerSha256 compiled into the updater.'
-    $ExpectedNextSignerSha256 = ([string]$ExpectedNextSignerSha256).Replace(' ', '').ToUpperInvariant()
-    Assert-Condition ([string]::IsNullOrEmpty($ExpectedNextSignerSha256) -or
-                      $ExpectedNextSignerSha256 -cmatch '^[0-9A-F]{64}$') `
-        'ExpectedNextSignerSha256 must be empty or exactly 64 hexadecimal characters.'
-    Assert-Condition ([string]::IsNullOrEmpty($ExpectedNextSignerSha256) -or
-                      $ExpectedNextSignerSha256 -cne $ExpectedSignerSha256) `
-        'ExpectedNextSignerSha256 must differ from the current ExpectedSignerSha256.'
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($TimestampUrl)) 'Production mode requires -TimestampUrl.'
+    Assert-Condition (Test-ArtifactSigningProfileEku $ExpectedProfileEku) 'ExpectedProfileEku must be a full Public Trust identity OID.'
+    $ExpectedNextProfileEku = [string]$ExpectedNextProfileEku
+    Assert-Condition ([string]::IsNullOrEmpty($ExpectedNextProfileEku) -or
+        ((Test-ArtifactSigningProfileEku $ExpectedNextProfileEku) -and $ExpectedNextProfileEku -cne $ExpectedProfileEku)) `
+        'ExpectedNextProfileEku must be empty or a distinct full Public Trust identity OID.'
     Assert-Condition (-not [string]::IsNullOrWhiteSpace($ExpectedReleaseGatePublicKeyXY) -and
                       $ExpectedReleaseGatePublicKeyXY -cmatch '^[0-9A-F]{128}\z') `
         'Production mode requires -ExpectedReleaseGatePublicKeyXY as exactly 128 uppercase hexadecimal characters.'
@@ -1598,15 +1659,10 @@ if ($AllowUnsigned) {
     Assert-Condition ($UpdaterPath.Count -eq 1 -and $updaterRelativePaths.Count -eq 1 -and
                       $updaterRelativePaths[0] -ceq "Contents\Helpers\$($productName)Updater.exe") `
         'Production packages require exactly the product updater at Contents\Helpers\<Product>Updater.exe.'
-    Assert-Condition (-not [string]::IsNullOrWhiteSpace($CertificateStoreName)) `
-        'CertificateStoreName must not be empty.'
-    if ($CertificateSubject) {
-        Assert-Condition (-not [string]::IsNullOrWhiteSpace($CertificateSubject)) `
-            'CertificateSubject must not be empty.'
-    }
     $timestamp = [uri]$TimestampUrl
-    Assert-Condition ($timestamp.IsAbsoluteUri -and $timestamp.Scheme -ceq 'https') `
-        'TimestampUrl must be an absolute HTTPS RFC3161 endpoint.'
+    Assert-Condition ($timestamp.AbsoluteUri -ceq 'http://timestamp.acs.microsoft.com/') `
+        'TimestampUrl must be the Microsoft Artifact Signing RFC3161 endpoint.'
+    $signingArguments = Resolve-ArtifactSigning $SigningDlibPath $SigningDlibSha256 $SigningMetadataPath
 }
 
 $outputRoot = Get-FullPath $OutputDirectory
@@ -1707,27 +1763,25 @@ try {
     if (-not $AllowUnsigned) {
         Invoke-UpdaterBuildContract (Join-Path $stagedBundle $updaterRelativePaths[0]) `
             $productName $Version $manufacturer $githubOwner $githubRepository $Architecture `
-            $upgradeCode $otherUpgradeCode $ExpectedSignerSha256 $ExpectedNextSignerSha256 `
+            $upgradeCode $otherUpgradeCode $ExpectedProfileEku $ExpectedNextProfileEku `
             $ExpectedReleaseGatePublicKeyXY $ExpectedReleaseGateNextPublicKeyXY
     }
 
     [string[]] $signableRelativePaths = @($payloadContract.PortableExecutablePaths)
 
     $signTool = $null
-    $signingCertificate = $null
+    $payloadSigningEvidence = [System.Collections.Generic.List[object]]::new()
     $signerCertificateSha256 = $null
     if (-not $AllowUnsigned) {
         $signTool = Resolve-SignTool $SignToolPath
-        $signingCertificate = Resolve-SigningCertificate $CertificateThumbprint $CertificateSubject `
-            $CertificateStoreName $UseMachineCertificateStore.IsPresent
-        $signerCertificateSha256 = $signingCertificate.Sha256
-        Assert-Condition ($signerCertificateSha256 -ceq $ExpectedSignerSha256) `
-            'Selected signing certificate does not match the SHA-256 fingerprint compiled into the updater.'
+        Assert-PeArchitecture $signTool 'x64' $dumpbin
+        Assert-PeArchitecture $SigningDlibPath 'x64' $dumpbin
         foreach ($relative in $signableRelativePaths) {
             $signResult = Invoke-AuthenticodeSign (Join-Path $stagedBundle $relative) $signTool `
-                $signingCertificate.Arguments $signingCertificate.Thumbprint $timestamp
-            Assert-Condition ($signResult.SignerSha256 -ceq $signerCertificateSha256) `
-                "Signer SHA-256 fingerprint mismatch after signing: $relative"
+                $signingArguments $ExpectedProfileEku $timestamp
+            $payloadSigningEvidence.Add([ordered]@{ path = $relative; profileEku = $signResult.ProfileEku
+                signerCertificateSha256 = $signResult.SignerSha256
+                timestampCertificateSha256 = $signResult.TimestampCertificateSha256 })
         }
     }
 
@@ -1792,16 +1846,30 @@ try {
         $productCode $upgradeCode `
         $otherUpgradeCode $architectureContract.MsiArchitecture $signedSnapshot.Files.Count
 
+    Assert-Condition ($AllowUnsigned -or $UpdaterTestPath) 'Signed packaging requires the native updater MSI policy probe.'
+    $nativeProbe = if ($UpdaterTestPath) { Resolve-ExistingFile $UpdaterTestPath 'Native updater MSI policy probe' } else { $null }
+    if ($nativeProbe) { Invoke-MsiDatabaseProbe $nativeProbe $msiPath $Version 0 }
+    $sequenceMutationTestCount = Invoke-MsiSequenceMutationTests $msiPath $workRoot {
+        param($candidate)
+        Test-MsiContract $candidate $productName $displayName $manufacturer $Version `
+            $productCode $upgradeCode $otherUpgradeCode $architectureContract.MsiArchitecture $signedSnapshot.Files.Count
+    } $nativeProbe $Version
+    $architectureMutationTestCount = Invoke-MsiArchitectureMutationTest $msiPath $workRoot {
+        param($candidate)
+        Test-MsiContract $candidate $productName $displayName $manufacturer $Version `
+            $productCode $upgradeCode $otherUpgradeCode $architectureContract.MsiArchitecture $signedSnapshot.Files.Count
+    } $nativeProbe $Version
+
     if (-not $AllowUnsigned) {
-        $msiSignResult = Invoke-AuthenticodeSign $msiPath $signTool $signingCertificate.Arguments `
-            $signingCertificate.Thumbprint $timestamp
-        Assert-Condition ($msiSignResult.SignerSha256 -ceq $signerCertificateSha256) `
-            'MSI signer SHA-256 fingerprint differs from the payload signer.'
+        $msiSignResult = Invoke-AuthenticodeSign $msiPath $signTool $signingArguments $ExpectedProfileEku $timestamp
+        $signerCertificateSha256 = $msiSignResult.SignerSha256
         $postSignContract = Test-MsiContract $msiPath $productName $displayName $manufacturer $Version `
             $productCode $upgradeCode `
             $otherUpgradeCode $architectureContract.MsiArchitecture $signedSnapshot.Files.Count
         Assert-Condition ($postSignContract.Template -ceq $msiContract.Template -and
-                          $postSignContract.FileRows -eq $msiContract.FileRows) `
+                          $postSignContract.FileRows -eq $msiContract.FileRows -and
+                          ($postSignContract.InstallExecuteSequence | ConvertTo-Json -Compress) -ceq
+                          ($msiContract.InstallExecuteSequence | ConvertTo-Json -Compress)) `
             'MSI tables changed unexpectedly during signing.'
     }
 
@@ -1885,7 +1953,8 @@ try {
             [System.Security.Cryptography.SHA256]::HashData($timestampBytes))
     }
     $evidence = [ordered]@{
-        schemaVersion = 4
+        schemaVersion = 5
+        releaseContractVersion = 2
         artifactStatus = if ($AllowUnsigned) { 'UNSIGNED-NOT-FOR-DISTRIBUTION' } else { 'SIGNED' }
         product = $productName
         version = $Version
@@ -1902,18 +1971,21 @@ try {
         msiSha256 = (Get-FileHash -LiteralPath $candidateMsi -Algorithm SHA256).Hash.ToUpperInvariant()
         signed = -not $AllowUnsigned
         signerCertificateSha256 = $signerCertificateSha256
-        updaterCurrentSignerSha256 = if ($AllowUnsigned) { $null } else { $ExpectedSignerSha256 }
-        updaterNextSignerSha256 = if ($AllowUnsigned -or [string]::IsNullOrEmpty($ExpectedNextSignerSha256)) {
+        signingProfileEku = if ($AllowUnsigned) { $null } else { $ExpectedProfileEku }
+        payloadSigningEvidence = @($payloadSigningEvidence.ToArray())
+        timestampCertificateSha256 = if ($AllowUnsigned) { $null } else { $msiSignResult.TimestampCertificateSha256 }
+        updaterCurrentProfileEku = if ($AllowUnsigned) { $null } else { $ExpectedProfileEku }
+        updaterNextProfileEku = if ($AllowUnsigned -or [string]::IsNullOrEmpty($ExpectedNextProfileEku)) {
             $null
         } else {
-            $ExpectedNextSignerSha256
+            $ExpectedNextProfileEku
         }
-        payloadSignerAllowlistSha256 = if ($AllowUnsigned) {
+        payloadProfileEkuAllowlist = if ($AllowUnsigned) {
             @()
-        } elseif ([string]::IsNullOrEmpty($ExpectedNextSignerSha256)) {
-            @($ExpectedSignerSha256)
+        } elseif ([string]::IsNullOrEmpty($ExpectedNextProfileEku)) {
+            @($ExpectedProfileEku)
         } else {
-            @($ExpectedSignerSha256, $ExpectedNextSignerSha256)
+            @($ExpectedProfileEku, $ExpectedNextProfileEku)
         }
         releaseGatePublicKeyXY = if ($AllowUnsigned) { $null } else { $ExpectedReleaseGatePublicKeyXY }
         releaseGateNextPublicKeyXY = if ($AllowUnsigned -or
@@ -1971,6 +2043,11 @@ try {
         payloadFiles = $payloadEvidence
         validation = [ordered]@{
             policyMutationTests = $policyMutationTestCount
+            sequenceMutationTests = $sequenceMutationTestCount
+            nativeUpdaterSequenceMutationTests = if ($nativeProbe) { $sequenceMutationTestCount } else { 0 }
+            architectureMutationTests = $architectureMutationTestCount
+            nativeUpdaterArchitectureMutationTests = if ($nativeProbe) { $architectureMutationTestCount } else { 0 }
+            installExecuteSequence = @($msiContract.InstallExecuteSequence)
             moduleInfoIdentityValidated = $true
             pluginVersionResourceValidated = $true
             updaterVersionResourceValidated = -not $AllowUnsigned
