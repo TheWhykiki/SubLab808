@@ -174,6 +174,33 @@ def snapshot_source(root, destination):
     _, confirmation = source_inputs(root)
     if manifest != confirmation:
         raise ReleaseError("Source changed while creating the snapshot; retry when edits finish")
+    if manifest.get("origin") != "verified-source-archive" and any(
+            name.startswith("external/JUCE/") for name in files):
+        # A Git snapshot intentionally drops .git, so CMake validates vendored
+        # JUCE through the same manifest used by corresponding-source archives.
+        # Derive that manifest only from the already confirmed snapshot bytes;
+        # never relabel changed or differently pinned vendor sources as upstream.
+        from release_contract import strict_json, validate_product
+        from source_release import MANIFEST, SBOM, canonical_json, make_manifest
+        config = validate_product(strict_json(files["release/product.json"][0]))
+        vendor = [repo for repo in manifest["repositories"] if repo["path"] == "external/JUCE"]
+        if len(vendor) != 1 or vendor[0]["commit"] != config["juce"]["commit"] or vendor[0]["dirty"]:
+            raise ReleaseError("Vendored JUCE snapshots require the exact clean configured commit")
+        if MANIFEST in files or SBOM in files:
+            raise ReleaseError("Git snapshots must not contain pre-existing generated source metadata")
+        commit = manifest["repositories"][0]["commit"]
+        vendor_files = {name: value for name, value in files.items() if name.startswith("external/JUCE/")}
+        # This is deliberately vendor-scoped: a dirty development snapshot is
+        # not a corresponding-source archive and receives no source-release SBOM.
+        # CMake's --juce-only validation accepts it; full archive validation and
+        # repackaging a gitless snapshot must reject the missing own-source/SBOM.
+        files[MANIFEST] = (canonical_json(make_manifest(config, commit, vendor_files, [])), 0o644)
+        # Bind generated verification inputs too, without changing the original
+        # repositories' dirty flags or pretending this is a published source ZIP.
+        records = [{"path": name, "sha256": digest(data), "mode": oct(mode)}
+                   for name, (data, mode) in sorted(files.items())]
+        manifest = {**manifest, "files": records,
+                    "source_sha256": digest(json.dumps(records, sort_keys=True).encode())}
     destination.mkdir()
     for name, (data, mode) in files.items():
         path = destination / name

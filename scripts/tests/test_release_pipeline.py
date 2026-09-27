@@ -204,6 +204,72 @@ class ReleasePipelineTests(unittest.TestCase):
         self.assertFalse(json.loads((candidate / "release-manifest.json").read_text())["application_signed"])
         self.assertEqual(tools.snapshot_manifest, source_manifest)
 
+    def vendored_snapshot_fixture(self, root_dirty=False):
+        files, provenance = pipeline.source_inputs(self.root)
+        files["external/JUCE/CMakeLists.txt"] = (b"project(JUCE)\n", 0o644)
+        files["external/JUCE/LICENSE.md"] = (b"Unmodified upstream fixture licence\n", 0o644)
+        files["external/JUCE/scripts/check.sh"] = (b"#!/bin/sh\nexit 0\n", 0o755)
+        provenance["repositories"][0]["dirty"] = root_dirty
+        provenance["repositories"].append({"path": "external/JUCE", "dirty": False,
+                                           "commit": pipeline.load_product(self.root)["juce"]["commit"]})
+        return files, provenance
+
+    def test_git_vendor_snapshot_has_verifiable_manifest_and_preserves_dirty_evidence(self):
+        import source_release
+        for dirty in (False, True):
+            files, provenance = self.vendored_snapshot_fixture(dirty)
+            destination = self.root / "dist" / f"snapshot-{dirty}"
+            with patch.object(pipeline, "source_inputs", return_value=(files, provenance)):
+                result = pipeline.snapshot_source(self.root, destination)
+            manifest = source_release.verify_tree(destination, juce_only=True)
+            self.assertEqual(manifest["commit"], provenance["repositories"][0]["commit"])
+            self.assertEqual(manifest["juceCommit"], provenance["repositories"][1]["commit"])
+            self.assertEqual(result["repositories"][0]["dirty"], dirty)
+            self.assertNotIn("origin", result)
+            script_record = next(record for record in manifest["files"]
+                                 if record["path"] == "external/JUCE/scripts/check.sh")
+            self.assertEqual(script_record["mode"], 0o755)
+            if pipeline.os.name != "nt":
+                self.assertEqual((destination / "external/JUCE/scripts/check.sh").stat().st_mode & 0o777, 0o755)
+            self.assertEqual({record["path"] for record in manifest["files"]},
+                             {name for name in files if name.startswith("external/JUCE/")})
+            self.assertFalse((destination / source_release.SBOM).exists())
+            with self.assertRaisesRegex(pipeline.ReleaseError, "intact corresponding-source archive"):
+                pipeline.source_inputs(destination)
+            for record in result["files"]:
+                self.assertEqual(record["sha256"], pipeline.file_hash(destination / record["path"]))
+
+    def test_git_vendor_snapshot_rejects_unpinned_dirty_or_unidentified_juce(self):
+        for issue in ("wrong-commit", "dirty", "missing-provenance"):
+            files, provenance = self.vendored_snapshot_fixture()
+            if issue == "wrong-commit":
+                provenance["repositories"][1]["commit"] = "0" * 40
+            elif issue == "dirty":
+                provenance["repositories"][1]["dirty"] = True
+            else:
+                provenance["repositories"].pop()
+            destination = self.root / "dist" / issue
+            with self.subTest(issue=issue), patch.object(pipeline, "source_inputs", return_value=(files, provenance)):
+                with self.assertRaisesRegex(pipeline.ReleaseError, "exact clean configured commit"):
+                    pipeline.snapshot_source(self.root, destination)
+            self.assertFalse(destination.exists())
+
+    def test_git_vendor_snapshot_rejects_preexisting_generated_metadata(self):
+        for name in ("SOURCE-MANIFEST.json", "SBOM.spdx.json"):
+            files, provenance = self.vendored_snapshot_fixture()
+            files[name] = (b"{}\n", 0o644)
+            with self.subTest(name=name), patch.object(pipeline, "source_inputs", return_value=(files, provenance)):
+                with self.assertRaisesRegex(pipeline.ReleaseError, "pre-existing generated source metadata"):
+                    pipeline.snapshot_source(self.root, self.root / "dist" / "rejected")
+
+    def test_nonvendored_git_snapshot_retains_fetch_path_and_exact_provenance(self):
+        _, expected = pipeline.source_inputs(self.root)
+        destination = self.root / "dist" / "nonvendored"
+        result = pipeline.snapshot_source(self.root, destination)
+        self.assertEqual(result, expected)
+        self.assertFalse((destination / "SOURCE-MANIFEST.json").exists())
+        self.assertFalse((destination / "SBOM.spdx.json").exists())
+
     def test_gitless_archive_cannot_sign_a_distribution(self):
         self.make_gitless_source_fixture()
         tools = FakeTools()
