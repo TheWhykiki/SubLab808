@@ -848,16 +848,47 @@ function Invoke-AuthenticodeSign {
     return Assert-ArtifactSigningIdentity $Path $ExpectedProfile
 }
 
+function Invoke-ComMember {
+    param([object] $Object, [string] $Name,
+          [System.Reflection.BindingFlags] $Access, [object[]] $Arguments = @())
+    # Cmdlet results (notably Join-Path) carry PSObject wrappers even when
+    # GetType() reports String. Reflection/COM does not unwrap object[] entries:
+    # Windows Installer then sees an object instead of the required BSTR.
+    # Assign BaseObject directly; a pipeline would wrap its result again.
+    [object[]] $nativeArguments = [object[]]::new($Arguments.Length)
+    for ($index = 0; $index -lt $Arguments.Length; ++$index) {
+        if ($null -ne $Arguments[$index]) {
+            $nativeArguments[$index] = $Arguments[$index].PSObject.BaseObject
+        }
+    }
+    try {
+        return $Object.GetType().InvokeMember($Name, $Access, $null, $Object, $nativeArguments)
+    } catch {
+        $types = @($nativeArguments | ForEach-Object {
+            if ($null -eq $_) { 'null' } else { $_.GetType().FullName }
+        }) -join ', '
+        $cause = $_.Exception
+        while ($null -ne $cause.InnerException) { $cause = $cause.InnerException }
+        $detail = $cause.Message
+        if ($detail.Length -gt 512) { $detail = $detail.Substring(0, 512) }
+        throw [System.InvalidOperationException]::new(
+            "MSI COM $Access '$Name' ($types) failed: $detail", $_.Exception)
+    }
+}
+
 function Invoke-ComMethod {
     param([object] $Object, [string] $Name, [object[]] $Arguments = @())
-    return $Object.GetType().InvokeMember(
-        $Name, [System.Reflection.BindingFlags]::InvokeMethod, $null, $Object, $Arguments)
+    return Invoke-ComMember $Object $Name ([System.Reflection.BindingFlags]::InvokeMethod) $Arguments
 }
 
 function Get-ComProperty {
     param([object] $Object, [string] $Name, [object[]] $Arguments = @())
-    return $Object.GetType().InvokeMember(
-        $Name, [System.Reflection.BindingFlags]::GetProperty, $null, $Object, $Arguments)
+    return Invoke-ComMember $Object $Name ([System.Reflection.BindingFlags]::GetProperty) $Arguments
+}
+
+function Set-ComProperty {
+    param([object] $Object, [string] $Name, [object[]] $Arguments)
+    [void](Invoke-ComMember $Object $Name ([System.Reflection.BindingFlags]::SetProperty) $Arguments)
 }
 
 function Get-MsiRows {
@@ -1333,7 +1364,7 @@ function Invoke-MsiSequenceMutationTests {
     foreach ($action in @('FindRelatedProducts', 'LaunchConditions')) {
         $mutations.Add("DELETE FROM ``InstallExecuteSequence`` WHERE ``Action`` = '$action'")
         $mutations.Add("UPDATE ``InstallExecuteSequence`` SET ``Condition`` = '0' WHERE ``Action`` = '$action'")
-        foreach ($sequence in @('NULL', '0', '-1')) {
+        foreach ($sequence in @('?', '0', '-1')) {
             $mutations.Add("UPDATE ``InstallExecuteSequence`` SET ``Sequence`` = $sequence WHERE ``Action`` = '$action'")
         }
     }
@@ -1348,19 +1379,36 @@ function Invoke-MsiSequenceMutationTests {
         $installer = New-Object -ComObject WindowsInstaller.Installer
         $database = $null
         $view = $null
+        $parameters = $null
         try {
             $database = Invoke-ComMethod $installer 'OpenDatabase' @($copy, 1)
             $view = Invoke-ComMethod $database 'OpenView' @($query)
-            [void](Invoke-ComMethod $view 'Execute')
+            if ($query.Contains('?')) {
+                # MSI SQL constants are only strings/integers. A new Record's
+                # unset first field supplies an actual NULL through its marker.
+                $parameters = Invoke-ComMethod $installer 'CreateRecord' @(1)
+                Assert-Condition (Get-ComProperty $parameters 'IsNull' @(1)) `
+                    'MSI NULL mutation parameter is not null.'
+                [void](Invoke-ComMethod $view 'Execute' @($parameters))
+            } else {
+                [void](Invoke-ComMethod $view 'Execute')
+            }
             [void](Invoke-ComMethod $view 'Close')
             [void](Invoke-ComMethod $database 'Commit')
+        } catch {
+            throw [System.InvalidOperationException]::new(
+                "MSI sequence mutation $index could not be written ($query): $($_.Exception.Message)", $_.Exception)
         } finally {
+            if ($null -ne $parameters) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($parameters) }
             if ($null -ne $view) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) }
             if ($null -ne $database) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($database) }
             [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer)
         }
         $rejected = $false
-        try { & $Validate $copy | Out-Null } catch { $rejected = $true }
+        try { & $Validate $copy | Out-Null } catch {
+            if ($_.Exception.Message -notmatch '^MSI sequence action|^MSI detection/launch-condition|^FindRelatedProducts must run before') { throw }
+            $rejected = $true
+        }
         Assert-Condition $rejected "MSI sequence mutant was accepted: $query"
         if ($Probe) { Invoke-MsiDatabaseProbe $Probe $copy $Version 1 }
         Remove-Item -LiteralPath $copy
@@ -1380,15 +1428,17 @@ function Invoke-MsiArchitectureMutationTest {
         $summary = Get-ComProperty $installer 'SummaryInformation' @($copy, 1)
         $current = [string](Get-ComProperty $summary 'Property' @(7))
         $wrong = if ($current.Split(';')[0] -in @('x64', 'Intel64')) { 'Arm64;1033' } else { 'x64;1033' }
-        [void]$summary.GetType().InvokeMember('Property',
-            [System.Reflection.BindingFlags]::SetProperty, $null, $summary, @(7, $wrong))
+        Set-ComProperty $summary 'Property' @(7, $wrong)
         [void](Invoke-ComMethod $summary 'Persist')
     } finally {
         if ($null -ne $summary) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($summary) }
         [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer)
     }
     $rejected = $false
-    try { & $Validate $copy | Out-Null } catch { $rejected = $true }
+    try { & $Validate $copy | Out-Null } catch {
+        if ($_.Exception.Message -notmatch '^Expected (Arm64|x64) MSI template') { throw }
+        $rejected = $true
+    }
     Assert-Condition $rejected 'MSI foreign architecture mutant was accepted.'
     if ($Probe) { Invoke-MsiDatabaseProbe $Probe $copy $Version 1 }
     Remove-Item -LiteralPath $copy
@@ -1845,10 +1895,14 @@ try {
     $msiContract = Test-MsiContract $msiPath $productName $displayName $manufacturer $Version `
         $productCode $upgradeCode `
         $otherUpgradeCode $architectureContract.MsiArchitecture $signedSnapshot.Files.Count
+    Write-Host 'Generated MSI table contract: PASS'
 
     Assert-Condition ($AllowUnsigned -or $UpdaterTestPath) 'Signed packaging requires the native updater MSI policy probe.'
     $nativeProbe = if ($UpdaterTestPath) { Resolve-ExistingFile $UpdaterTestPath 'Native updater MSI policy probe' } else { $null }
-    if ($nativeProbe) { Invoke-MsiDatabaseProbe $nativeProbe $msiPath $Version 0 }
+    if ($nativeProbe) {
+        Invoke-MsiDatabaseProbe $nativeProbe $msiPath $Version 0
+        Write-Host 'Native updater MSI baseline: PASS'
+    }
     $sequenceMutationTestCount = Invoke-MsiSequenceMutationTests $msiPath $workRoot {
         param($candidate)
         Test-MsiContract $candidate $productName $displayName $manufacturer $Version `
@@ -1859,6 +1913,8 @@ try {
         Test-MsiContract $candidate $productName $displayName $manufacturer $Version `
             $productCode $upgradeCode $otherUpgradeCode $architectureContract.MsiArchitecture $signedSnapshot.Files.Count
     } $nativeProbe $Version
+
+    Write-Host "MSI mutations rejected: $sequenceMutationTestCount sequence, $architectureMutationTestCount architecture (native probe: $([bool]$nativeProbe))."
 
     if (-not $AllowUnsigned) {
         $msiSignResult = Invoke-AuthenticodeSign $msiPath $signTool $signingArguments $ExpectedProfileEku $timestamp

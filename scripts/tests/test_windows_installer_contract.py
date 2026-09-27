@@ -53,6 +53,23 @@ class WindowsInstallerContractTests(unittest.TestCase):
     def elements(self, name: str) -> list[ET.Element]:
         return list(self.wxs.iter(f"{{{WIX_NAMESPACE}}}{name}"))
 
+    def test_msi_com_argument_transport_and_native_mutations(self) -> None:
+        pwsh = os.environ.get("PWSH") or shutil.which("pwsh")
+        if not pwsh:
+            if os.name == "nt":
+                self.fail("pwsh is required by the Windows workflows")
+            self.skipTest("PowerShell is required for executable reflection regression tests")
+        result = subprocess.run(
+            [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-File",
+             str(ROOT / "scripts/tests/test_windows_msi_com.ps1")],
+            capture_output=True, text=True, timeout=90, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PASS: MSI reflection argument transport", result.stdout)
+        if os.name == "nt":
+            self.assertIn("PASS: Windows Installer COM database/summary baseline", result.stdout)
+            self.assertIn("14 sequence + 1 architecture mutants", result.stdout)
+
     @unittest.skipUnless(os.name == "nt", "PowerShell AST parsing requires Windows")
     def test_powershell_sources_parse_on_windows(self) -> None:
         pwsh = shutil.which("pwsh")
@@ -485,6 +502,10 @@ if ($certificates[0].GetAttribute('allowUntrustedRoot') -cne 'false') {
             "Invoke-MsiArchitectureMutationTest",
             "Signed packaging requires the native updater MSI policy probe.",
             "installExecuteSequence = @($msiContract.InstallExecuteSequence)",
+            "foreach ($sequence in @('?', '0', '-1'))",
+            "Invoke-ComMethod $installer 'CreateRecord' @(1)",
+            "Get-ComProperty $parameters 'IsNull' @(1)",
+            "Invoke-ComMethod $view 'Execute' @($parameters)",
         ):
             self.assertIn(token, self.script)
         source = (ROOT / "Updater/Windows/WindowsUpdater.cpp").read_text()

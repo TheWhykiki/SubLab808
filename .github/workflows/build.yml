@@ -156,6 +156,9 @@ jobs:
           key: juce-windows-${{ matrix.label }}-release-91ad83ae34a81e0833b1a2b0866f54846370ae53
       - name: Verify factory bank
         run: python scripts/generate-presets.py --check
+      - name: Check native Windows Installer COM mutations before compilation
+        shell: pwsh
+        run: pwsh -NoLogo -NoProfile -NonInteractive -File scripts/tests/test_windows_msi_com.ps1
       - name: Verify native host architecture
         shell: pwsh
         run: |

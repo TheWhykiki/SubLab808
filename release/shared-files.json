@@ -34,6 +34,7 @@
     "scripts/tests/test_owner_promotion.py",
     "scripts/tests/test_release_protection.py",
     "scripts/tests/test_source_release.py",
+    "scripts/tests/test_windows_msi_com.ps1",
     "scripts/validate-owner-promotion.py",
     "scripts/validate-physical-daw-release-receipt.py",
     "scripts/validate-release-protection.py",
