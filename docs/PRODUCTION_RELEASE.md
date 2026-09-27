@@ -1,13 +1,21 @@
 # Production release contract v2
 
 Code implementation does not authorize publication. Keep the current PRs as
-drafts until independent review is complete. Do not merge, create a tag, dispatch
-the production workflow, or publish a prerelease without separate owner approval.
+drafts until the owner separately authorizes proceeding. Do not merge, create a
+tag, dispatch the production workflow, or publish a prerelease without separate
+owner approval.
+
+On 2026-09-27 the owner explicitly chose sole-owner approval by `TheWhykiki`
+instead of an independent reviewer. Self-approval is intentional under this
+policy; it is not independent QA or a two-person control. Code review, actual
+physical acceptance and every signing/evidence gate still apply. This policy
+change itself authorizes neither a merge nor any publication.
 
 ## Separate owner permission for Stable/Latest
 
-The physical environment review is independent QA, not the owner's publication
-permission. After the physical checks have actually finished, while the
+The physical environment review attests the actual tests; it is not by itself
+permission to publish Stable/Latest. The same owner supplies these two distinct
+approvals. After the physical checks have actually finished, while the
 `physical-daw-release` job is still awaiting its review, the repository owner
 posts a commit comment on the exact candidate commit. The comment is the prefix
 `whykiki-stable-promotion-v2:` immediately followed by this JSON (use real values):
@@ -26,7 +34,7 @@ binding field. An unrelated or older run cannot approve the candidate. The
 latest matching owner comment is authoritative; `"decision":"reject"` revokes
 an earlier approval. Duplicate JSON keys fail closed.
 
-Only then does the independent reviewer submit the physical receipt and approve
+Only then does the owner submit the physical receipt and approve
 the physical environment. The finalizer requires both approvals and all automated
 gates. Missing owner permission leaves the candidate quarantined as an immutable
 prerelease. Do not rerun blindly: a new run attempt needs new bindings and receipts.
@@ -34,25 +42,44 @@ Do not delete or reuse the tag of any published candidate.
 
 ## Protected GitHub setup
 
-On 2026-09-26, both repositories' `main` branch protection was configured and
-verified through GitHub: native platform CI plus release parity are mandatory,
-checks are bound to GitHub Actions, branches must be current, at least one PR
-review is required, stale approvals are dismissed, last-push approval and
-conversation resolution are required, administrators cannot bypass, and force
-pushes/deletions are disabled.
+On 2026-09-27, both repositories' `main` protection was updated and re-read
+through GitHub for the explicitly approved sole-owner policy. Pull requests,
+native platform CI, release parity, current branches and conversation resolution
+remain required. Checks remain bound to GitHub Actions; administrator enforcement
+remains enabled, and force pushes/deletions remain disabled. Only the peer-review
+requirement changed: `required_approving_review_count=0`,
+`require_last_push_approval=false`, `require_code_owner_reviews=false`.
+Stale-review dismissal remains enabled. GitHub authors cannot approve their own
+PRs, so a mandatory peer approval would prevent this owner-only process.
+The agent still must obtain separate owner permission before merging.
 Repository release immutability was also enabled and re-read as enabled for both
 repositories. This affects future releases; no release or tag was created.
 
-Before signing, both `release-signing` and `physical-daw-release` must have
-explicit independent user reviewers, self-review prevention, no admin bypass,
-and protected branches only. They are deliberately not activated with a dummy
-reviewer. The authorization, staging and promotion steps re-read protection and
-fail closed if it has weakened. The Administration-read token for this preflight
-must remain separate from release-signing credentials.
+Both `release-signing` and `physical-daw-release` were created and re-read with
+exactly one required `User` reviewer: `TheWhykiki` (GitHub user ID `12602174`).
+`prevent_self_review=false` deliberately allows the owner to approve their own
+run or rerun. Administrator bypass is forbidden, and only protected branches
+may deploy. The validators bind both owner login and immutable user ID from
+GitHub metadata, not an identity asserted by a receipt. Teams, additional
+reviewers, missing owner identity or mismatched IDs/logins are rejected.
+The authorization, staging and promotion steps re-read protection and fail
+closed if it differs from this policy. The Administration-read token for this
+preflight must remain separate from release-signing credentials.
+
+The owner approves signing in `release-signing`, later supplies the complete
+physical receipt in a separate `physical-daw-release` approval, and grants the
+candidate-specific Stable/Latest permission above separately. A signing approval
+does not substitute for either of the other two. No approval is generated by
+changing these settings.
+
+GitHub references:
+[environment review controls](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
+and [PR author approval restriction](https://docs.github.com/en/pull-requests/how-tos/review-pull-requests/approving-a-pull-request-with-required-reviews).
 
 ## External acceptance still required
 
-- Name an independent reviewer with repository read access.
+- The owner must deliberately approve each signing run, actual physical receipt
+  and exact Stable/Latest candidate; the environment configuration is not approval.
 - Provision the Azure tenant/subscription, validated Public Trust certificate
   profile, environment-bound GitHub OIDC roles and versioned non-exportable
   P-256 EC-HSM release-gate key. Do not upload Windows PFX or gate private keys.

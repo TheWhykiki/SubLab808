@@ -664,11 +664,13 @@ class WindowsReleaseContractTests(unittest.TestCase):
             '"repos/$GITHUB_REPOSITORY/environments/$WK_PHYSICAL_ENVIRONMENT"',
             '"repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/approvals"',
             '"repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"',
+            '"repos/$GITHUB_REPOSITORY" > "$gate_directory/repository.json"',
             '"repos/$GITHUB_REPOSITORY/branches/$default_branch_uri"',
             '"repos/$GITHUB_REPOSITORY/compare/$WK_CANDIDATE_COMMIT...$observed_branch_commit"',
             '"repos/$GITHUB_REPOSITORY/compare/$WK_WORKFLOW_SHA...$observed_branch_commit"',
             '"repos/$GITHUB_REPOSITORY/releases/$WK_CANDIDATE_RELEASE_ID"',
             "--branch-json \"$gate_directory/branch.json\"",
+            "--repository-json \"$gate_directory/repository.json\"",
             "--candidate-compare-json \"$gate_directory/candidate-compare.json\"",
             "--workflow-compare-json \"$gate_directory/workflow-compare.json\"",
             "--run-attempt \"$GITHUB_RUN_ATTEMPT\"",
@@ -678,6 +680,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
         ):
             self.assertIn(token, gate)
         self.assertNotIn("WINDOWS_CODE_SIGNING_PFX_BASE64", gate)
+        self.assertNotIn("'.repository.default_branch |", gate)
         self.assertNotIn("MACOS_NOTARY_PRIVATE_KEY_P8_BASE64", gate)
         self.assertNotIn("WINDOWS_RELEASE_GATE_PRIVATE_KEY_PKCS8_BASE64", gate)
         finalizer = self.release[end:]
@@ -705,7 +708,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
         release_id = 987654321
         workflow_sha = "2" * 40
         environment_id = 41
-        reviewer_id = 42
+        reviewer_id = 12602174
         names = (
             f"{PRODUCT}-{version}-Windows-x64.msi",
             f"{PRODUCT}-{version}-Windows-x64.evidence.json",
@@ -810,11 +813,11 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "protection_rules": [
                 {
                     "type": "required_reviewers",
-                    "prevent_self_review": True,
+                    "prevent_self_review": False,
                     "reviewers": [
                         {
                             "type": "User",
-                            "reviewer": {"id": reviewer_id, "login": "qa-reviewer"},
+                            "reviewer": {"id": reviewer_id, "login": "TheWhykiki", "type": "User"},
                         }
                     ],
                 }
@@ -827,7 +830,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
                 "environments": [
                     {"id": environment_id, "name": "physical-daw-release"}
                 ],
-                "user": {"id": reviewer_id, "login": "qa-reviewer"},
+                "user": {"id": reviewer_id, "login": "TheWhykiki", "type": "User"},
             }
         ]
         workflow_run = {
@@ -837,8 +840,9 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "head_sha": workflow_sha,
             "head_branch": "main",
             "repository": {
+                "id": 101,
                 "full_name": f"TheWhykiki/{PRODUCT}",
-                "default_branch": "main",
+                "owner": {"id": reviewer_id, "login": "TheWhykiki", "type": "User"},
             },
             "actor": {"id": 7, "login": "release-operator"},
             "triggering_actor": {"id": 8, "login": "rerun-operator"},
@@ -876,6 +880,12 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "environment": environment,
             "reviews": reviews,
             "workflow_run": workflow_run,
+            "repository_metadata": {
+                "id": 101,
+                "full_name": f"TheWhykiki/{PRODUCT}",
+                "default_branch": "main",
+                "owner": {"id": reviewer_id, "login": "TheWhykiki", "type": "User"},
+            },
             "branch": branch,
             "candidate_compare": candidate_compare,
             "workflow_compare": workflow_compare,
@@ -894,11 +904,191 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "now": dt.datetime(2026, 9, 8, 13, 0, tzinfo=dt.timezone.utc),
         }
 
+    def test_physical_receipt_binds_minimal_run_to_full_repository_metadata(self) -> None:
+        fixture = self._physical_receipt_fixture()
+        self.assertNotIn("default_branch", fixture["workflow_run"]["repository"])
+        envelope = self.physical_receipt.validate(**fixture)
+        self.assertEqual(envelope["branchProtection"]["name"], "main")
+        # GitHub's minimal Actions repository omits this field; a null value
+        # must not override the canonical full repository API response either.
+        fixture["workflow_run"]["repository"]["default_branch"] = None
+        self.assertEqual(self.physical_receipt.validate(**fixture), envelope)
+
+        for mutation in (
+            "missing-metadata", "metadata-full-name", "metadata-missing-full-name",
+            "metadata-id", "metadata-missing-id", "metadata-bool-id", "run-missing-id",
+            "metadata-missing-owner", "metadata-owner-id", "metadata-owner-login",
+            "metadata-owner-type", "metadata-owner-missing-type",
+            "metadata-owner-missing-login", "metadata-owner-bool-id",
+            "missing-default-branch", "null-default-branch", "empty-default-branch",
+            "wrong-default-branch", "control-default-branch", "long-default-branch",
+        ):
+            with self.subTest(mutation=mutation):
+                fixture = self._physical_receipt_fixture()
+                metadata = fixture["repository_metadata"]
+                if mutation == "missing-metadata":
+                    fixture["repository_metadata"] = None
+                elif mutation == "metadata-full-name":
+                    metadata["full_name"] = f"different-owner/{PRODUCT}"
+                elif mutation == "metadata-missing-full-name":
+                    del metadata["full_name"]
+                elif mutation == "metadata-id":
+                    metadata["id"] = 102
+                elif mutation == "metadata-missing-id":
+                    del metadata["id"]
+                elif mutation == "metadata-bool-id":
+                    metadata["id"] = True
+                elif mutation == "run-missing-id":
+                    del fixture["workflow_run"]["repository"]["id"]
+                elif mutation == "metadata-missing-owner":
+                    del metadata["owner"]
+                elif mutation == "metadata-owner-id":
+                    metadata["owner"]["id"] = 77
+                elif mutation == "metadata-owner-login":
+                    metadata["owner"]["login"] = "different-owner"
+                elif mutation == "metadata-owner-type":
+                    metadata["owner"]["type"] = "Organization"
+                elif mutation == "metadata-owner-missing-type":
+                    del metadata["owner"]["type"]
+                elif mutation == "metadata-owner-missing-login":
+                    del metadata["owner"]["login"]
+                elif mutation == "metadata-owner-bool-id":
+                    metadata["owner"]["id"] = True
+                elif mutation == "missing-default-branch":
+                    del metadata["default_branch"]
+                elif mutation == "null-default-branch":
+                    metadata["default_branch"] = None
+                elif mutation == "empty-default-branch":
+                    metadata["default_branch"] = ""
+                elif mutation == "wrong-default-branch":
+                    metadata["default_branch"] = "different-branch"
+                elif mutation == "control-default-branch":
+                    metadata["default_branch"] = "main\n"
+                else:
+                    metadata["default_branch"] = "a" * 256
+                with self.assertRaises(self.physical_receipt.ContractError):
+                    self.physical_receipt.validate(**fixture)
+
+    def test_physical_receipt_owner_can_approve_own_run_and_rerun(self) -> None:
+        for actors in (("actor",), ("triggering_actor",), ("actor", "triggering_actor")):
+            with self.subTest(actors=actors):
+                fixture = self._physical_receipt_fixture()
+                owner = fixture["workflow_run"]["repository"]["owner"]
+                for field in actors:
+                    fixture["workflow_run"][field] = dict(owner)
+                envelope = self.physical_receipt.validate(**fixture)
+                self.assertEqual(envelope["review"]["userId"], owner["id"])
+                self.assertEqual(len(envelope["receipt"]["checks"]), 12)
+
+        fixture = self._physical_receipt_fixture()
+        fixture["run_attempt"] = fixture["workflow_run"]["run_attempt"] = 2
+        fixture["workflow_run"]["triggering_actor"] = dict(fixture["workflow_run"]["repository"]["owner"])
+        receipt = json.loads(fixture["reviews"][0]["comment"])
+        receipt["runAttempt"] = 2
+        fixture["reviews"][0]["comment"] = json.dumps(receipt)
+        fixture["release"]["body"] = (
+            f"whykiki-release-run:TheWhykiki/{PRODUCT}:"
+            f'{fixture["run_id"]}:2:{TAG_COMMIT}'
+        )
+        envelope = self.physical_receipt.validate(**fixture)
+        self.assertEqual(envelope["receipt"]["runAttempt"], 2)
+        self.assertEqual(envelope["review"]["userId"], 12602174)
+        # Owner authority must not make a previous attempt's receipt reusable.
+        receipt["runAttempt"] = 1
+        fixture["reviews"][0]["comment"] = json.dumps(receipt)
+        with self.assertRaises(self.physical_receipt.ContractError):
+            self.physical_receipt.validate(**fixture)
+
+    def test_physical_receipt_requires_exact_owner_identity_and_policy(self) -> None:
+        for mutation in (
+            "missing-owner", "owner-organization", "owner-bot", "owner-missing-type",
+            "owner-id", "owner-bool-id", "owner-login", "owner-missing-login",
+            "repository-owner-mismatch", "reviewer-id", "reviewer-login",
+            "reviewer-bot", "reviewer-missing-type", "configured-id", "configured-login",
+            "configured-team", "configured-bot", "configured-missing-type",
+            "missing-reviewer", "additional-reviewer", "duplicate-owner-reviewer",
+            "prevent-self-review", "missing-self-review-policy", "numeric-self-review-policy",
+            "actor-owner-id-only", "actor-owner-login-only",
+            "rerun-owner-id-only", "rerun-owner-login-only", "missing-actor",
+            "missing-rerun-actor", "invalid-actor-id", "invalid-rerun-login",
+            "actor-pair-inconsistent",
+        ):
+            with self.subTest(mutation=mutation):
+                fixture = self._physical_receipt_fixture()
+                run = fixture["workflow_run"]
+                owner = run["repository"]["owner"]
+                review_user = fixture["reviews"][0]["user"]
+                rule = fixture["environment"]["protection_rules"][0]
+                configured = rule["reviewers"][0]
+                configured_user = configured["reviewer"]
+                if mutation == "missing-owner":
+                    del run["repository"]["owner"]
+                elif mutation in ("owner-organization", "owner-bot"):
+                    owner["type"] = "Organization" if mutation.endswith("organization") else "Bot"
+                elif mutation == "owner-missing-type":
+                    del owner["type"]
+                elif mutation in ("owner-id", "owner-bool-id"):
+                    owner["id"] = 77 if mutation == "owner-id" else True
+                elif mutation == "owner-login":
+                    owner["login"] = "different-owner"
+                elif mutation == "owner-missing-login":
+                    del owner["login"]
+                elif mutation == "repository-owner-mismatch":
+                    run["repository"]["full_name"] = f"different-owner/{PRODUCT}"
+                elif mutation == "reviewer-id":
+                    review_user["id"] = 77
+                elif mutation == "reviewer-login":
+                    review_user["login"] = "different-owner"
+                elif mutation == "reviewer-bot":
+                    review_user["type"] = "Bot"
+                elif mutation == "reviewer-missing-type":
+                    del review_user["type"]
+                elif mutation == "configured-id":
+                    configured_user["id"] = 77
+                elif mutation == "configured-login":
+                    configured_user["login"] = "different-owner"
+                elif mutation == "configured-team":
+                    configured["type"] = "Team"
+                elif mutation == "configured-bot":
+                    configured_user["type"] = "Bot"
+                elif mutation == "configured-missing-type":
+                    del configured_user["type"]
+                elif mutation == "missing-reviewer":
+                    rule["reviewers"] = []
+                elif mutation == "additional-reviewer":
+                    rule["reviewers"].append({"type": "User", "reviewer": {
+                        "id": 77, "login": "foreign-reviewer", "type": "User"}})
+                elif mutation == "duplicate-owner-reviewer":
+                    rule["reviewers"].append(json.loads(json.dumps(configured)))
+                elif mutation == "prevent-self-review":
+                    rule["prevent_self_review"] = True
+                elif mutation == "missing-self-review-policy":
+                    del rule["prevent_self_review"]
+                elif mutation == "numeric-self-review-policy":
+                    rule["prevent_self_review"] = 0
+                elif mutation in ("actor-owner-id-only", "rerun-owner-id-only"):
+                    run["actor" if mutation.startswith("actor") else "triggering_actor"]["id"] = owner["id"]
+                elif mutation in ("actor-owner-login-only", "rerun-owner-login-only"):
+                    run["actor" if mutation.startswith("actor") else "triggering_actor"]["login"] = owner["login"]
+                elif mutation == "missing-actor":
+                    del run["actor"]
+                elif mutation == "missing-rerun-actor":
+                    del run["triggering_actor"]
+                elif mutation == "invalid-actor-id":
+                    run["actor"]["id"] = True
+                elif mutation == "invalid-rerun-login":
+                    run["triggering_actor"]["login"] = "bad login"
+                else:
+                    run["triggering_actor"]["id"] = run["actor"]["id"]
+                with self.assertRaises(self.physical_receipt.ContractError):
+                    self.physical_receipt.validate(**fixture)
+
     def test_physical_receipt_cli_hashes_exact_written_bytes(self) -> None:
         fixture = self._physical_receipt_fixture()
         envelope = self.physical_receipt.validate(**fixture)
         self.assertEqual(envelope["environmentId"], 41)
-        self.assertEqual(envelope["review"]["userId"], 42)
+        self.assertEqual(envelope["review"]["userId"], 12602174)
+        self.assertEqual(envelope["review"]["user"], "TheWhykiki")
         self.assertEqual(envelope["branchProtection"]["candidateAncestor"], TAG_COMMIT)
         self.assertEqual(
             envelope["branchProtection"]["workflowAncestor"], fixture["workflow_sha"]
@@ -913,6 +1103,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
                 "environment",
                 "reviews",
                 "workflow_run",
+                "repository_metadata",
                 "branch",
                 "candidate_compare",
                 "workflow_compare",
@@ -932,6 +1123,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
                 "--environment-json", str(paths["environment"]),
                 "--reviews-json", str(paths["reviews"]),
                 "--workflow-run-json", str(paths["workflow_run"]),
+                "--repository-json", str(paths["repository_metadata"]),
                 "--branch-json", str(paths["branch"]),
                 "--candidate-compare-json", str(paths["candidate_compare"]),
                 "--workflow-compare-json", str(paths["workflow_compare"]),
@@ -1041,7 +1233,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
         signing_review = {
             "state": "approved", "comment": "Sign the reviewed candidate",
             "environments": [{"id": 99, "name": "release-signing"}],
-            "user": {"id": 42, "login": "qa-reviewer"},
+            "user": {"id": 12602174, "login": "TheWhykiki", "type": "User"},
         }
         fixture["reviews"].insert(0, signing_review)
         fixture["reviews"].append(json.loads(json.dumps(signing_review)))
@@ -1675,7 +1867,7 @@ class WindowsReleaseContractTests(unittest.TestCase):
             "ARM64EC",
             "Draft",
             "physical-daw-release",
-            "Prevent self-review",
+            "prevent_self_review=false",
             "Allow administrators to bypass configured protection rules",
             "GET /repos/{owner}/{repo}/actions/runs/{run_id}/approvals",
             "Cubase",

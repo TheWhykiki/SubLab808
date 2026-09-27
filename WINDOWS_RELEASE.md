@@ -30,16 +30,21 @@ künftig veröffentlichte Releases und heilt keine bereits vorhandenen veränder
 Releases nachträglich; der Workflow prüft sie deshalb vor Authorization, Stage und
 Finalize jeweils fail-closed über das separate Administration-Read-Token.
 
-Unter **Settings → Environments** muss außerdem vor dem ersten Lauf das
-Environments `release-signing` und `physical-daw-release` angelegt werden. Es braucht mindestens einen
-expliziten Benutzer als **Required reviewer** (keine Teams), aktiviertes **Prevent self-review** und
-deaktiviertes **Allow administrators to bypass configured protection rules**.
-Seine Deployment-Branches werden auf **Protected branches only** begrenzt; der
-Default Branch selbst muss geschützt sein.
-Das Environment enthält keine Secrets. Wird es vergessen und von GitHub beim
+Unter **Settings → Environments** sind `release-signing` und
+`physical-daw-release` mit genau einem **Required reviewer** konfiguriert:
+Eigentümer `TheWhykiki` (GitHub-User-ID `12602174`, keine Teams).
+Seit der ausdrücklichen Eigentümerentscheidung vom 27.09.2026 ist
+**Prevent self-review** deaktiviert (`prevent_self_review=false`).
+**Allow administrators to bypass configured protection rules** bleibt deaktiviert.
+Die Deployment-Branches bleiben auf **Protected branches only** begrenzt; der
+Default Branch selbst muss geschützt sein. Das ist eine bewusste
+Eigentümerfreigabe, keine unabhängige Zweitprüfung.
+Das physische Abnahme-Environment benötigt keine Signing-Secrets.
+Wird ein Environment vergessen und von GitHub beim
 ersten Bezug ungeschützt angelegt, bricht der nachgelagerte Validator ab, weil
-er genau eine nichtleere `required_reviewers`-Regel mit
-`prevent_self_review=true`, `deployment_branch_policy.protected_branches=true`
+er genau eine `required_reviewers`-Regel mit ausschließlich dem Eigentümer
+(Login und unveränderliche ID aus GitHub-Metadaten),
+`prevent_self_review=false`, `deployment_branch_policy.protected_branches=true`
 und `custom_branch_policies=false` verlangt. Der geprüfte Workflow-Run muss
 außerdem auf dem gemeldeten Default Branch liegen. Der Validator liest diesen
 Branch zusätzlich direkt über die GitHub-API und verlangt `protected=true`; die
@@ -268,8 +273,12 @@ Auf Windows bleibt UAC aktiviert; auf macOS bleiben Gatekeeper und die
 gestapelten Notarisierungstickets aktiv. `machine` ist nur ein nicht geheimes
 Inventar-Alias, niemals Seriennummer, Benutzername oder sonstiges Geheimnis.
 
-Erst danach darf ein anderer Required Reviewer den wartenden Environment-Job
-freigeben. Sein Kommentar muss ausschließlich ein JSON-Objekt nach Schema 2
+Erst danach darf der Eigentümer `TheWhykiki` den wartenden Environment-Job
+freigeben, auch wenn er den Workflow selbst gestartet oder erneut gestartet hat.
+Das ersetzt weder die tatsächlichen zwölf Abnahmen noch die separate,
+kandidatengenau gebundene Stable-/Latest-Freigabe gemäß
+[`docs/PRODUCTION_RELEASE.md`](docs/PRODUCTION_RELEASE.md).
+Sein Kommentar muss ausschließlich ein JSON-Objekt nach Schema 2
 enthalten; Markdown-Fences oder Begleittext sind nicht zulässig. Die exakten
 Werte für `runId`, `runAttempt`, `releaseId`, `tag`, `commit`,
 `assetManifestSha256` und die vier Digests stehen in der Zusammenfassung von
@@ -288,15 +297,20 @@ Er wählt genau einen Eintrag für das physische Environment; separate
 `release-signing`-Reviews sind erlaubt. `state` muss exakt `approved` sein,
 `environments` muss ausschließlich ID und Name des aktuellen
 `physical-daw-release` enthalten, `user.id` und `user.login` müssen exakt einen
-direkt im Environment konfigurierten Benutzer benennen, dieser darf weder per
-stabiler User-ID noch per Login ursprünglicher Workflow-Aktor oder Re-run-Aktor
-sein und `comment` muss das obige Receipt
+direkt im Environment konfigurierten Benutzer benennen. Dieser muss mit
+stabiler User-ID und Login dem Eigentümer aus den Repository-Metadaten entsprechen;
+der ursprüngliche Workflow-Aktor oder Re-run-Aktor darf derselbe Eigentümer sein.
+`comment` muss das obige Receipt
 erfüllen. Doppelte, gemischte, abgelehnte oder unklare physische Reviews sind
 fail-closed. Das Environment muss `can_admins_bypass=false` melden. Zusätzlich werden das Environment
 über `GET /repos/{owner}/{repo}/environments/physical-daw-release`, der Run über
-`GET /repos/{owner}/{repo}/actions/runs/{run_id}`, der aktuelle Default Branch
+`GET /repos/{owner}/{repo}/actions/runs/{run_id}`, die vollständigen Repository-
+Metadaten über `GET /repos/{owner}/{repo}`, der aktuelle Default Branch
 über `GET /repos/{owner}/{repo}/branches/{branch}` und der Candidate über seine
-exakte Release-ID erneut gelesen. Nur eine Branch-Antwort mit passendem Namen,
+exakte Release-ID erneut gelesen. Der Default-Branch stammt aus der vollständigen
+Repository-Antwort; das minimale Repository-Objekt in der Run-Antwort enthält
+dieses Feld nicht. Eigentümer und Repository-Identität müssen zwischen beiden
+Antworten übereinstimmen. Nur eine Branch-Antwort mit passendem Namen,
 `protected=true` und gültigem beobachtetem Commit wird in den kanonischen
 Receipt-Umschlag übernommen. Zwei Compare-API-Antworten müssen zusätzlich
 `status=ahead|identical` liefern und Candidate- sowie Workflow-Commit jeweils

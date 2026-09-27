@@ -61,6 +61,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_ADMIN_READ_TOKEN }}
+          WK_REPOSITORY_OWNER_ID: ${{ github.repository_owner_id }}
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN"
@@ -76,7 +77,7 @@ jobs:
             --branch-protection-json "$protection_dir/branch.json" \
             --signing-environment-json "$protection_dir/signing.json" \
             --physical-environment-json "$protection_dir/physical.json" \
-            --owner "${GITHUB_REPOSITORY%%/*}" --actor "$GITHUB_ACTOR"
+            --owner "${GITHUB_REPOSITORY%%/*}" --owner-id "$WK_REPOSITORY_OWNER_ID" --actor "$GITHUB_ACTOR"
 
       - name: Resolve immutable bootstrap or exact previous Windows release
         id: release_state
@@ -1065,6 +1066,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_ADMIN_READ_TOKEN }}
+          WK_REPOSITORY_OWNER_ID: ${{ github.repository_owner_id }}
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN"
@@ -1080,7 +1082,7 @@ jobs:
             --branch-protection-json "$protection_dir/branch.json" \
             --signing-environment-json "$protection_dir/signing.json" \
             --physical-environment-json "$protection_dir/physical.json" \
-            --owner "${GITHUB_REPOSITORY%%/*}" --actor "$GITHUB_ACTOR"
+            --owner "${GITHUB_REPOSITORY%%/*}" --owner-id "$WK_REPOSITORY_OWNER_ID" --actor "$GITHUB_ACTOR"
 
       - name: Create a complete draft and expose that exact ID as an immutable prerelease
         id: stage_release
@@ -1614,9 +1616,11 @@ jobs:
           gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
             "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             > "$gate_directory/workflow-run.json"
+          gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY" > "$gate_directory/repository.json"
           default_branch_uri="$(jq -er \
-            '.repository.default_branch | select(type == "string" and length > 0 and length <= 255) | @uri' \
-            "$gate_directory/workflow-run.json")"
+            '.default_branch | select(type == "string" and length > 0 and length <= 255) | @uri' \
+            "$gate_directory/repository.json")"
           [[ -n "$default_branch_uri" ]]
           gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
             "repos/$GITHUB_REPOSITORY/branches/$default_branch_uri" \
@@ -1649,6 +1653,7 @@ jobs:
             --environment-json "$gate_directory/environment.json" \
             --reviews-json "$gate_directory/reviews.json" \
             --workflow-run-json "$gate_directory/workflow-run.json" \
+            --repository-json "$gate_directory/repository.json" \
             --branch-json "$gate_directory/branch.json" \
             --candidate-compare-json "$gate_directory/candidate-compare.json" \
             --workflow-compare-json "$gate_directory/workflow-compare.json" \
@@ -1731,6 +1736,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_ADMIN_READ_TOKEN }}
+          WK_REPOSITORY_OWNER_ID: ${{ github.repository_owner_id }}
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN"
@@ -1746,7 +1752,7 @@ jobs:
             --branch-protection-json "$protection_dir/branch.json" \
             --signing-environment-json "$protection_dir/signing.json" \
             --physical-environment-json "$protection_dir/physical.json" \
-            --owner "${GITHUB_REPOSITORY%%/*}" --actor "$GITHUB_ACTOR"
+            --owner "${GITHUB_REPOSITORY%%/*}" --owner-id "$WK_REPOSITORY_OWNER_ID" --actor "$GITHUB_ACTOR"
 
       - name: Audit exact staged ID and promote only after both native gates
         shell: bash

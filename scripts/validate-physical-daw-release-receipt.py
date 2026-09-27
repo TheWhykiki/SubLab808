@@ -133,6 +133,7 @@ def validate(
     environment: Any,
     reviews: Any,
     workflow_run: Any,
+    repository_metadata: Any,
     branch: Any,
     candidate_compare: Any,
     workflow_compare: Any,
@@ -179,8 +180,8 @@ def validate(
     if len(reviewer_rules) != 1:
         _error("Environment must have exactly one required-reviewers rule")
     reviewer_rule = reviewer_rules[0]
-    if reviewer_rule.get("prevent_self_review") is not True:
-        _error("Environment must prevent self-review")
+    if reviewer_rule.get("prevent_self_review") is not False:
+        _error("Owner-only acceptance requires self-review prevention explicitly disabled")
     deployment_branch_policy = _require_object(
         environment.get("deployment_branch_policy"),
         "Environment deployment-branch policy",
@@ -191,8 +192,8 @@ def validate(
     ):
         _error("Environment must allow only protected branches")
     configured_reviewers = reviewer_rule.get("reviewers")
-    if not isinstance(configured_reviewers, list) or not configured_reviewers:
-        _error("Environment has no configured required reviewer")
+    if not isinstance(configured_reviewers, list) or len(configured_reviewers) != 1:
+        _error("Environment must configure exactly one individual repository-owner reviewer")
     allowed_reviewers: set[tuple[int, str]] = set()
     for configured in configured_reviewers:
         configured = _require_object(configured, "Configured environment reviewer")
@@ -205,7 +206,8 @@ def validate(
             configured_user.get("id"), "configured reviewer id"
         )
         configured_login = configured_user.get("login")
-        if not isinstance(configured_login, str) or not LOGIN.fullmatch(configured_login):
+        if (configured_user.get("type") != "User" or not isinstance(configured_login, str)
+                or not LOGIN.fullmatch(configured_login)):
             _error("Configured environment reviewer login is malformed")
         allowed_reviewers.add((configured_id, configured_login.casefold()))
 
@@ -213,18 +215,46 @@ def validate(
     run_repository = _require_object(
         workflow_run.get("repository"), "Workflow-run repository"
     )
-    default_branch = run_repository.get("default_branch")
+    # Actions embeds only a minimal repository object; default_branch belongs
+    # to the separate GET /repos/{owner}/{repo} response.
+    repository_metadata = _require_object(repository_metadata, "Repository response")
+    run_repository_id = _require_positive_int(run_repository.get("id"), "workflow repository id")
+    repository_id = _require_positive_int(repository_metadata.get("id"), "repository id")
+    default_branch = repository_metadata.get("default_branch")
     if (
         workflow_run.get("id") != run_id
         or workflow_run.get("run_attempt") != run_attempt
         or workflow_run.get("event") != "workflow_dispatch"
         or workflow_run.get("head_sha") != workflow_sha
         or run_repository.get("full_name") != repository
+        or repository_metadata.get("full_name") != repository
+        or run_repository_id != repository_id
         or not isinstance(default_branch, str)
-        or not default_branch
+        or not 1 <= len(default_branch) <= 255
+        or any(ord(character) <= 32 or ord(character) == 127 for character in default_branch)
         or workflow_run.get("head_branch") != default_branch
     ):
         _error("Workflow-run identity does not match the current attempt")
+    # Resolve current ownership from trusted repository metadata, cross-bound
+    # to the run's embedded repository. Never trust the receipt/reviewer list.
+    owner = _require_object(repository_metadata.get("owner"), "Repository owner")
+    owner_id = _require_positive_int(owner.get("id"), "repository owner id")
+    owner_login = owner.get("login")
+    if (owner.get("type") != "User" or not isinstance(owner_login, str)
+            or not LOGIN.fullmatch(owner_login)
+            or not isinstance(repository, str) or repository.count("/") != 1
+            or repository.split("/", 1)[0].casefold() != owner_login.casefold()):
+        _error("Repository owner identity does not match the individual repository owner")
+    owner_identity = (owner_id, owner_login.casefold())
+    run_owner = _require_object(run_repository.get("owner"), "Workflow-run repository owner")
+    run_owner_id = _require_positive_int(run_owner.get("id"), "workflow repository owner id")
+    run_owner_login = run_owner.get("login")
+    if (run_owner.get("type") != "User" or not isinstance(run_owner_login, str)
+            or not LOGIN.fullmatch(run_owner_login)
+            or (run_owner_id, run_owner_login.casefold()) != owner_identity):
+        _error("Workflow-run repository owner differs from current repository metadata")
+    if allowed_reviewers != {owner_identity}:
+        _error("Configured physical reviewer must be the repository owner by ID and login")
 
     branch = _require_object(branch, "Default-branch response")
     branch_commit = _require_object(branch.get("commit"), "Default-branch commit")
@@ -263,6 +293,11 @@ def validate(
         or not LOGIN.fullmatch(triggering_actor)
     ):
         _error("Workflow-run actor identities are malformed")
+    for identity_id, identity_login in ((actor_id, actor), (triggering_actor_id, triggering_actor)):
+        if (identity_id == owner_id) != (identity_login.casefold() == owner_login.casefold()):
+            _error("Workflow-run actor partially impersonates the repository owner")
+    if (actor_id == triggering_actor_id) != (actor.casefold() == triggering_actor.casefold()):
+        _error("Workflow-run actor ID/login bindings are inconsistent")
 
     if not isinstance(reviews, list) or not reviews or len(reviews) > 100:
         _error("Workflow run deployment review history is missing or oversized")
@@ -302,15 +337,11 @@ def validate(
     review_user = _require_object(review.get("user"), "Deployment review user")
     reviewer_id = _require_positive_int(review_user.get("id"), "deployment reviewer id")
     reviewer = review_user.get("login")
-    if not isinstance(reviewer, str) or not LOGIN.fullmatch(reviewer):
+    if (review_user.get("type") != "User" or not isinstance(reviewer, str)
+            or not LOGIN.fullmatch(reviewer)):
         _error("Deployment reviewer identity is malformed")
-    if (reviewer_id, reviewer.casefold()) not in allowed_reviewers:
-        _error("Deployment reviewer is not an explicitly configured user reviewer")
-    if reviewer_id in {actor_id, triggering_actor_id} or reviewer.casefold() in {
-        actor.casefold(),
-        triggering_actor.casefold(),
-    }:
-        _error("Workflow initiator or re-run initiator cannot attest acceptance")
+    if (reviewer_id, reviewer.casefold()) != owner_identity:
+        _error("Deployment reviewer must be the explicitly configured repository owner")
     comment = review.get("comment")
     if not isinstance(comment, str) or not comment or len(comment.encode("utf-8")) > 24576:
         _error("Deployment review comment is missing or too large")
@@ -558,6 +589,7 @@ def main() -> int:
     parser.add_argument("--environment-json", type=pathlib.Path, required=True)
     parser.add_argument("--reviews-json", type=pathlib.Path, required=True)
     parser.add_argument("--workflow-run-json", type=pathlib.Path, required=True)
+    parser.add_argument("--repository-json", type=pathlib.Path, required=True)
     parser.add_argument("--branch-json", type=pathlib.Path, required=True)
     parser.add_argument("--candidate-compare-json", type=pathlib.Path, required=True)
     parser.add_argument("--workflow-compare-json", type=pathlib.Path, required=True)
@@ -580,6 +612,7 @@ def main() -> int:
             environment=load_json(args.environment_json, "environment response"),
             reviews=load_json(args.reviews_json, "review history"),
             workflow_run=load_json(args.workflow_run_json, "workflow-run response"),
+            repository_metadata=load_json(args.repository_json, "repository response"),
             branch=load_json(args.branch_json, "default-branch response"),
             candidate_compare=load_json(
                 args.candidate_compare_json, "candidate ancestry response"

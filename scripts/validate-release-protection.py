@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (c) 2026 Whykiki Audio
-"""Fail closed before signing/public staging if GitHub protection is weakened.
+"""Fail closed unless GitHub protection enforces the owner-only release policy.
 
 Consumes unmodified GET /branches/{branch}/protection and
 GET /environments/{name} REST responses (Administration:read token).
@@ -52,9 +52,14 @@ def validate_branch(value):
     if object_value(value.get("enforce_admins"), "Admin enforcement").get("enabled") is not True:
         raise ValueError("Branch protection must enforce restrictions for administrators")
     reviews = object_value(value.get("required_pull_request_reviews"), "Required PR reviews")
-    count = positive(reviews.get("required_approving_review_count"), "Required review count")
-    if count > 6 or reviews.get("dismiss_stale_reviews") is not True:
-        raise ValueError("At least one current PR review with stale-review dismissal is required")
+    # The owner cannot approve their own PR. Keep the PR/check requirements,
+    # but do not require an independent review or last-pusher approval.
+    count = reviews.get("required_approving_review_count")
+    if type(count) is not int or count != 0 or reviews.get("dismiss_stale_reviews") is not True \
+            or reviews.get("require_last_push_approval") is not False \
+            or reviews.get("require_code_owner_reviews") is not False:
+        raise ValueError("Owner-only PR policy requires zero approving reviews, stale-review dismissal, "
+                         "and no last-push or code-owner approval requirement")
     bypass = reviews.get("bypass_pull_request_allowances")
     if bypass is not None:
         bypass = object_value(bypass, "PR bypass allowances")
@@ -85,7 +90,9 @@ def validate_branch(value):
     return sorted(set(names))
 
 
-def validate_environment(value, name, forbidden):
+def validate_environment(value, name, owner, owner_id):
+    owner = login(owner, "Repository owner")
+    owner_id = positive(owner_id, "Repository owner id")
     value = object_value(value, name)
     positive(value.get("id"), name + " id")
     if value.get("name") != name or value.get("can_admins_bypass") is not False:
@@ -101,30 +108,28 @@ def validate_environment(value, name, forbidden):
         rule = object_value(rule, name + " protection rule")
         if rule.get("type") == "required_reviewers":
             reviewer_rules.append(rule)
-    if len(reviewer_rules) != 1 or reviewer_rules[0].get("prevent_self_review") is not True:
-        raise ValueError(f"{name} must require reviewers and prevent self-review")
+    if len(reviewer_rules) != 1 or reviewer_rules[0].get("prevent_self_review") is not False:
+        raise ValueError(f"{name} must require owner approval and explicitly allow self-review")
     reviewers = reviewer_rules[0].get("reviewers")
-    if not isinstance(reviewers, list) or not 1 <= len(reviewers) <= 6:
-        raise ValueError(f"{name} must name 1-6 independent individual reviewers")
-    ids, logins = set(), set()
-    for entry in reviewers:
-        entry = object_value(entry, name + " reviewer entry")
-        reviewer = object_value(entry.get("reviewer"), name + " reviewer")
-        reviewer_id = positive(reviewer.get("id"), name + " reviewer id")
-        reviewer_login = login(reviewer.get("login"), name + " reviewer login")
-        if entry.get("type") != "User" or reviewer.get("type", "User") != "User" \
-                or reviewer_login in forbidden or reviewer_id in ids or reviewer_login in logins:
-            raise ValueError(f"{name} reviewers must be distinct individuals independent of owner and actor")
-        ids.add(reviewer_id)
-        logins.add(reviewer_login)
-    return sorted(logins)
+    if not isinstance(reviewers, list) or len(reviewers) != 1:
+        raise ValueError(f"{name} must name exactly one reviewer: the repository owner")
+    entry = object_value(reviewers[0], name + " reviewer entry")
+    reviewer = object_value(entry.get("reviewer"), name + " reviewer")
+    reviewer_id = positive(reviewer.get("id"), name + " reviewer id")
+    reviewer_login = login(reviewer.get("login"), name + " reviewer login")
+    if entry.get("type") != "User" or reviewer.get("type") != "User" \
+            or reviewer_login != owner or reviewer_id != owner_id:
+        raise ValueError(f"{name} reviewer must match the repository owner's individual login and immutable id")
+    return [reviewer_login]
 
 
-def validate(branch_protection, signing_environment, physical_environment, owner, actor):
-    forbidden = {login(owner, "Repository owner"), login(actor, "Workflow actor")}
+def validate(branch_protection, signing_environment, physical_environment, owner, actor, owner_id):
+    owner = login(owner, "Repository owner")
+    owner_id = positive(owner_id, "Repository owner id")
+    login(actor, "Workflow actor")  # The owner may also trigger or rerun the workflow.
     return {"requiredChecks": validate_branch(branch_protection),
-            "release-signing": validate_environment(signing_environment, "release-signing", forbidden),
-            "physical-daw-release": validate_environment(physical_environment, "physical-daw-release", forbidden)}
+            "release-signing": validate_environment(signing_environment, "release-signing", owner, owner_id),
+            "physical-daw-release": validate_environment(physical_environment, "physical-daw-release", owner, owner_id)}
 
 
 def main():
@@ -132,14 +137,16 @@ def main():
     for name in ("branch-protection", "signing-environment", "physical-environment"):
         parser.add_argument("--" + name + "-json", type=Path, required=True)
     parser.add_argument("--owner", required=True)
+    parser.add_argument("--owner-id", type=int, required=True,
+                        help="Immutable owner ID from trusted github.repository_owner_id")
     parser.add_argument("--actor", required=True)
     args = parser.parse_args()
     try:
         validate(load_json(args.branch_protection_json), load_json(args.signing_environment_json),
-                 load_json(args.physical_environment_json), args.owner, args.actor)
+                 load_json(args.physical_environment_json), args.owner, args.actor, args.owner_id)
     except (OSError, ValueError, UnicodeError) as error:
         parser.exit(1, f"Release protection rejected: {error}\n")
-    print("Protected branch and independent signing/physical approval policies verified")
+    print("Protected branch and owner-only signing/physical approval policies verified")
 
 
 if __name__ == "__main__":

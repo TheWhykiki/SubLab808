@@ -55,11 +55,18 @@ tester, DAW and OS version, loaded binary path and SHA-256. The four `artifacts`
 digests come from GitHub; `loadedVst3Sha256` comes from the loaded binary and must
 equal the payload hash in the matching immutable evidence file.
 
-An independent required reviewer submits the complete JSON alone as the
-`physical-daw-release` approval comment. The environment must prevent self-review,
-forbid administrator bypass and allow only protected branches. Signing approvals
+Under the owner-approved sole-owner policy, `TheWhykiki` submits the complete
+JSON alone as the `physical-daw-release` approval comment. The environment
+requires exactly the repository owner by immutable user ID and login, with
+`prevent_self_review=false`, no administrator bypass and protected branches only.
+The owner may also be the workflow or rerun initiator. This is owner attestation,
+not independent QA; it does not reduce or waive any physical test. Signing approvals
 for `release-signing` can coexist in the run; exactly one review must approve only
 the physical environment. Mixed or duplicate physical approvals are rejected.
+
+The separate candidate-specific Stable/Latest owner approval in
+[`docs/PRODUCTION_RELEASE.md`](../../docs/PRODUCTION_RELEASE.md) is also mandatory;
+an environment approval alone is not publication permission.
 
 Retain projects, exports, preset lists, host screenshots and test notes with the
 receipt. This is authenticated human attestation, not a machine proof of DAW use.
