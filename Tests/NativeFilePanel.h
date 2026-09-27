@@ -1,0 +1,95 @@
+#pragma once
+#include <cstddef>
+#include <memory>
+#include <string>
+
+// Test-only observer for panels owned by this process. The opaque identity is
+// re-resolved through NSApp's live windows; no panel is retained or dereferenced
+// after removal, and no other app is inspected.
+class NativeFilePanel final
+{
+public:
+    enum class ApplicationStopResult
+    {
+        failed,
+        jucePeriodicWakeAcquired
+    };
+    enum class ApplicationMenuTrackingCancellationResult
+    {
+        notNeeded,
+        waitingForSafeRequest,
+        requestPosted,
+        failed
+    };
+    // A successful callback must both submit JUCE's NSApplication stop request
+    // and acquire the periodic wake which JUCE's macOS implementation creates.
+    using ApplicationStopCallback = ApplicationStopResult (*)() noexcept;
+    using ApplicationFetchBoundCallback = bool (*)(void*) noexcept;
+    // Must run before ScopedJuceInitialiser_GUI creates NSApplication.
+    static void installTestApplication();
+    static void prepareTestApplication(ApplicationStopCallback,
+                                       ApplicationFetchBoundCallback,
+                                       void* applicationFetchBoundContext);
+    [[nodiscard]] static bool applicationIsRunning() noexcept;
+    // Test-app only: a public NSMenu begin notification must first identify the
+    // exact application main menu. A generation-bound one-shot is then queued
+    // in tracking mode; the caller waits for the matching end notification and
+    // a later outer fetch instead of cancelling re-entrantly from its timer.
+    [[nodiscard]] static ApplicationMenuTrackingCancellationResult
+        requestApplicationMenuTrackingCancellationIfNeeded() noexcept;
+    [[nodiscard]] static bool applicationMenuTrackingCancellationIsInProgress() noexcept;
+    static void disableApplicationMenuTrackingCancellation() noexcept;
+    // A destructive test-harness transition may proceed only outside nested
+    // AppKit fetches and after all observed main-menu tracking has ended.
+    [[nodiscard]] static bool applicationIsAtSafeLifetimeBoundary() noexcept;
+    // Private START/BARRIER/SETTLE/STOP events prove distinct dispatches through
+    // the real NSApplication event loop. An eligible depth-one fetch is returned
+    // with BARRIER. Other active fetch stacks may receive bounded, mode-matched,
+    // test-owned periodic pulses, or passively observe an already-owned stream,
+    // tied to invocation returns. A successful owned slot probe is then required
+    // before an eligible depth-one fetch claims BARRIER. Only that exact return
+    // path queues SETTLE.
+    // The test never pumps or sends an event.
+    [[nodiscard]] static bool postApplicationStartEvent() noexcept;
+    [[nodiscard]] static bool applicationStartEventWasHandled() noexcept;
+    [[nodiscard]] static bool applicationIsReadyForSettleEvent() noexcept;
+    [[nodiscard]] static bool postApplicationSettleEvent() noexcept;
+    [[nodiscard]] static bool postBoundApplicationFetchBarrierEvent() noexcept;
+    [[nodiscard]] static bool requestApplicationEventFetchReturn() noexcept;
+    [[nodiscard]] static bool driveApplicationEventFetchReturnRequest() noexcept;
+    static void logApplicationSettleReadiness() noexcept;
+    [[nodiscard]] static bool applicationSettleEventWasHandled() noexcept;
+    [[nodiscard]] static bool applicationIsReadyForStopEvent() noexcept;
+    [[nodiscard]] static bool postApplicationStopEvent() noexcept;
+    [[nodiscard]] static bool applicationStopEventWasPosted() noexcept;
+    [[nodiscard]] static bool applicationStopEventWasHandled() noexcept;
+    static void finishTestApplication() noexcept;
+    // A captured, test-owned JUCE desktop peer must not leave an AppKit
+    // display-link animation running after the console test exits.
+    static void disableAutomaticWindowAnimations(void* nativeView);
+    static std::unique_ptr<NativeFilePanel> findVisible(bool importing, const char* title);
+    static int visibleCount();
+    ~NativeFilePanel();
+    NativeFilePanel(const NativeFilePanel&) = delete;
+    NativeFilePanel& operator=(const NativeFilePanel&) = delete;
+    bool isAlive() const;
+    bool isVisible() const;
+    bool hasDelegate() const;
+    bool beganExactlyOnce() const;
+    bool moduleWasRetainedAtBegin() const;
+    bool completionHasNotStarted() const;
+    bool completionProgressIsValid() const;
+    bool completionIsQuiescent() const;
+    // Call only after JUCE destroyed its native-modal component and AppKit
+    // removed the closed panel/delegate. Idempotent for cleanup/fence checks.
+    bool markSafeOwnerRetired();
+    std::size_t lateCompletionEntryCount() const;
+    static std::size_t totalLateCompletionEntryCount();
+    static bool hasActiveCompletionSession();
+    std::string className() const;
+    void useFixtureLocation(const std::string& directory, const std::string& filename);
+private:
+    NativeFilePanel(void*, void*);
+    void* panel = nullptr;
+    void* observation = nullptr;
+};

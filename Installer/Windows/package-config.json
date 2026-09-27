@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "productName": "SubLab808",
+  "manufacturer": "Whykiki Audio",
+  "vst3Classes": [
+    {
+      "cid": "ABCDEF019182FAEB576B696B536C3038",
+      "category": "Audio Module Class"
+    },
+    {
+      "cid": "ABCDEF011234ABCD576B696B536C3038",
+      "category": "Component Controller Class"
+    }
+  ],
+  "upgradeCodes": {
+    "x64": "DB0CABBA-9411-5738-8A43-98D900748C58",
+    "arm64ec": "8494E96B-8735-5AB6-8E20-D1BF667DADD9"
+  }
+}

@@ -1,4 +1,6 @@
 #pragma once
+#include "PresetBar.h"
+#include "LicensePanel.h"
 #include <JuceHeader.h>
 #include "PluginProcessor.h"
 
@@ -29,8 +31,10 @@ private:
     SubLabLookAndFeel look;
     Dial decay, release, punch, pitchDecay, glide, tune, body, click, drive, tone, velocity, output;
     std::array<Dial*, 12> dials;
-    juce::ComboBox presetBox;
-    juce::Label presetLabel;
+    wk::PresetBar presetBar;
+    juce::TextButton updates;
+    juce::TextButton about { "About" };
+    wk::LicensePanel licensePanel;
     juce::ToggleButton oneShotButton { "ONE SHOT" };
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> oneShotAttachment;
     float meter = 0.0f;

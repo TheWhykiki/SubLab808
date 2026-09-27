@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Product identity is data; packaging and updater policy are shared between products.
+file(READ "${CMAKE_CURRENT_LIST_DIR}/../release/product.json" WK_PRODUCT_CONFIG)
+string(JSON WK_RELEASE_CONTRACT_VERSION GET "${WK_PRODUCT_CONFIG}" release-contract-version)
+if(NOT WK_RELEASE_CONTRACT_VERSION EQUAL 2)
+    message(FATAL_ERROR "Unsupported release-contract-version")
+endif()
+foreach(field productName manufacturer bundleId version pluginManufacturerCode pluginCode)
+    string(JSON WK_CONFIG_${field} GET "${WK_PRODUCT_CONFIG}" ${field})
+endforeach()
+set(WK_PRODUCT_NAME "${WK_CONFIG_productName}")
+set(WK_PRODUCT_VERSION "${WK_CONFIG_version}")
+set(WK_PRODUCT_MANUFACTURER "${WK_CONFIG_manufacturer}")
+set(WK_PRODUCT_BUNDLE_ID "${WK_CONFIG_bundleId}")
+set(WK_PLUGIN_MANUFACTURER_CODE "${WK_CONFIG_pluginManufacturerCode}")
+set(WK_PLUGIN_CODE "${WK_CONFIG_pluginCode}")
+string(JSON WK_JUCE_COMMIT GET "${WK_PRODUCT_CONFIG}" juce commit)
+function(wk_validate_source_juce root)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    execute_process(COMMAND "${Python3_EXECUTABLE}" -B "${root}/scripts/source-release.py"
+        verify-tree --root "${root}" --juce-only
+        RESULT_VARIABLE source_result OUTPUT_VARIABLE source_output ERROR_VARIABLE source_error)
+    if(NOT source_result EQUAL 0)
+        message(FATAL_ERROR "Source archive JUCE verification failed: ${source_output}${source_error}")
+    endif()
+endfunction()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/../release/product.json")

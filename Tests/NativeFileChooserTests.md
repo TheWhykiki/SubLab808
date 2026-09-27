@@ -1,0 +1,253 @@
+# Native file-chooser lifecycle regression tests
+
+The macOS PresetTests target opens the product's real Import and Export menus,
+then verifies native NSOpenPanel/NSSavePanel lifetime for editor ancestor-hide,
+detach, destruction, and hide-then-immediate-destruction (eight cases per product). It does not replace the chooser
+with a fake or call an artificial successful import/export callback.
+
+Each case requires a visible, correctly typed native panel and a live JUCE modal
+before the owner transition. The interception also proves that the product retained
+its module before AppKit copied the completion block. Afterwards the native panel must be hidden, its JUCE
+delegate cleared, removed from `NSApp.windows`, and the JUCE modal destroyed. The
+test-only observer marks safe owner retirement only after all four conditions hold.
+At that boundary the callback must either have entered and returned exactly once,
+or remain entirely unentered. AppKit does not promise to release a modeless
+completion block immediately after a programmatic close, so block release is
+recorded only as a diagnostic. A process-wide counter records any completion that
+enters after owner retirement; such an entry is legal only if it returns exactly
+once without changing product state or files. The next same-process case and wrap-around
+sentinel additionally detect leaked observer state. Exact processor state, preset selection,
+and every file/directory in the temporary fixture must remain unchanged.
+The reopened editor must accept a real Save As/Cancel interaction and parameter
+button clicks.
+
+On macOS, JUCE destroys a native `FileChooser` by leaving its modal state,
+removing its peer, and closing the AppKit panel. On hide or detach, PresetBar
+therefore invalidates the callback and removes the chooser from its active slot
+synchronously, but defers native destruction to its next message-thread timer
+event. This avoids re-entering the `ComponentMovementWatcher` notification that
+caused cancellation without posting a second owner-specific callback object.
+The deferred chooser remains owned by PresetBar. On destruction, its existing
+timer is stopped and member ordering unregisters the watcher before active or
+deferred choosers are destroyed. Before the editor is reopened, the harness
+returns repeatedly to the real top-level app loop and proves panel, delegate and
+modal teardown. JUCE's modeless handler captures a `SafePointer` to that native
+component, so a later AppKit invocation cannot reach the destroyed chooser. The
+harness nevertheless records any such late entry while the process continues.
+Before launching a native chooser, the product resolves its own Mach-O image and
+acquires one ref-counted `RTLD_NOLOAD` handle that is intentionally kept until
+process exit. If that fails, Import/Export stops without registering another
+asynchronous UI callback. This keeps the block's code mapped even if a host drops
+its VST3 handle. A separate unloadable-module test proves this behavior with an
+unpinned negative control. The panel harness does not claim that every queued
+AppKit event has been drained; exact-host acceptance still covers host behavior.
+
+The bridge observes only the test process's own NSApp windows. It installs a
+test-process-only observer around `NSSavePanel.beginWithCompletionHandler`, calls
+the original implementation and JUCE handler exactly as supplied, and records
+module retention at entry, normal return, final wrapper-block release, safe owner retirement, and any
+late entry without closing or confirming the panel itself. A callback-local retain
+keeps the observer valid if the JUCE handler synchronously releases AppKit's last
+block owner. It stores
+the panel's opaque identity and re-resolves it through the live window list on every
+inspection; it deliberately does not retain the panel because JUCE's close-release
+is part of the lifecycle under test. The fixture redirects the panel to an isolated
+temporary directory containing an input preset and an initially nonexistent export
+destination; it never confirms a file operation. No DAW, installed bundle, or user
+preset library is modified.
+
+The console target installs a test-only `NSApplication` subclass before
+`ScopedJuceInitialiser_GUI` can create AppKit's process singleton, then runs one
+genuine top-level `MessageManager`/`NSApplication` loop for the complete native
+suite. While the native harness is active, its public
+`nextEventMatchingMask:untilDate:inMode:dequeue:` override leaves the supplied mask,
+deadline, mode and dequeue flag unchanged. It records only marked control-event
+dequeues and the targeted fetch returning after the shutdown request.
+
+Before entering that loop the harness posts a private ApplicationDefined START
+`NSEvent`; the timer-driven
+state machine remains dormant until a local AppKit monitor sees that event in the real
+`NSApplication.sendEvent:` path while the application is running. The subclass also
+records that the same marked event came from a default-mode dequeue. This proves that
+launch has yielded to top-level event dispatch. It then
+performs at most one bounded action per callback and returns after every asynchronous boundary:
+activation, menu dismissal, panel presentation, owner transition, panel retirement,
+editor reopen and control probe.
+It never calls `CFRunLoopRunInMode`, directly invokes `sendEvent:`, or enters a nested
+JUCE dispatch loop. Because `NSApplication.stop` called from a timer does not stop the
+main loop, the final clean case boundary first enters its shutdown phase and arms an
+independent five-second watchdog. AppKit can create a nested menu-bar tracking session
+while its remote view makes the synthetic host window key; a queued event cannot end
+that session. Public begin/end notifications identify the exact application main-menu
+root and establish a session ledger. After START, a generation- and session-bound
+one-shot runs separately in `NSEventTrackingRunLoopMode`; immediately before calling
+the public `NSMenu.cancelTrackingWithoutAnimation` API it re-proves the exact retained
+menu, a nested instrumented fetch, its bound tracking mode, balanced periodic ownership,
+and the absence of any shutdown control request. A skipped proof may retry, but one run
+allows at most 32 sessions, 32 request blocks and 32 actual calls, with never more than
+one cancellation in the same session. Every observed session has one
+independent three-second atomic-ticket watchdog, covering a block that never runs, a
+call that never returns, a missing end notification, and failure to reach a later outer
+fetch boundary. Reentrant timer turns may only queue this one-shot and never advance or
+destroy coordinator state. After the matching end notification, a later outer fetch
+must be observed before any lifetime transition. Once BARRIER is requested, that return
+protocol has priority and menu cancellation is forbidden. Readiness otherwise requires
+either no active event fetch or a valid outermost depth-one fetch, followed by three
+consecutive timer turns while `NSApplication` is running without an AppKit modal window.
+A blocked cancellation, a tracking stack that does not unwind, or a later event-loop
+return failure stays fail-closed. This
+test-process-only cleanup is never linked into a plugin target and cannot cancel a
+Cubase or Reaper host menu. JUCE may deliver those timer messages
+from any common run-loop mode, so posting does not depend on AppKit's transient
+`currentMode`; all four marked control events remain the supported
+ApplicationDefined type. Their private subtype, per-run random nonce and event code
+survive any AppKit event copy and are validated before the local monitor consumes one; each
+must be dequeued exactly once through the public AppKit fetch. On that final ready turn
+the coordinator creates one shutdown request
+before SETTLE exists. The bounded 10 ms source remains active only until BARRIER is
+successfully queued.
+
+If the current AppKit fetch is an eligible outermost depth-one fetch, the harness
+binds and posts one private prioritized BARRIER event directly. AppKit may instead
+be blocked in another nested fetch, or in an outer fetch which deliberately
+excludes ApplicationDefined events. When that exact supplied mask accepts
+`NSEventTypePeriodic`, dequeue is enabled, and its supplied mode equals the current
+main-run-loop mode, the harness starts one short, fetch-bound public AppKit periodic
+stream after one positive-period delay, leaving already-ready AppKit work ahead of
+the wake. Ownership is recorded before the start call. A successful start is stopped
+immediately when its target fetch returns for any reason or when the first deeper
+fetch returns a Periodic event. Either return records a monotonic earliest retry
+100 ms later, so an already-ready event cannot immediately reacquire the
+thread-global slot. An already-eligible depth-one fetch can bind BARRIER immediately
+because it needs no new periodic ownership. If AppKit reports that the thread already
+has a periodic stream, the harness observes the same physical return boundary
+passively and
+never calls `stopPeriodicEvents` for that foreign stream. BARRIER remains forbidden
+until a later main-thread turn synchronously acquires and immediately stops its own
+zero-delay, zero-delivery probe without a run-loop yield, proving that the
+thread-global Periodic slot is free. This zero-yield slot probe does not wait for the
+real-pulse retry deadline. A failed probe returns to passive observation. A later
+10 ms turn can bind a fresh observation to the restored current invocation;
+same-depth reentry is legal and receives a new invocation token.
+
+Neither an owned nor a foreign Periodic event is the shutdown oracle. The request
+ledger requires `initial depth + entries == returns + current depth`, counts
+same-depth reentries, bounds both fetch transitions and pulse attempts, and permits
+at most 32 consecutive wake attempts without reaching a smaller fetch depth. Together
+with the five-second watchdog this fails closed if AppKit never exposes an eligible
+outer fetch or releases a foreign Periodic slot. Before BARRIER is posted, every owned
+test pulse must be stopped, no slot proof may remain pending, and the start/stop
+ownership counters must balance. The first eligible depth-one fetch then
+claims the pending request and posts BARRIER before entering AppKit. That exact public
+fetch must dequeue and return BARRIER once; only its return path may post SETTLE.
+
+Immediately after BARRIER is queued, a test callback synchronously stops the recurring
+timer before the bound fetch enters AppKit, preventing coordinator messages from
+entering the BARRIER/SETTLE/STOP sequence. Invocation IDs prove the
+BARRIER/SETTLE/STOP separation. Each event records its dequeue and handler depth; the
+handler depth must be lower, proving that the exact fetch returned before AppKit
+dispatched it. Apart from waking the separately queued menu-session one-shot, the
+shutdown-return protocol never changes `NSApplication`'s running flag, rewrites a
+fetch deadline or mask, retrieves an event, calls `CFRunLoopWakeUp`, or dispatches an
+event itself. The local monitor must observe both BARRIER and SETTLE while the
+application is running without a modal window. Only then does the SETTLE handler post
+prioritized STOP and return.
+
+Because there is no manual event pump, STOP can be retrieved only by a still later
+AppKit fetch and dispatched by a distinct `sendEvent:` call. Invocation IDs and its
+monitor validate the dequeue and application context, then invoke JUCE's stop request
+exactly once from that real event-handler boundary. START, BARRIER, SETTLE and STOP
+must each be handled exactly once. Immediately before JUCE is called, a final owned
+start/stop probe rechecks the thread-global Periodic slot with no run-loop yield in
+between; a start exception leaves the foreign stream untouched and fails closed.
+An atomic return acknowledgement lets the
+independent GCD watchdog require SETTLE delivery, STOP delivery and `[NSApp run]`
+return within five seconds. The callback's typed success result explicitly transfers
+ownership of the periodic wake created by JUCE's macOS stop implementation; the
+harness retires that framework-owned stream exactly once after the loop returns. The
+coordinator
+destructor retains an idempotent timer stop. Final state/files/global-modal audits
+run immediately before the timer is retired and again after run-loop return, before the
+monitor is removed exactly once. It does not assume
+that AppKit invokes, discards, or releases a modeless panel completion after a programmatic
+close. Instead it marks the verified JUCE/AppKit owner-retirement boundary atomically
+and keeps the late-entry sentinel active across subsequent editor interaction and
+chooser sessions.
+Completed processors and their final state/file snapshots are retained and audited
+on every later coordinator turn, so a late callback cannot hide in the final fence.
+Before their first order-in, both the synthetic `Preset UI Tests` host window and the
+intercepted genuine file panel disable AppKit's automatic window-transform animations.
+The containing JUCE peer windows resolved from the captured test-owned management menu,
+native-modal wrapper and reopened Save As dialog do the same before harness-induced
+teardown. Those visuals are outside the lifetime contract and can otherwise leave a
+private display-link worker running after every observable panel/session state is gone
+in this short-lived process; the real panel class, delegate and completion path are
+unchanged.
+A callback itself can still block inside
+AppKit, so CTest remains the hard process watchdog. The lifetime guard is product
+code; the AppKit interception remains test-only and relaxes none of the assertions.
+
+## Running
+
+Build the product's PresetTests target, then set
+`WHYKIKI_PRESET_TEST_NATIVE_ONLY=1` when launching its executable. For example:
+
+```sh
+cmake --build build-review --target SubLab808PresetTests -j 2
+env WHYKIKI_PRESET_TEST_NATIVE_ONLY=1 \
+  ./build-review/SubLab808PresetTests_artefacts/Release/SubLab808PresetTests
+```
+
+For ReverseLab, use the equivalent `ReverseLabPresetTests` target/executable and
+its configured build directory. CTest registers all eight cases separately for
+precise diagnostics and also runs all eight sequentially in one process. That
+run then repeats the first import/ancestor-hide case as a wrap-around sentinel,
+proving that the final export/hide-then-destroy transition cannot poison the
+next native session. The sequential test is required: it detects stale AppKit
+modal state that process isolation would hide. Native UI is kept out of the
+normal unfiltered PresetTests invocation; the existing reentrancy-only and
+lifecycle-only modes remain unchanged.
+
+The normal, non-sanitized macOS CTest matrices also run `MacModulePinPinned` and
+`MacModulePinUnpinned` in separate
+processes against a deliberately unloadable module. Sixteen threads race the
+first pin and must observe one cached status; after the simulated host handle is
+closed, pinned code remains callable while the unpinned control is absent. These
+two controls are omitted under sanitizers because an instrumented DSO may be made
+non-unloadable by the sanitizer runtime, which would invalidate the oracle.
+
+START has a five-second dispatch deadline. After START, the coordinator has an absolute
+32-second isolated / 435-second sequential functional deadline. Every observed menu
+session has a three-second watchdog, and failure cleanup arms the same
+idempotent five-second return watchdog used by normal shutdown before touching UI state.
+Even the maximum bounded cleanup
+stays below CTest's 60-second / 480-second process watchdog with reserve. CTest remains the
+fallback for a callback that blocks before shutdown begins.
+
+To reproduce one isolated case manually, also set
+`WHYKIKI_PRESET_TEST_NATIVE_CASE` to an operation (`import` or `export`) plus
+one of `ancestor-hide`, `detach`, `destroy`, or `hide-then-destroy`. The last
+case intentionally performs no message-loop turn between hiding the owner and
+destroying it, exercising member teardown before the queued timer can run.
+
+An active macOS desktop session is required. Run native UI suites serially.
+The console test's bridge completes NSApplication launch and activates only its
+own process; missing activation, display, or native-panel availability is a setup
+failure, not evidence of a plugin defect. A requested native-only run on another
+platform fails explicitly instead of accepting a non-native fallback.
+
+The project already enables Objective-C++ for its updater. Sanitizer builds must
+therefore pass matching `CMAKE_OBJCXX_FLAGS`; `CMAKE_CXX_FLAGS` alone does not
+instrument this `.mm` bridge or the MRC/block lifetime that it observes.
+
+## Limits
+
+These cases test JUCE owner hide/detach/destruction with genuine native panels.
+They deliberately exclude AppKit's default window-transform animation timing;
+the animations are visual behavior, not part of the asserted ownership contract.
+They do **not** establish behavior when a particular DAW only hides an NSWindow
+without changing the JUCE owner hierarchy. Cubase/REAPER acceptance on the exact
+delivered bundle remains a separate requirement. They also do not exercise actual
+file selection/confirmation or an externally queued native successful callback.
+They do not replace unload and UI acceptance of the signed VST3 in every supported
+Cubase/REAPER version.

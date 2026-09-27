@@ -1,14 +1,15 @@
 #pragma once
+#include "PresetLibrary.h"
 #include <JuceHeader.h>
-#include <condition_variable>
 #include <deque>
 #include <mutex>
 
 class SubLab808Processor final : public juce::AudioProcessor,
-                                 private juce::AudioProcessorValueTreeState::Listener
+                                 private juce::AudioProcessorValueTreeState::Listener,
+                                 private juce::AsyncUpdater
 {
 public:
-    SubLab808Processor();
+    explicit SubLab808Processor(juce::File presetStorage = {});
     ~SubLab808Processor() override;
     void prepareToPlay(double, int) override;
     void releaseResources() override {}
@@ -31,10 +32,18 @@ public:
     void setStateInformation(const void*, int) override;
 
     juce::AudioProcessorValueTreeState parameters;
+    wk::PresetLibrary presets;
     std::atomic<float> outputMeter { 0.0f };
     juce::Point<int> getEditorSize() const noexcept;
     void setEditorSize(int width, int height) noexcept;
     bool isPresetModified() const { return presetModified.load(); }
+#if JUCE_STANDALONE_APPLICATION
+    // Console-test access to the same public JUCE continuation mechanism. This is
+    // not part of the VST3 processor interface and never changes parameter values.
+    void servicePendingStateNotificationsForTesting() { handleUpdateNowIfNeeded(); }
+    bool hasPendingStateNotificationsForTesting() const { return isUpdatePending(); }
+    std::function<void()> beforeQueuedProgramCommitForTesting;
+#endif
 
 private:
     struct ControlOperation
@@ -43,6 +52,8 @@ private:
         Kind kind = Kind::program;
         int programIndex = 0;
         bool notifyHost = true;
+        bool queuedProgram = false;
+        uint64_t restoreEpoch = 0;
         juce::ValueTree state;
     };
 
@@ -52,16 +63,16 @@ private:
         float glide = 0.03f, tune = 0.0f, body = 18.0f, click = 12.0f;
         float drive = 5.0f, tone = 5000.0f, velocity = 80.0f, output = -3.0f;
         bool oneShot = true;
+        uint64_t clickSequenceGeneration = 0;
     };
 
     static juce::AudioProcessorValueTreeState::ParameterLayout makeLayout();
     void submitControlOperation(ControlOperation);
-    void performControlOperation(const ControlOperation&);
-    bool applyProgramNow(int index);
-    bool applyStateNow(const juce::ValueTree&);
-    juce::MemoryBlock createStateSnapshot();
-    void beginStateTransaction();
-    void endStateTransaction();
+    void commitControlOperation(ControlOperation);
+    void drainStateNotifications();
+    void handleAsyncUpdate() override;
+    void applyRestoredEditorSize();
+    float readParameter(size_t index) const noexcept;
     RuntimeParameters readRuntimeParameters() const;
     void refreshRuntimeParameters() noexcept;
     void triggerNote(int channel, int note, float newVelocity);
@@ -82,28 +93,38 @@ private:
     float click = 0.0f, clickCoef = 0.965f;
     juce::SmoothedValue<float> ampCoef, pitchCoef, glideCoef, releaseCoef;
     juce::SmoothedValue<float> drive, outputGain, filterCoef, body, tuneSemitones;
-    uint32_t noiseState = 0x6d2b79f5u;
+    static constexpr uint32_t initialNoiseSeed = 0x6d2b79f5u;
+    uint32_t noiseState = initialNoiseSeed;
+    std::atomic<uint64_t> clickSequenceGeneration { 0 };
+    static constexpr uint64_t editorRestorePendingMask = uint64_t { 1 } << 63;
     std::atomic<uint64_t> editorSize { packEditorSize(860, 520) };
     std::atomic<int> currentProgram { 0 };
     std::atomic<unsigned> internalParameterChangeDepth { 0 };
     std::atomic<bool> presetModified { false };
-    std::atomic<bool> stateRestoreActive { false };
+    static constexpr std::array<const char*, 13> parameterIds {
+        "decay", "release", "punch", "pitchdecay", "glide", "tune", "body",
+        "click", "drive", "tone", "velocity", "output", "oneshot"
+    };
+    std::array<juce::RangedAudioParameter*, parameterIds.size()> rangedParameters {};
+    // The commit gate never calls APVTS, listeners, the host, or an editor.
     std::mutex controlMutex;
-    std::condition_variable controlCondition;
-    juce::Thread::ThreadID controlOwner = nullptr;
-    std::deque<ControlOperation> pendingControlOperations;
-    unsigned controlOperationBudget = 0;
-    juce::CriticalSection stateSnapshotLock;
-    juce::MemoryBlock lastCommittedState;
-    bool stateTransactionActive = false;
-    uint64_t stateSnapshotGeneration = 0;
+    juce::ValueTree stateExtensions { "PARAMETERS" }; // immutable between commits
+    std::deque<ControlOperation> pendingProgramOperations;
+    uint64_t restoreEpoch = 0; // protected by controlMutex; invalidates even a locally dequeued old request
+    bool committedProgramNotification = false, committedRestoreNotification = false;
+    std::atomic<uint64_t> controlGeneration { 0 }, notifiedGeneration { 0 };
+    std::atomic<juce::Thread::ThreadID> notificationOwner { nullptr };
+    std::atomic<bool> notifyingRestore { false };
+    // All packet reads/writes, including JUCE's standard parameter atomics and
+    // the Click generation, participate in the same sequentially consistent order.
     std::atomic<uint64_t> parameterTransactionSequence { 0 };
     RuntimeParameters runtimeParameters;
     static constexpr float amplitudeSilenceThreshold = 1.0e-5f;
     static constexpr int midiChannelCount = 16;
     static constexpr int midiNoteCount = 128;
     static constexpr int midiKeyCount = midiChannelCount * midiNoteCount;
-    static constexpr unsigned maxControlOperationsPerDrain = 64;
+    static constexpr unsigned maxGenerationsPerDrain = 128;
+    static_assert(std::atomic<float>::is_always_lock_free && std::atomic<uint64_t>::is_always_lock_free);
     std::array<uint32_t, midiKeyCount> heldKeyCounts {};
     std::array<int, midiKeyCount> previousHeldKeys {}, nextHeldKeys {};
     std::array<juce::SmoothedValue<float>, midiChannelCount> channelBendSemitones;
